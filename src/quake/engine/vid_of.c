@@ -110,6 +110,40 @@ void of_dbg_verify_cmap_row0(const unsigned char *host_cm)
         for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)host_cm[i]);
         Sys_Printf("\n");
 
+        /* Dump representative rows so we can see if some OTHER row is
+         * identity.  Some Quake forks use inverted light convention
+         * (row 0 = darkest, row 63 = brightest = identity).  If row
+         * 63 is identity here, the engine's "fullbright = light 0"
+         * assumption is wrong and D_ALIAS_GOURAUD=0 should set
+         * vertex.r = 63, not 0.  Also, scan all 64 rows and print the
+         * first one that IS identity (if any). */
+        Sys_Printf("DBG cmap rows[0..7] of each light level (first 8 bytes):\n");
+        for (int row = 0; row < 64; row += 8) {
+            Sys_Printf("DBG  row %2d:", row);
+            for (int i = 0; i < 8; i++)
+                Sys_Printf(" %02x", (unsigned)host_cm[row * 256 + i]);
+            Sys_Printf("\n");
+        }
+        int identity_row = -1;
+        for (int row = 0; row < 64; row++) {
+            int ok = 1;
+            for (int i = 0; i < 256; i++) {
+                if (host_cm[row * 256 + i] != (byte)i) { ok = 0; break; }
+            }
+            if (ok) { identity_row = row; break; }
+        }
+        if (identity_row >= 0) {
+            Sys_Printf("DBG: row %d IS identity-passthrough.  D_ALIAS_GOURAUD=0\n"
+                       "DBG: should set vertex.r=%d (not 0) for this build's\n"
+                       "DBG: colormap convention.  Light=%d == fullbright in\n"
+                       "DBG: this fork.\n",
+                       identity_row, identity_row, identity_row);
+        } else {
+            Sys_Printf("DBG: NO row in [0..63] is identity.  "
+                       "Either the colormap is heavily modded, or "
+                       "the layout isn't 64×256 row-major.\n");
+        }
+
         /* Re-read colormap.lmp via Quake's PAK-aware loader into our
          * own 512-byte-aligned buffer.  Direct fopen("colormap.lmp")
          * fails because the file lives inside id1/pak0.pak — only
