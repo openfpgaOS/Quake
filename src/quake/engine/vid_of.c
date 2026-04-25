@@ -60,19 +60,13 @@ void of_emit_init(void)
      * what's already on the screen." This is the one depth-func
      * Quake's renderer was designed around; without it, alias models
      * either draw on top of walls they should hide behind or disappear
-     * entirely. LITE didn't ship GEQUAL — now that the full GPU is
-     * live we can use it. */
+     * entirely. */
     of_gpu_depth_test(OF_GPU_DEPTH_GEQUAL);
 
-    /* Enable Gouraud interpolation so alias-triangle vertex lights
-     * bilinear-interp across each triangle. Combined with COLORMAP in
-     * the span flags, the GPU looks up colormap[light * 256 + texel]
-     * per pixel — matches Quake's lit alias-skin rendering exactly. */
-    of_gpu_shade_mode(1);
-
-    /* No alpha blending by default. Water, particles and sprites turn
-     * it on per-draw as needed. */
-    of_gpu_blend(OF_GPU_BLEND_NONE);
+    /* of_gpu_shade_mode / of_gpu_blend were removed from the SDK along
+     * with their underlying SET_SHADE / SET_BLEND commands. Gouraud is
+     * always-on after Phase 4d, and blend was never implemented in
+     * the datapath — nothing to enable here. */
 }
 
 void of_emit_upload_colormap(const unsigned char *cm, uint32_t size)
@@ -115,7 +109,89 @@ void of_dbg_verify_cmap_row0(const unsigned char *host_cm)
         Sys_Printf("DBG cmap row0[0..31]:");
         for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)host_cm[i]);
         Sys_Printf("\n");
-        Sys_Printf("DBG: bug is in host data, not the GPU.  Stop here.\n");
+
+        /* Re-read colormap.lmp directly from disk into a 512-byte-aligned
+         * buffer.  This bypasses Quake's COM_LoadHunkFile to isolate
+         * "is the file content wrong" from "is the load broken".
+         *
+         *   raw[0..7] = 00 01 02 03 04 05 06 07          → file fine,
+         *                                                  COM_LoadHunkFile
+         *                                                  is the broken
+         *                                                  path.  Likely
+         *                                                  the same fread-
+         *                                                  alignment bug
+         *                                                  fixed in
+         *                                                  openfpgaOS
+         *                                                  64b35bc, but
+         *                                                  via a different
+         *                                                  call site.
+         *
+         *   raw matches host_colormap                    → file content
+         *                                                  itself is non-
+         *                                                  standard for
+         *                                                  this build (mod
+         *                                                  WAD, custom
+         *                                                  colormap.lmp).
+         *
+         * 16388 = 64*256 light table + 4-byte fullbright marker.  Use
+         * 512-byte alignment per the prior fread-alignment incident; the
+         * SDK fread is supposed to be fixed but worth being defensive
+         * here. */
+        static byte raw[16388] __attribute__((aligned(512)));
+        FILE *f = fopen("colormap.lmp", "rb");
+        if (!f) f = fopen("gfx/colormap.lmp", "rb");
+        if (!f) f = fopen("id1/gfx/colormap.lmp", "rb");
+        if (!f) {
+            Sys_Printf("DBG: file-vs-hunk: fopen(colormap.lmp) failed; "
+                       "can't isolate file vs load.\n");
+            return;
+        }
+        memset(raw, 0xAA, sizeof raw);  /* sentinel so partial reads visible */
+        int got = fread(raw, 1, sizeof raw, f);
+        fclose(f);
+
+        Sys_Printf("DBG file: read %d bytes (expected 16388).  raw[0..31]:", got);
+        for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)raw[i]);
+        Sys_Printf("\n");
+
+        if (got <= 0) {
+            Sys_Printf("DBG: fread returned %d — load path is broken.  "
+                       "Same shape as the openfpgaOS fread-alignment bug "
+                       "(64b35bc).  Check the SDK fopen/fread path Quake "
+                       "uses (Sys_FileOpenRead → fopen).\n", got);
+            return;
+        }
+
+        /* Compare raw vs host_colormap row 0 explicitly. */
+        int matches = 0;
+        for (int i = 0; i < 256; i++)
+            if (raw[i] == host_cm[i]) matches++;
+        Sys_Printf("DBG file vs hunk row 0: %d/256 bytes match.\n", matches);
+
+        /* Is the file itself identity? */
+        int file_identity = 1;
+        for (int i = 0; i < 256; i++) {
+            if (raw[i] != (byte)i) { file_identity = 0; break; }
+        }
+        if (file_identity) {
+            Sys_Printf("DBG: file row 0 IS identity but host_colormap is "
+                       "NOT — the load path corrupted/truncated it.  "
+                       "Inspect COM_LoadHunkFile (host.c:988) and the "
+                       "underlying Sys_FileOpenRead → fread chain.\n");
+        } else if (matches == 256) {
+            Sys_Printf("DBG: file content matches host_colormap.  Either "
+                       "this WAD ships a non-identity colormap.lmp, or "
+                       "vid.fullbright's offset (%d ints = %d bytes) is "
+                       "wrong for this file format.  Standard id1 "
+                       "colormap.lmp is 16388 bytes (16384 light table + "
+                       "4-byte fullbright marker at the very end, offset "
+                       "16384/4 = 4096 ints, NOT 2048).\n",
+                       2048, 2048 * 4);
+        } else {
+            Sys_Printf("DBG: partial match (%d/256).  File content is "
+                       "non-standard AND the load path possibly modified "
+                       "it.  Mixed bug — investigate both.\n", matches);
+        }
         return;
     }
     Sys_Printf("DBG cmap row0: host_colormap[0..255] is identity ✓\n");
