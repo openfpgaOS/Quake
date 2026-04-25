@@ -110,83 +110,78 @@ void of_dbg_verify_cmap_row0(const unsigned char *host_cm)
         for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)host_cm[i]);
         Sys_Printf("\n");
 
-        /* Re-read colormap.lmp directly from disk into a 512-byte-aligned
-         * buffer.  This bypasses Quake's COM_LoadHunkFile to isolate
-         * "is the file content wrong" from "is the load broken".
+        /* Re-read colormap.lmp via Quake's PAK-aware loader into our
+         * own 512-byte-aligned buffer.  Direct fopen("colormap.lmp")
+         * fails because the file lives inside id1/pak0.pak — only
+         * COM_OpenFile (via COM_LoadStackFile) checks the PAK index.
          *
-         *   raw[0..7] = 00 01 02 03 04 05 06 07          → file fine,
-         *                                                  COM_LoadHunkFile
-         *                                                  is the broken
-         *                                                  path.  Likely
-         *                                                  the same fread-
-         *                                                  alignment bug
-         *                                                  fixed in
-         *                                                  openfpgaOS
-         *                                                  64b35bc, but
-         *                                                  via a different
-         *                                                  call site.
+         * Alignment of the destination matters because of the prior
+         * fread-alignment bug (openfpgaOS 64b35bc): unaligned dests
+         * silently truncated.  The SDK side is fixed, but if Quake's
+         * Hunk_Alloc returns a not-512-aligned pointer for
+         * host_colormap, AND the fix only catches one alignment
+         * boundary, we'd still see the problem here.  Print
+         * host_colormap's alignment alongside the comparison so we
+         * can correlate.
          *
-         *   raw matches host_colormap                    → file content
-         *                                                  itself is non-
-         *                                                  standard for
-         *                                                  this build (mod
-         *                                                  WAD, custom
-         *                                                  colormap.lmp).
-         *
-         * 16388 = 64*256 light table + 4-byte fullbright marker.  Use
-         * 512-byte alignment per the prior fread-alignment incident; the
-         * SDK fread is supposed to be fixed but worth being defensive
-         * here. */
-        static byte raw[16388] __attribute__((aligned(512)));
-        FILE *f = fopen("colormap.lmp", "rb");
-        if (!f) f = fopen("gfx/colormap.lmp", "rb");
-        if (!f) f = fopen("id1/gfx/colormap.lmp", "rb");
-        if (!f) {
-            Sys_Printf("DBG: file-vs-hunk: fopen(colormap.lmp) failed; "
-                       "can't isolate file vs load.\n");
+         * 16388 = 64*256 light table + 4-byte fullbright marker
+         * (standard id1 layout).  Pad to 16400 so we see any extra
+         * bytes the loader appends. */
+        static byte raw[16400] __attribute__((aligned(512)));
+        memset(raw, 0xAA, sizeof raw);  /* sentinel for partial reads */
+
+        Sys_Printf("DBG host_colormap=%p (align: 512=%d, 4=%d)\n",
+                   (void *)host_cm,
+                   ((uintptr_t)host_cm & 511) == 0,
+                   ((uintptr_t)host_cm & 3)   == 0);
+        Sys_Printf("DBG raw buf=%p (align: 512=%d)\n",
+                   (void *)raw,
+                   ((uintptr_t)raw & 511) == 0);
+
+        byte *loaded = COM_LoadStackFile("gfx/colormap.lmp",
+                                         raw, sizeof raw);
+        if (!loaded) {
+            Sys_Printf("DBG: COM_LoadStackFile(gfx/colormap.lmp) returned "
+                       "NULL — the file isn't in the PAK index either.\n");
             return;
         }
-        memset(raw, 0xAA, sizeof raw);  /* sentinel so partial reads visible */
-        int got = fread(raw, 1, sizeof raw, f);
-        fclose(f);
+        /* COM_LoadStackFile may have loaded into a temp hunk if our
+         * buffer was too small; loaded points to wherever it actually
+         * landed.  Read from `loaded`, NOT raw[]. */
 
-        Sys_Printf("DBG file: read %d bytes (expected 16388).  raw[0..31]:", got);
-        for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)raw[i]);
+        Sys_Printf("DBG file: loaded buf=%p (align: 512=%d).  bytes[0..31]:",
+                   (void *)loaded,
+                   ((uintptr_t)loaded & 511) == 0);
+        for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)loaded[i]);
         Sys_Printf("\n");
 
-        if (got <= 0) {
-            Sys_Printf("DBG: fread returned %d — load path is broken.  "
-                       "Same shape as the openfpgaOS fread-alignment bug "
-                       "(64b35bc).  Check the SDK fopen/fread path Quake "
-                       "uses (Sys_FileOpenRead → fopen).\n", got);
-            return;
-        }
-
-        /* Compare raw vs host_colormap row 0 explicitly. */
+        /* Compare loaded vs host_colormap row 0 explicitly. */
         int matches = 0;
         for (int i = 0; i < 256; i++)
-            if (raw[i] == host_cm[i]) matches++;
+            if (loaded[i] == host_cm[i]) matches++;
         Sys_Printf("DBG file vs hunk row 0: %d/256 bytes match.\n", matches);
 
         /* Is the file itself identity? */
         int file_identity = 1;
         for (int i = 0; i < 256; i++) {
-            if (raw[i] != (byte)i) { file_identity = 0; break; }
+            if (loaded[i] != (byte)i) { file_identity = 0; break; }
         }
         if (file_identity) {
             Sys_Printf("DBG: file row 0 IS identity but host_colormap is "
-                       "NOT — the load path corrupted/truncated it.  "
-                       "Inspect COM_LoadHunkFile (host.c:988) and the "
-                       "underlying Sys_FileOpenRead → fread chain.\n");
+                       "NOT — the load path corrupted/truncated the first "
+                       "load (host.c:988 COM_LoadHunkFile).  Same shape as "
+                       "the openfpgaOS fread-alignment bug; the second-"
+                       "read worked because we're reading into an aligned "
+                       "buffer this time.  Workaround: align the hunk "
+                       "allocation for host_colormap to 512 bytes.\n");
         } else if (matches == 256) {
-            Sys_Printf("DBG: file content matches host_colormap.  Either "
-                       "this WAD ships a non-identity colormap.lmp, or "
-                       "vid.fullbright's offset (%d ints = %d bytes) is "
-                       "wrong for this file format.  Standard id1 "
-                       "colormap.lmp is 16388 bytes (16384 light table + "
-                       "4-byte fullbright marker at the very end, offset "
-                       "16384/4 = 4096 ints, NOT 2048).\n",
-                       2048, 2048 * 4);
+            Sys_Printf("DBG: file content matches host_colormap.  This "
+                       "PAK's colormap.lmp is non-standard for row 0; the "
+                       "engine's vid.fullbright formula (offset 2048 ints "
+                       "= 8192 bytes — middle of the light table, not the "
+                       "end) is also suspect.  Standard id1 layout is "
+                       "16388 bytes with the fullbright marker at byte "
+                       "16384 (offset 4096 ints, not 2048).\n");
         } else {
             Sys_Printf("DBG: partial match (%d/256).  File content is "
                        "non-standard AND the load path possibly modified "
