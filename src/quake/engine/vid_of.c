@@ -245,8 +245,6 @@ void of_dbg_verify_cmap_row0(const unsigned char *host_cm)
     of_gpu_texture_t test_tex = {
         .addr = (uint32_t)(uintptr_t)_dbg_test_tex,
         .width = 16, .height = 16,
-        .format = OF_GPU_TEXFMT_I8,
-        .wrap_s = OF_GPU_WRAP_REPEAT, .wrap_t = OF_GPU_WRAP_REPEAT,
     };
     of_gpu_bind_texture(&test_tex);
 
@@ -397,9 +395,6 @@ void of_emit_bind_texture(const of_emit_texture_t *tex)
         .addr   = tex->addr,
         .width  = tex->width,
         .height = tex->height,
-        .format = (of_gpu_texfmt_t)tex->format,
-        .wrap_s = (of_gpu_wrap_t)tex->wrap_s,
-        .wrap_t = (of_gpu_wrap_t)tex->wrap_t,
     };
     of_gpu_bind_texture(&gt);
 }
