@@ -55,18 +55,10 @@ void of_emit_init(void)
     { volatile int i; for (i = 0; i < 100; i++) ; }
     of_gpu_init();
 
-    /* Quake stores 1/z in the z-buffer (bigger = nearer). GEQUAL means
-     * "write the pixel if the incoming fragment is at least as near as
-     * what's already on the screen." This is the one depth-func
-     * Quake's renderer was designed around; without it, alias models
-     * either draw on top of walls they should hide behind or disappear
-     * entirely. */
-    of_gpu_depth_test(OF_GPU_DEPTH_GEQUAL);
-
-    /* of_gpu_shade_mode / of_gpu_blend were removed from the SDK along
-     * with their underlying SET_SHADE / SET_BLEND commands. Gouraud is
-     * always-on after Phase 4d, and blend was never implemented in
-     * the datapath — nothing to enable here. */
+    /* Z-buffer / depth-test removed from the GPU in lean Phase 2.3.
+     * Quake's BSP visibility pass + paint order handle visibility on
+     * the CPU — alias models are clipped against the BSP and rendered
+     * back-to-front, no z-test needed. */
 }
 
 void of_emit_upload_colormap(const unsigned char *cm, uint32_t size)
@@ -304,10 +296,8 @@ void of_dbg_verify_cmap_row0(const unsigned char *host_cm)
 void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
                      uint32_t zb_addr, int zb_stride_bytes)
 {
+    (void)zb_addr; (void)zb_stride_bytes;  /* Z buffer dropped */
     of_gpu_set_framebuffer(fb_addr, (uint16_t)fb_stride);
-    /* The z-buffer stride is in 16-bit words on the GPU side but
-     * bytes on ours — divide. */
-    of_gpu_set_zbuffer(zb_addr, (uint16_t)zb_stride_bytes);
 }
 
 void of_emit_finish(void) { of_gpu_finish(); }
@@ -327,12 +317,13 @@ void of_emit_cache_clean(const void *addr, uint32_t size)
 
 void of_emit_clear(uint32_t flags, uint16_t color, uint16_t depth)
 {
-    of_gpu_clear(flags, color, depth);
+    (void)depth;  /* Z buffer dropped */
+    of_gpu_clear(flags, color);
 }
 
 void of_emit_depth_test(of_emit_depth_func_t func)
 {
-    of_gpu_depth_test((of_gpu_depth_func_t)func);
+    (void)func;  /* depth test dropped — no-op for ABI stability */
 }
 
 void of_emit_span(const of_emit_span_t *sp)

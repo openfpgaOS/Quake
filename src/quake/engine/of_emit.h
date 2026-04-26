@@ -22,8 +22,7 @@
 #define OF_EMIT_COLORMAP    (1 << 0)
 #define OF_EMIT_COLUMN      (1 << 1)
 #define OF_EMIT_SKIP_ZERO   (1 << 2)
-#define OF_EMIT_DEPTH_TEST  (1 << 3)
-#define OF_EMIT_DEPTH_WRITE (1 << 4)
+/* bits 3/4 (DEPTH_TEST/WRITE) reserved — Z buffer dropped in lean Phase 2.3 */
 #define OF_EMIT_PERSP       (1 << 5)
 
 typedef struct of_emit_span_s {
@@ -36,14 +35,9 @@ typedef struct of_emit_span_s {
     uint8_t  flags;
     int16_t  fb_stride;
     uint16_t tex_width;
-    /* POT wrap masks (tex_w-1 / tex_h-1).  Both 0 = no wrap (legacy
-     * default).  Renamed from tex_shift/tex_bits — those fed the
-     * shift-mode addressing path that the GPU RTL retired. */
+    /* POT wrap masks (tex_w-1 / tex_h-1).  Both 0 = no wrap. */
     uint16_t tex_w_mask;
     uint16_t tex_h_mask;
-    uint32_t z_addr;
-    int32_t  zi;
-    int32_t  zistep;
     int32_t  sdivz, tdivz;
     int32_t  zi_persp;
     int32_t  sdivz_step, tdivz_step;
