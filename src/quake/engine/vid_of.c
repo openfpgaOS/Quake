@@ -337,9 +337,6 @@ void of_emit_depth_test(of_emit_depth_func_t func)
     of_gpu_depth_test((of_gpu_depth_func_t)func);
 }
 
-uint32_t of_emit_stat_pixels(void) { return of_gpu_stat_pixels(); }
-uint32_t of_emit_stat_spans(void)  { return of_gpu_stat_spans();  }
-
 void of_emit_span(const of_emit_span_t *sp)
 {
     of_gpu_draw_span((const of_gpu_span_t *)sp);
