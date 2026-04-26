@@ -71,7 +71,7 @@ void of_emit_init(void)
 
 void of_emit_upload_colormap(const unsigned char *cm, uint32_t size)
 {
-    of_gpu_colormap_upload(cm, size);
+    of_gpu_palookup_upload(0, cm, size);
 }
 
 /* Debug helper for the D_ALIAS_GOURAUD=0 "wrong textures" symptom in
@@ -314,6 +314,13 @@ void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
 
 void of_emit_finish(void) { of_gpu_finish(); }
 
+/* Publish the CPU-side write pointer to the GPU without waiting. Lets
+ * the GPU start consuming a batch of queued commands while the CPU
+ * moves on to the next batch's setup work. Without this, the GPU only
+ * sees new work when the ring fills (slow-path publish in
+ * _gpu_ring_ensure) or when of_emit_finish() is called. */
+void of_emit_kick(void) { of_gpu_kick(); }
+
 void of_emit_cache_clean(const void *addr, uint32_t size)
 {
     if (!addr || !size) return;
@@ -330,16 +337,6 @@ void of_emit_depth_test(of_emit_depth_func_t func)
     of_gpu_depth_test((of_gpu_depth_func_t)func);
 }
 
-void of_emit_blend(of_emit_blend_t mode)
-{
-    of_gpu_blend((of_gpu_blend_t)mode);
-}
-
-void of_emit_shade_gouraud(int enable)
-{
-    of_gpu_shade_mode(enable);
-}
-
 uint32_t of_emit_stat_pixels(void) { return of_gpu_stat_pixels(); }
 uint32_t of_emit_stat_spans(void)  { return of_gpu_stat_spans();  }
 
@@ -348,9 +345,53 @@ void of_emit_span(const of_emit_span_t *sp)
     of_gpu_draw_span((const of_gpu_span_t *)sp);
 }
 
+void of_emit_blit(int dst_x, int dst_y,
+                  int blit_w, int blit_h,
+                  const unsigned char *src,
+                  int src_pitch,
+                  int src_x, int src_y,
+                  int skip_key_ff)
+{
+    if (blit_w <= 0 || blit_h <= 0) return;
+
+    extern viddef_t vid;
+    const uint32_t fb_base = (uint32_t)(uintptr_t)vid.buffer;
+    const int      fb_row  = vid.rowbytes;
+    const uint8_t  flags   = skip_key_ff ? OF_EMIT_SKIP_ZERO : 0;
+
+    /* Emit one affine span per row. The fragment processor on the SPAN
+     * path writes raw I8 texel directly when COLORMAP isn't set, and
+     * with the SKIP_ZERO flag (which actually discards 0xFF, matching
+     * Quake's TRANSPARENT_COLOR) we get key-color transparency. */
+    for (int row = 0; row < blit_h; row++) {
+        of_emit_span_t sp = {
+            .fb_addr   = fb_base + (uint32_t)((dst_y + row) * fb_row + dst_x),
+            .tex_addr  = (uint32_t)(uintptr_t)(src
+                          + (src_y + row) * src_pitch
+                          + src_x),
+            .s         = 0,
+            .t         = 0,
+            .sstep     = 0x10000,   /* 1 texel per pixel */
+            .tstep     = 0,
+            .count     = (uint16_t)blit_w,
+            .light     = 0,
+            .flags     = flags,
+            .fb_stride = 1,
+            .tex_width = (uint16_t)src_pitch,
+        };
+        of_emit_span(&sp);
+    }
+}
+
 void of_emit_triangles(const of_emit_vertex_t *verts, uint32_t num_vertices)
 {
     of_gpu_draw_triangles((const of_gpu_vertex_t *)verts, num_vertices);
+}
+
+void of_emit_triangles_batch(const of_emit_vertex_t *verts,
+                             uint32_t num_vertices)
+{
+    of_gpu_draw_triangles_batch((const of_gpu_vertex_t *)verts, num_vertices);
 }
 
 void of_emit_bind_texture(const of_emit_texture_t *tex)
@@ -396,7 +437,19 @@ void VID_Init(unsigned char *palette)
     vid.aspect = 1.0f;
     vid.numpages = 3;
     vid.colormap = host_colormap;
-    vid.fullbright = 256 - LittleLong(*((int *)vid.colormap + 2048));
+    /* Fullbright marker sits at byte (VID_GRADES*256), one past the
+     * light table.  Two conventions in the wild:
+     *   - id1 standard: marker = "starting palette index of the
+     *     fullbright range" (typically 224 → fullbright_count=32).
+     *   - some PAKs (incl. the one this build runs against): marker
+     *     stores the count directly (32 → fullbright_count=32).
+     * Distinguish heuristically: a count is small (≤127), a start
+     * index is large (≥128). vid.fullbright is the COUNT throughout
+     * the engine. */
+    {
+        int marker = vid.colormap[VID_GRADES * 256];
+        vid.fullbright = (marker < 128) ? marker : (256 - marker);
+    }
 
     vid.buffer    = vid.conbuffer   = (byte *)of_uncached(of_video_surface());
     vid.rowbytes  = vid.conrowbytes = BASEWIDTH;
@@ -458,10 +511,14 @@ void VID_Update(vrect_t *rects)
     /* Bind the new buffer + z-buffer to the GPU, then HW-clear the
      * z-buffer so alias/sprite depth tests start fresh. FB clearing
      * isn't needed — world spans cover every pixel (or sky fills any
-     * gaps on the CPU side). */
+     * gaps on the CPU side). Kick after queueing so the clear overlaps
+     * the start of the next frame's CPU work (BSP traversal, surface
+     * cache build, etc.) instead of waiting for of_emit_finish at the
+     * next VID_Update. */
     of_emit_bind_fb((uint32_t)(uintptr_t)of_video_surface(), BASEWIDTH,
                     (uint32_t)(uintptr_t)zbuffer_storage, BASEWIDTH * 2);
     of_emit_clear(OF_EMIT_CLEAR_DEPTH, 0, 0);
+    of_emit_kick();
 }
 
 void VID_WaitSync(void) { /* triple-buffered, non-blocking flip */ }
