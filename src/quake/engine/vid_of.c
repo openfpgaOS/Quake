@@ -22,6 +22,7 @@
 #include "of_cache.h"
 #include "of_services.h"
 #include "of_gpu.h"                 /* static ring state lives HERE only */
+#include "sysreg_stub.h"            /* SYS_CYCLE_LO for GPU-wait profiling */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,34 @@ extern viddef_t vid;
 unsigned short d_8to16table[256];
 unsigned       d_8to24table[256];
 
+/* GPU-utilisation probe: cumulative cycles the CPU spent blocked inside
+ * of_emit_finish() — i.e. waiting for the GPU to drain submitted work.
+ * Resets at frame start (R_RenderView_).  Synthesised cycles via
+ * SYS_CYCLE_LO (= of_time_us()*105) so the units match other buckets.
+ *
+ * Interpretation:
+ *   pq_prof_gpu_wait ≈ 0  → CPU is the bottleneck (GPU keeping up easily).
+ *   pq_prof_gpu_wait > 0  → CPU was idle waiting for GPU for that span;
+ *                            of_emit_finish() takes ~that long per call. */
+unsigned int   pq_prof_gpu_wait_cycles;
+
+/* Page-flip duration: time inside of_video_acquire_next().  Now
+ * captures only the rare 3-buffer-ceiling block (CPU outran the
+ * display by more than one frame); steady-state value is ~10 µs of
+ * book-keeping syscall.  Pre cr-gpu-triggered-flip this measured
+ * the kernel-driven of_video_flip() which spent ~80 µs blocking on
+ * framebuffer ownership; the GPU-triggered path moves the actual
+ * vsync wait into the GPU's command processor, where it overlaps
+ * with the next frame's CPU work. */
+unsigned int   pq_prof_video_flip_cycles;
+
+/* Triple-buffer slot index the GPU's CMD_FLIP will swap to this
+ * frame.  Initialized by VID_Init via of_video_acquire_next(-1)
+ * after the init-time kernel-driven flip cycle settles, then
+ * advanced each VID_Update to the slot returned by
+ * of_video_acquire_next(draw_idx).  See cr-gpu-triggered-flip.md. */
+static int     draw_idx = -1;
+
 /* Surface cache in BSS (cacheable SDRAM). 2 MB bank. */
 static byte surfcache_storage[SURFCACHE_SIZE] __attribute__((aligned(64)));
 
@@ -45,6 +74,36 @@ static short zbuffer_storage[BASEWIDTH * BASEHEIGHT]
     __attribute__((aligned(64)));
 
 /* ---- of_emit_* API (the GPU owner's public surface) --------------- */
+
+/* Span batch accumulator.
+ *
+ * Quake's world / sky / sprite / alias-poly inner loops submit one
+ * of_gpu_span_t per scanline.  Routing each through of_gpu_draw_span
+ * costs ~16 MMIO writes per span; at typical world frames (hundreds
+ * to a few thousand spans) that's a real chunk of frame time.  Buffer
+ * up to OF_GPU_BATCH_MAX_SPANS spans, then dispatch via
+ * of_gpu_draw_spans_batch — payload is built as cached scalar stores
+ * into the SDRAM scratch buffer of_gpu_init() pinned, followed by one
+ * cache_clean_range and a single CMD_DRAW_SPANS_BATCH header; the GPU
+ * pulls the bytes over its own AXI master while the CPU returns to
+ * game logic / next-frame setup.
+ *
+ * fb_addr / tex_addr / light / flags / perspective fields are baked
+ * per-span into the payload, so changes within a batch need no flush.
+ * The accumulator MUST flush before any other GPU command the queued
+ * spans should observe in ring order — bind_fb, bind_texture, clear,
+ * triangles*, kick, finish.  of_emit_blit submits its per-row spans
+ * via of_emit_span so it auto-batches without special handling. */
+static of_gpu_span_t span_buf[OF_GPU_BATCH_MAX_SPANS];
+static int           span_buf_count;
+
+static inline void flush_span_batch(void)
+{
+    if (span_buf_count > 0) {
+        of_gpu_draw_spans_batch(span_buf, span_buf_count);
+        span_buf_count = 0;
+    }
+}
 
 void of_emit_init(void)
 {
@@ -66,248 +125,38 @@ void of_emit_upload_colormap(const unsigned char *cm, uint32_t size)
     of_gpu_palookup_upload(0, cm, size);
 }
 
-/* Debug helper for the D_ALIAS_GOURAUD=0 "wrong textures" symptom in
- * d_polyse.c.  Two checks:
- *   1. CPU-side: is host_colormap[0..255] actually identity-passthrough
- *      as the bisection comment assumes?  If not, the engine's belief
- *      is wrong and the bug is in WAD/colormap.lmp data, not the GPU.
- *   2. GPU-side: render a 16x16 quad with a per-texel-distinct test
- *      texture and light=0 + COLORMAP into a scratch FB.  Read back
- *      and compare against host_colormap[0..255].  Mismatches mean
- *      the cmap upload landed in the wrong cells, OR the GPU samples
- *      cmap differently than expected, OR the cmap_bram contents
- *      aren't what was uploaded.
- *
- * Call once after of_emit_upload_colormap + of_emit_bind_fb.  Output
- * goes to UART via Sys_Printf — read with `tools/capture_ocr.sh` or
- * a serial terminal. */
-static byte _dbg_test_tex[256];     /* 16x16 distinct-texel pattern */
-static byte _dbg_scratch_fb[16*16]; /* tiny FB for the readback */
-
-void of_dbg_verify_cmap_row0(const unsigned char *host_cm)
-{
-    /* ---- (1) CPU check: is the source data identity? ---- */
-    int identity = 1;
-    int first_mismatch = -1;
-    for (int i = 0; i < 256; i++) {
-        if (host_cm[i] != (unsigned char)i) {
-            if (identity) { first_mismatch = i; identity = 0; }
-        }
-    }
-    if (!identity) {
-        Sys_Printf("DBG cmap row0: NOT IDENTITY (first mismatch i=%d → 0x%02x; expected 0x%02x).\n",
-                   first_mismatch, (unsigned)host_cm[first_mismatch],
-                   first_mismatch & 0xFF);
-        Sys_Printf("DBG cmap row0[0..31]:");
-        for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)host_cm[i]);
-        Sys_Printf("\n");
-
-        /* Dump representative rows so we can see if some OTHER row is
-         * identity.  Some Quake forks use inverted light convention
-         * (row 0 = darkest, row 63 = brightest = identity).  If row
-         * 63 is identity here, the engine's "fullbright = light 0"
-         * assumption is wrong and D_ALIAS_GOURAUD=0 should set
-         * vertex.r = 63, not 0.  Also, scan all 64 rows and print the
-         * first one that IS identity (if any). */
-        Sys_Printf("DBG cmap rows[0..7] of each light level (first 8 bytes):\n");
-        for (int row = 0; row < 64; row += 8) {
-            Sys_Printf("DBG  row %2d:", row);
-            for (int i = 0; i < 8; i++)
-                Sys_Printf(" %02x", (unsigned)host_cm[row * 256 + i]);
-            Sys_Printf("\n");
-        }
-        int identity_row = -1;
-        for (int row = 0; row < 64; row++) {
-            int ok = 1;
-            for (int i = 0; i < 256; i++) {
-                if (host_cm[row * 256 + i] != (byte)i) { ok = 0; break; }
-            }
-            if (ok) { identity_row = row; break; }
-        }
-        if (identity_row >= 0) {
-            Sys_Printf("DBG: row %d IS identity-passthrough.  D_ALIAS_GOURAUD=0\n"
-                       "DBG: should set vertex.r=%d (not 0) for this build's\n"
-                       "DBG: colormap convention.  Light=%d == fullbright in\n"
-                       "DBG: this fork.\n",
-                       identity_row, identity_row, identity_row);
-        } else {
-            Sys_Printf("DBG: NO row in [0..63] is identity.  "
-                       "Either the colormap is heavily modded, or "
-                       "the layout isn't 64×256 row-major.\n");
-        }
-
-        /* Re-read colormap.lmp via Quake's PAK-aware loader into our
-         * own 512-byte-aligned buffer.  Direct fopen("colormap.lmp")
-         * fails because the file lives inside id1/pak0.pak — only
-         * COM_OpenFile (via COM_LoadStackFile) checks the PAK index.
-         *
-         * Alignment of the destination matters because of the prior
-         * fread-alignment bug (openfpgaOS 64b35bc): unaligned dests
-         * silently truncated.  The SDK side is fixed, but if Quake's
-         * Hunk_Alloc returns a not-512-aligned pointer for
-         * host_colormap, AND the fix only catches one alignment
-         * boundary, we'd still see the problem here.  Print
-         * host_colormap's alignment alongside the comparison so we
-         * can correlate.
-         *
-         * 16388 = 64*256 light table + 4-byte fullbright marker
-         * (standard id1 layout).  Pad to 16400 so we see any extra
-         * bytes the loader appends. */
-        static byte raw[16400] __attribute__((aligned(512)));
-        memset(raw, 0xAA, sizeof raw);  /* sentinel for partial reads */
-
-        Sys_Printf("DBG host_colormap=%p (align: 512=%d, 4=%d)\n",
-                   (void *)host_cm,
-                   ((uintptr_t)host_cm & 511) == 0,
-                   ((uintptr_t)host_cm & 3)   == 0);
-        Sys_Printf("DBG raw buf=%p (align: 512=%d)\n",
-                   (void *)raw,
-                   ((uintptr_t)raw & 511) == 0);
-
-        byte *loaded = COM_LoadStackFile("gfx/colormap.lmp",
-                                         raw, sizeof raw);
-        if (!loaded) {
-            Sys_Printf("DBG: COM_LoadStackFile(gfx/colormap.lmp) returned "
-                       "NULL — the file isn't in the PAK index either.\n");
-            return;
-        }
-        /* COM_LoadStackFile may have loaded into a temp hunk if our
-         * buffer was too small; loaded points to wherever it actually
-         * landed.  Read from `loaded`, NOT raw[]. */
-
-        Sys_Printf("DBG file: loaded buf=%p (align: 512=%d).  bytes[0..31]:",
-                   (void *)loaded,
-                   ((uintptr_t)loaded & 511) == 0);
-        for (int i = 0; i < 32; i++) Sys_Printf(" %02x", (unsigned)loaded[i]);
-        Sys_Printf("\n");
-
-        /* Compare loaded vs host_colormap row 0 explicitly. */
-        int matches = 0;
-        for (int i = 0; i < 256; i++)
-            if (loaded[i] == host_cm[i]) matches++;
-        Sys_Printf("DBG file vs hunk row 0: %d/256 bytes match.\n", matches);
-
-        /* Is the file itself identity? */
-        int file_identity = 1;
-        for (int i = 0; i < 256; i++) {
-            if (loaded[i] != (byte)i) { file_identity = 0; break; }
-        }
-        if (file_identity) {
-            Sys_Printf("DBG: file row 0 IS identity but host_colormap is "
-                       "NOT — the load path corrupted/truncated the first "
-                       "load (host.c:988 COM_LoadHunkFile).  Same shape as "
-                       "the openfpgaOS fread-alignment bug; the second-"
-                       "read worked because we're reading into an aligned "
-                       "buffer this time.  Workaround: align the hunk "
-                       "allocation for host_colormap to 512 bytes.\n");
-        } else if (matches == 256) {
-            Sys_Printf("DBG: file content matches host_colormap.  This "
-                       "PAK's colormap.lmp is non-standard for row 0; the "
-                       "engine's vid.fullbright formula (offset 2048 ints "
-                       "= 8192 bytes — middle of the light table, not the "
-                       "end) is also suspect.  Standard id1 layout is "
-                       "16388 bytes with the fullbright marker at byte "
-                       "16384 (offset 4096 ints, not 2048).\n");
-        } else {
-            Sys_Printf("DBG: partial match (%d/256).  File content is "
-                       "non-standard AND the load path possibly modified "
-                       "it.  Mixed bug — investigate both.\n", matches);
-        }
-        return;
-    }
-    Sys_Printf("DBG cmap row0: host_colormap[0..255] is identity ✓\n");
-
-    /* ---- (2) GPU readback: render through cmap row 0 ---- */
-    /* Distinct-texel test texture: tex[t*16+s] = (t<<4)|s.  Identical
-     * to tb_gpu's test_triangle_light_zero_identity_cmap pattern. */
-    for (int t = 0; t < 16; t++)
-        for (int s = 0; s < 16; s++)
-            _dbg_test_tex[t * 16 + s] = (byte)((t << 4) | s);
-    of_emit_cache_clean(_dbg_test_tex, sizeof(_dbg_test_tex));
-
-    /* Clear the scratch FB and bind it. */
-    memset(_dbg_scratch_fb, 0xCC, sizeof(_dbg_scratch_fb));
-    of_emit_cache_clean(_dbg_scratch_fb, sizeof(_dbg_scratch_fb));
-    of_emit_bind_fb((uint32_t)(uintptr_t)_dbg_scratch_fb, 16,
-                    (uint32_t)(uintptr_t)d_pzbuffer, BASEWIDTH * 2);
-
-    /* Bind test tex.  Then render two triangles forming a 16x16 quad
-     * with affine UVs spanning the full texture.  All vertex.r=0
-     * forces sp_light_q=0 → cmap row 0. */
-    of_gpu_texture_t test_tex = {
-        .addr = (uint32_t)(uintptr_t)_dbg_test_tex,
-        .width = 16, .height = 16,
-    };
-    of_gpu_bind_texture(&test_tex);
-
-    of_gpu_vertex_t v[6] = {
-        /* Tri 0: (0,0)-(16,0)-(0,16) */
-        { 0,    0,    0, 0, 0,         0,         0x10000, 0,0,0,0xFF },
-        { 16*16,0,    0, 0, 16<<16,    0,         0x10000, 0,0,0,0xFF },
-        { 0,    16*16,0, 0, 0,         16<<16,    0x10000, 0,0,0,0xFF },
-        /* Tri 1: (16,0)-(16,16)-(0,16) */
-        { 16*16,0,    0, 0, 16<<16,    0,         0x10000, 0,0,0,0xFF },
-        { 16*16,16*16,0, 0, 16<<16,    16<<16,    0x10000, 0,0,0,0xFF },
-        { 0,    16*16,0, 0, 0,         16<<16,    0x10000, 0,0,0,0xFF },
-    };
-    of_gpu_draw_triangles(&v[0], 3);
-    of_gpu_draw_triangles(&v[3], 3);
-    of_emit_finish();
-
-    /* Read back via uncached alias so we don't hit a stale CPU line. */
-    const byte *fb = (const byte *)of_uncached(_dbg_scratch_fb);
-    int mismatches = 0;
-    int first_bad_i = -1;
-    byte first_bad_got = 0, first_bad_exp = 0;
-    for (int y = 0; y < 16; y++) {
-        for (int x = 0; x < 16; x++) {
-            byte texel = (byte)((y << 4) | x);
-            byte expected = host_cm[texel];   /* = texel for identity */
-            byte got = fb[y * 16 + x];
-            if (got != expected) {
-                if (first_bad_i < 0) {
-                    first_bad_i = y * 16 + x;
-                    first_bad_got = got;
-                    first_bad_exp = expected;
-                }
-                mismatches++;
-            }
-        }
-    }
-    if (mismatches == 0) {
-        Sys_Printf("DBG cmap row0: GPU readback matches host_colormap (256/256) ✓\n");
-        Sys_Printf("DBG: GPU light=0 + cmap row 0 path is correct.  D_ALIAS_GOURAUD=0\n");
-        Sys_Printf("DBG  symptom must come from elsewhere (not the cmap path).\n");
-    } else {
-        Sys_Printf("DBG cmap row0: GPU readback mismatches=%d/256.\n", mismatches);
-        Sys_Printf("DBG first @ FB[%d,%d] (texel 0x%02x): got 0x%02x, expected 0x%02x.\n",
-                   first_bad_i & 15, first_bad_i >> 4,
-                   first_bad_i & 0xFF, first_bad_got, first_bad_exp);
-        Sys_Printf("DBG FB row 0:");
-        for (int x = 0; x < 16; x++) Sys_Printf(" %02x", (unsigned)fb[x]);
-        Sys_Printf("\n");
-    }
-
-    /* Restore the real FB binding so the rest of VID_Init isn't broken. */
-    of_emit_bind_fb((uint32_t)(uintptr_t)of_video_surface(), BASEWIDTH,
-                    (uint32_t)(uintptr_t)d_pzbuffer, BASEWIDTH * 2);
-}
-
 void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
                      uint32_t zb_addr, int zb_stride_bytes)
 {
     (void)zb_addr; (void)zb_stride_bytes;  /* Z buffer dropped */
+    flush_span_batch();
     of_gpu_set_framebuffer(fb_addr, (uint16_t)fb_stride);
 }
 
-void of_emit_finish(void) { of_gpu_finish(); }
+void of_emit_finish(void)
+{
+    flush_span_batch();
+    /* Bracket the GPU drain itself.  flush_span_batch is a CPU-side
+     * cache flush + ring header — fast and predictable; the spin in
+     * of_gpu_finish() is where CPU actually blocks on GPU. */
+    extern unsigned int pq_prof_gpu_wait_cycles;
+    extern cvar_t       pq_cycleprof;
+    int profiling = (int)pq_cycleprof.value;
+    unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
+    of_gpu_finish();
+    if (profiling) pq_prof_gpu_wait_cycles += SYS_CYCLE_LO - t0;
+}
 
 /* Publish the CPU-side write pointer to the GPU without waiting. Lets
  * the GPU start consuming a batch of queued commands while the CPU
  * moves on to the next batch's setup work. Without this, the GPU only
  * sees new work when the ring fills (slow-path publish in
  * _gpu_ring_ensure) or when of_emit_finish() is called. */
-void of_emit_kick(void) { of_gpu_kick(); }
+void of_emit_kick(void)
+{
+    flush_span_batch();
+    of_gpu_kick();
+}
 
 void of_emit_cache_clean(const void *addr, uint32_t size)
 {
@@ -318,6 +167,7 @@ void of_emit_cache_clean(const void *addr, uint32_t size)
 void of_emit_clear(uint32_t flags, uint16_t color, uint16_t depth)
 {
     (void)depth;  /* Z buffer dropped */
+    flush_span_batch();
     of_gpu_clear(flags, color);
 }
 
@@ -328,7 +178,9 @@ void of_emit_depth_test(of_emit_depth_func_t func)
 
 void of_emit_span(const of_emit_span_t *sp)
 {
-    of_gpu_draw_span((const of_gpu_span_t *)sp);
+    span_buf[span_buf_count++] = *(const of_gpu_span_t *)sp;
+    if (span_buf_count >= OF_GPU_BATCH_MAX_SPANS)
+        flush_span_batch();
 }
 
 void of_emit_blit(int dst_x, int dst_y,
@@ -371,17 +223,20 @@ void of_emit_blit(int dst_x, int dst_y,
 
 void of_emit_triangles(const of_emit_vertex_t *verts, uint32_t num_vertices)
 {
+    flush_span_batch();
     of_gpu_draw_triangles((const of_gpu_vertex_t *)verts, num_vertices);
 }
 
 void of_emit_triangles_batch(const of_emit_vertex_t *verts,
                              uint32_t num_vertices)
 {
+    flush_span_batch();
     of_gpu_draw_triangles_batch((const of_gpu_vertex_t *)verts, num_vertices);
 }
 
 void of_emit_bind_texture(const of_emit_texture_t *tex)
 {
+    flush_span_batch();
     of_gpu_texture_t gt = {
         .addr   = tex->addr,
         .width  = tex->width,
@@ -445,7 +300,7 @@ void VID_Init(unsigned char *palette)
     d_pzbuffer = (short *)of_uncached(zbuffer_storage);
     D_InitCaches(surfcache_storage, SURFCACHE_SIZE);
 
-    of_emit_init();                  /* GPU up, GEQUAL, Gouraud on */
+    of_emit_init();
     VID_SetPalette(palette);
     of_emit_upload_colormap(host_colormap, 64 * 256);
 
@@ -469,16 +324,15 @@ void VID_Init(unsigned char *palette)
                         (uint32_t)(uintptr_t)zbuffer_storage,
                         BASEWIDTH * 2);
     }
-    vid.buffer = vid.conbuffer = (byte *)of_uncached(of_video_surface());
+    /* Capture the kernel's current draw slot AFTER the init-time
+     * kernel-driven flip cycle has cycled through all three buffers
+     * and cleared them.  acquire_next(-1) is a pure read — sync to
+     * hardware state, return current buf_draw without any handoff. */
+    draw_idx = of_video_acquire_next(-1);
+    vid.buffer = vid.conbuffer = (byte *)of_uncached(of_video_buffer_addr(draw_idx));
 
-    Sys_Printf("VID_Init: fullbright=%d buffer=%p\n",
-               vid.fullbright, vid.buffer);
-
-    /* One-shot diagnostic for the D_ALIAS_GOURAUD=0 cmap-row-0 mystery
-     * in d_polyse.c.  Verifies (1) host_colormap[0..255] really is
-     * identity, and (2) the GPU agrees.  Output goes to UART.  Remove
-     * the call once the symptom is understood. */
-    of_dbg_verify_cmap_row0(host_colormap);
+    Sys_Printf("VID_Init: fullbright=%d buffer=%p draw_idx=%d\n",
+               vid.fullbright, vid.buffer, draw_idx);
 }
 
 void VID_Shutdown(void) { of_video_set_display_mode(OF_DISPLAY_TERMINAL); }
@@ -487,18 +341,42 @@ void VID_Update(vrect_t *rects)
 {
     (void)rects;
 
-    of_emit_finish();
-    of_video_flip();
-    vid.buffer = vid.conbuffer = (byte *)of_uncached(of_video_surface());
+    /* GPU-triggered flip path (cr-gpu-triggered-flip.md).
+     *
+     * Old path (pre-CR): of_emit_finish() → of_video_flip().  The
+     * finish spun on fence_reached + STATUS_BUSY waiting for
+     * m_wr_inflight to drain (the workaround for the race the
+     * fence-write-completion CR fixed); the flip syscall blocked on
+     * buffer ownership in the kernel.  ~340 µs/frame combined.
+     *
+     * New path: emit CMD_FLIP for the slot we just rendered, kick
+     * the ring, then ask the kernel for the next free draw slot.
+     * CMD_FLIP's drain semantics (now in RTL) replace the CPU spin;
+     * of_video_acquire_next blocks ONLY when the 3-buffer ceiling
+     * is hit (CPU ran more than one frame ahead of the display) —
+     * steady-state cost is ~10 µs of book-keeping. */
+
+    flush_span_batch();
+    of_gpu_flip_to(draw_idx);
+    of_gpu_kick();
+
+    extern cvar_t pq_cycleprof;
+    int profiling = (int)pq_cycleprof.value;
+    unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
+    draw_idx = of_video_acquire_next(draw_idx);
+    if (profiling) pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
 
     /* Bind the new buffer + z-buffer to the GPU, then HW-clear the
-     * z-buffer so alias/sprite depth tests start fresh. FB clearing
+     * z-buffer so alias/sprite depth tests start fresh.  FB clearing
      * isn't needed — world spans cover every pixel (or sky fills any
-     * gaps on the CPU side). Kick after queueing so the clear overlaps
-     * the start of the next frame's CPU work (BSP traversal, surface
-     * cache build, etc.) instead of waiting for of_emit_finish at the
-     * next VID_Update. */
-    of_emit_bind_fb((uint32_t)(uintptr_t)of_video_surface(), BASEWIDTH,
+     * gaps on the CPU side).  Kick after queueing so the clear
+     * overlaps the start of the next frame's CPU work (BSP traversal,
+     * surface cache build, etc.) instead of stalling on the next
+     * VID_Update's flush. */
+    uint8_t *new_fb = of_video_buffer_addr(draw_idx);
+    vid.buffer = vid.conbuffer = (byte *)of_uncached(new_fb);
+
+    of_emit_bind_fb((uint32_t)(uintptr_t)new_fb, BASEWIDTH,
                     (uint32_t)(uintptr_t)zbuffer_storage, BASEWIDTH * 2);
     of_emit_clear(OF_EMIT_CLEAR_DEPTH, 0, 0);
     of_emit_kick();
