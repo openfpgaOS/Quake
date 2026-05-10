@@ -745,17 +745,16 @@ Fills a box of pixels with a single color
 */
 void Draw_Fill (int x, int y, int w, int h, int c)
 {
-	byte			*dest;
 	unsigned short	*pusdest;
 	unsigned		uc;
 	int				u, v;
 
 	if (r_pixbytes == 1)
 	{
-		dest = vid.buffer + y*vid.rowbytes + x;
-		for (v=0 ; v<h ; v++, dest += vid.rowbytes)
-			for (u=0 ; u<w ; u++)
-				dest[u] = c;
+		/* GPU CMD_CLEAR_RECT — single ring command, no per-pixel CPU
+		 * work.  Beats the previous tight uncached-SDRAM byte-write
+		 * loop on any non-trivial rect size. */
+		of_emit_clear_rect(x, y, w, h, (unsigned char)c);
 	}
 	else
 	{

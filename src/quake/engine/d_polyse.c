@@ -533,7 +533,7 @@ void D_PolysetUpdateTables (void)
 D_PolysetScanLeftEdge
 ====================
 */
-PQ_FASTTEXT void D_PolysetScanLeftEdge (int height)
+PQ_HOT void D_PolysetScanLeftEdge (int height)
 {
 
 	do
@@ -657,7 +657,7 @@ void D_PolysetSetUpForLineScan(fixed8_t startvertu, fixed8_t startvertv,
 D_PolysetCalcGradients
 ================
 */
-PQ_FASTTEXT void D_PolysetCalcGradients (int skinwidth)
+PQ_HOT void D_PolysetCalcGradients (int skinwidth)
 {
 	float	xstepdenominv, ystepdenominv, t0, t1;
 	float	p01_minus_p21, p11_minus_p21, p00_minus_p20, p10_minus_p20;
@@ -744,7 +744,7 @@ void InitGel (byte *palette)
 D_PolysetDrawSpans8
 ================
 */
-PQ_FASTTEXT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
+PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 {
 	int		lcount;
 
@@ -827,7 +827,7 @@ Viewmodel variant: skips all Z-buffer reads and writes.
 The viewmodel renders last with ziscale*3, so it always passes the Z-test.
 ================
 */
-PQ_FASTTEXT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
+PQ_HOT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
 {
 	int		lcount;
 
@@ -938,7 +938,7 @@ void D_PolysetFillSpans8 (spanpackage_t *pspanpackage)
 D_RasterizeAliasPolySmooth
 ================
 */
-PQ_FASTTEXT void D_RasterizeAliasPolySmooth (void)
+PQ_HOT void D_RasterizeAliasPolySmooth (void)
 {
 	int				initialleftheight, initialrightheight;
 	int				*plefttop, *prighttop, *pleftbottom, *prightbottom;
@@ -1206,7 +1206,7 @@ PQ_FASTTEXT void D_RasterizeAliasPolySmooth (void)
 D_PolysetSetEdgeTable
 ================
 */
-PQ_FASTTEXT void D_PolysetSetEdgeTable (void)
+PQ_HOT void D_PolysetSetEdgeTable (void)
 {
 	int			edgetableindex;
 

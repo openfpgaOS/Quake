@@ -94,6 +94,12 @@ void of_emit_depth_test(of_emit_depth_func_t func);
 
 void of_emit_span(const of_emit_span_t *sp);
 
+/* Solid-color rectangle fill via the GPU's CMD_CLEAR_RECT primitive.
+ * (dst_x, dst_y) are in bound-FB pixel coords; (w, h) are pixels;
+ * `color` is a paletted byte.  Single ring command, no per-pixel CPU
+ * work — beats `Draw_Fill`'s tight uncached-SDRAM byte-write loop. */
+void of_emit_clear_rect(int dst_x, int dst_y, int w, int h, unsigned char color);
+
 /* 1-to-1 paletted blit of an `src_w × src_h` source rectangle (rooted
  * at (`src_x`, `src_y`) within `src_pitch`-wide image `src`) into the
  * currently-bound framebuffer at screen (`dst_x`, `dst_y`).  Affine,

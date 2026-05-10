@@ -28,12 +28,17 @@ extern "C" {
 /* Forward declare input state struct */
 struct of_input_state;
 
+/* Forward declare AWE per-voice config -- full definition in of_awe.h.
+ * Kept opaque here so this header doesn't pull the AWE-specific types
+ * into every TU that just wants the services table. */
+struct awe_voice_t;
+
 struct of_services_table {
     uint32_t magic;
     uint32_t version;
     uint32_t count;         /* Number of function pointers */
 
-    /* -- Video (12) -- */
+    /* -- Video (14) -- */
     void      (*video_init)(void);
     uint8_t * (*video_get_surface)(void);
     uint8_t * (*video_flip)(void);
@@ -46,6 +51,17 @@ struct of_services_table {
     void      (*video_flush_cache)(void);
     void      (*video_set_display_mode)(int mode);
     void      (*video_set_color_mode)(int mode);
+    /* GPU-triggered flip (cr-gpu-triggered-flip.md):
+     * acquire_next(just_flipped_idx, fence_token) — caller passes idx
+     * of the buffer they just emitted CMD_FLIP for and the fence
+     * token the SDK helper returned (or -1, 0 on first call).  Kernel
+     * waits for fence_reached >= token (proves CMD_FLIP retired and
+     * fb_swap_pending=1 was latched), then returns the third buffer:
+     * not current scanout and not queued for next vsync.  It does not
+     * wait for vsync.  buffer_addr(idx) — returns FB address of the
+     * given idx. */
+    int       (*video_acquire_next)(int just_flipped_idx, uint32_t fence_token);
+    uint8_t * (*video_buffer_addr)(int idx);
 
     /* -- Input (4) -- */
     void      (*input_poll)(void);
@@ -135,6 +151,82 @@ struct of_services_table {
      *    leaves these as NULL/0. */
     const void *smp_bank_preload_base;
     uint32_t    smp_bank_preload_size;
+
+    /* -- AWE coprocessor (RETIRED — slots kept for ABI stability) --
+     *    The AWE fabric coprocessor was removed; all of these slots are
+     *    wired to no-op stubs in services_table.c so SDK apps built
+     *    against the old ABI still link.  They silently do nothing.
+     *    Do NOT call these from new code; use the mixer + smp_voice
+     *    paths instead.  See of_awe.h for matching app-side stubs. */
+    void      (*awe_voice_load)(int voice, const struct awe_voice_t *v);
+    void      (*awe_voice_trigger)(int voice);
+    void      (*awe_voice_release)(int voice);
+    void      (*awe_voice_stop)(int voice);
+    void      (*awe_channel_set_volume)(int ch, int vol_0_127);
+    void      (*awe_channel_set_expression)(int ch, int expr_0_127);
+    void      (*awe_channel_set_pan)(int ch, int pan_0_127);
+    void      (*awe_channel_set_bend)(int ch, int bend_signed_8192);
+    void      (*awe_channel_set_mod)(int ch, int mod_0_127);
+    void      (*awe_channel_set_sustain)(int ch, int on_off);
+    void      (*awe_channel_set_brightness)(int ch, int br_0_127);
+    void      (*awe_channel_set_resonance)(int ch, int q_0_127);
+    void      (*awe_channel_set_reverb_send)(int ch, int send_0_255);
+    void      (*awe_channel_set_chorus_send)(int ch, int send_0_255);
+    void      (*awe_set_master_volume)(int vol_0_255);
+    void      (*awe_set_bend_range)(int cents);
+    uint64_t  (*awe_active_mask)(void);
+
+    /* Retired — returns 0. */
+    uint32_t  (*awe_tick_count)(void);
+
+    /* Retired — no-op. */
+    void      (*awe_set_hw_envelope)(int enabled);
+
+    /* Retired — no-op. */
+    void      (*awe_set_reverb_level)(int level);
+    void      (*awe_set_reverb_feedback)(int feedback);
+
+    /* Retired — no-op. */
+    void      (*awe_set_chorus_level)(int level);
+    void      (*awe_set_chorus_rate)(int rate);
+    void      (*awe_set_chorus_depth)(int depth);
+
+    /* Retired — no-op. */
+    void      (*awe_ramp1_trigger)(int voice, int stage, uint32_t rate);
+
+    /* -- Mixer group-aware allocation (append-only, ABI-stable) --
+     *    Atomic alloc-and-tag entry; lets callers that know which
+     *    group a new voice belongs to bias the slot search and steal
+     *    paths so MUSIC and SFX don't collide in the same slot range.
+     *    `mixer_voice_group` reads back the current tag for a slot
+     *    (cheap shadow read) so callers can validate ownership before
+     *    writing — used by the SW MIDI ISR to drop stale references
+     *    when a slot has been reassigned to another group.  Older
+     *    firmware leaves these as NULL; callers should fall back to
+     *    of_mixer_play + of_mixer_set_group when these are absent. */
+    int       (*mixer_alloc_for_group)(int group, const uint8_t *pcm_s16,
+                                       uint32_t sample_count,
+                                       uint32_t sample_rate,
+                                       int priority, int volume);
+    int       (*mixer_voice_group)(int voice);
+
+    /* -- Cache (append-only) -- */
+    /* Range-granular writeback + invalidate (cbo.flush per line).
+     * On this VexiiRiscv config, cbo.clean alone has been observed
+     * to leave dirty lines in L1 (the bank-preload + audio-mixer
+     * paths both regressed when using clean-only).  Use this when
+     * preparing a buffer to be read by an external AXI master like
+     * the GPU's m_rd_* or the audio mixer's per-voice fetch — they
+     * read DRAM directly, not through the CPU's cache.
+     * Older firmware leaves this NULL; callers should fall back to
+     * cache_flush() (full sweep) when this is absent. */
+    void      (*cache_flush_range)(void *addr, uint32_t size);
+
+    /* -- Input HID extensions (append-only) --
+     * Dock keyboard and mouse are APF Player 3/4 special controller
+     * reports, exposed separately from the two gamepad player snapshots. */
+    void      (*input_get_keyboard_state)(void *out);
+    void      (*input_read_mouse_state)(void *out);
 };
 
 #ifndef OF_PC

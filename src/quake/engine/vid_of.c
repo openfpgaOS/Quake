@@ -183,6 +183,19 @@ void of_emit_span(const of_emit_span_t *sp)
         flush_span_batch();
 }
 
+void of_emit_clear_rect(int dst_x, int dst_y, int w, int h, unsigned char color)
+{
+    if (w <= 0 || h <= 0) return;
+    /* of_gpu_clear_rect uses the SET_FB global stride, which already
+     * matches vid.rowbytes — no need to reissue SET_FB.  Span batch
+     * must drain first so the queued spans land before this clear
+     * (otherwise the clear would overwrite their pixels). */
+    const uint32_t fb_addr = (uint32_t)(uintptr_t)
+        (vid.buffer + (uint32_t)(dst_y * vid.rowbytes + dst_x));
+    flush_span_batch();
+    of_gpu_clear_rect(fb_addr, (uint16_t)w, (uint16_t)h, color);
+}
+
 void of_emit_blit(int dst_x, int dst_y,
                   int blit_w, int blit_h,
                   const unsigned char *src,
@@ -328,7 +341,7 @@ void VID_Init(unsigned char *palette)
      * kernel-driven flip cycle has cycled through all three buffers
      * and cleared them.  acquire_next(-1) is a pure read — sync to
      * hardware state, return current buf_draw without any handoff. */
-    draw_idx = of_video_acquire_next(-1);
+    draw_idx = of_video_acquire_next(-1, 0);
     vid.buffer = vid.conbuffer = (byte *)of_uncached(of_video_buffer_addr(draw_idx));
 
     Sys_Printf("VID_Init: fullbright=%d buffer=%p draw_idx=%d\n",
@@ -356,14 +369,21 @@ void VID_Update(vrect_t *rects)
      * is hit (CPU ran more than one frame ahead of the display) —
      * steady-state cost is ~10 µs of book-keeping. */
 
+    /* Wait for previous frame's swap to complete BEFORE emitting the
+     * next CMD_FLIP — the GPU's gpu_swap_req would otherwise race with
+     * the slave's still-pending bit and overwrite the queued slot.
+     * This wait sits AFTER render so it overlaps with rendering: when
+     * render time exceeds vsync period the wait collapses to ~0 µs. */
+    of_video_wait_flip();
+
     flush_span_batch();
-    of_gpu_flip_to(draw_idx);
+    uint32_t flip_token = of_gpu_flip_to(draw_idx);
     of_gpu_kick();
 
     extern cvar_t pq_cycleprof;
     int profiling = (int)pq_cycleprof.value;
     unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
-    draw_idx = of_video_acquire_next(draw_idx);
+    draw_idx = of_video_acquire_next(draw_idx, flip_token);
     if (profiling) pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
 
     /* Bind the new buffer + z-buffer to the GPU, then HW-clear the
