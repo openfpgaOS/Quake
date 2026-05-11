@@ -133,19 +133,20 @@ Risk: uncached writes may be slower than cached writes plus clean.
 
 **Simple variant — DONE.** `D_GPU_WORLD_LIGHT=1` is the default; `D_GpuLightSurface` replaces the per-texel CPU surface-cache build with one `R_BuildLightMap` + a single colormap-row byte per surface that the GPU consumes via `OF_EMIT_COLORMAP`.  Saves the per-texel CPU lookup (~5.5 cyc/texel × ~422k texels/frame on the dense scene) — confirmed by the per-bucket numbers: `CachSrf` is now 5.4 ms (cache-management work + lightmap build), down from the texel-rebuild cost the legacy path showed.
 
-**Better variant — IN PROGRESS (largest remaining engine-side lever).** Tessellate world surfaces into triangles with per-vertex Gouraud-interpolated light, dispatch through the existing `of_emit_triangles_batch` path.  Replaces the entire `R_ScanEdges` / AET / `D_DrawSurfaces` pipeline.
+**Better variant — DEFAULT WORLD PIXEL PATH.** Normal world surfaces now tessellate into triangles with per-vertex Gouraud-interpolated light and dispatch through the triangle path.  This replaces `D_CalcGradients` + `D_DrawSpans8` for normal world pixels. `R_ScanEdges` and `D_DrawZSpans` still run for visibility and CPU-side sprite/alias depth until GPU depth returns.
 
-  - Eliminates: `DrwSurf` (23.1 ms), `GenSpan` (10.9), `Insert` (3.5), `StepU` (4.7), `CalcGrd` (5.5), the unaccounted ~22 ms outer AET work, plus part of `RndFace` (the edge-emit half) — total ~75 ms at the dense reference scene.
+  - Eliminates now: normal-world `CalcGrd` + `D_DrawSpans8`.
+  - Still costs now: `R_ScanEdges`, AET stepping, and `D_DrawZSpans`. During this phase `R_ScanEdges` and `R_DrawSurfaceTris` both run, so frame time can temporarily improve modestly or even rise until GPU depth lets the AET path go away.
   - Adds: `R_DrawSurfaceTris` cost — emit ~2-4 triangles per visible surface = ~1500 vertices/frame on the dense scene, comfortably under the existing alias triangle-batch budget.  Estimate +5-8 ms of new CPU work.
-  - Net: 104.8 ms → ~30 ms = ~33 FPS on the dense scene.  Sparse scene → ~50 FPS.
+  - Target after GPU depth + AET removal: 104.8 ms → ~30 ms = ~33 FPS on the dense scene.  Sparse scene → ~50 FPS.
 
 Phased implementation:
 
-  - **Phase 1 — scaffolding (DONE).**  Compile-time flag `D_GPU_WORLD_TRIS` (default 0) added in `d_scan.c`.  `R_DrawSurfaceTris(msurface_t *fa, int miplevel)` defined under the flag.  No wiring yet — flag-off builds are byte-identical.
+  - **Phase 1 — scaffolding (DONE).**  `R_DrawSurfaceTris(msurface_t *fa, int miplevel)` exists in `d_scan.c`; the compile-time world-span fallback has been removed from the normal world path.
   - **Phase 2 — vertex collection (DONE).**  `R_CollectSurfaceVerts` walks `msurface_t::firstedge .. +numedges` via `currententity->model->surfedges` + `pedges`, mirroring `R_RenderFace`'s negative-surfedge handling.  Per vertex: `VectorSubtract(world, modelorg)` + `TransformVector` → camera space; `1/z` + `xscale * x/z + xcenter` → screen space; `DotProduct(world, texinfo->vecs[0/1]) + offset` → absolute texel coords.  Output: stack-local `r_tri_vert_t poly[32]` carrying world xyz, camera xyz, screen u/v, 1/z, and absolute s/t.  Near-plane clamp inside the collector (`z = max(z, NEAR_CLIP)`) is a Phase 3 placeholder.  Flag-on build verified clean.
   - **Phase 3 — frustum-near clip (DONE).**  `R_NearClipPoly` runs Sutherland-Hodgman against camera-space `z = NEAR_CLIP`.  Walks consecutive vertex pairs, emits intersection vertices via `R_NearPlaneInterp` (linear lerp in world / cam / s / t; recomputes screen u,v,1/z fresh from the interpolated cam since perspective is nonlinear).  Output ≤ n_in+1 vertices; `< 3` returns early.  Caller passes a pair of `r_tri_vert_t[N+1]` ping-pong buffers.
   - **Phase 4 — tessellation + UV/light.**  Triangle-fan from vertex 0; per vertex compute (s,t) from `texinfo->vecs` and sample the lightmap at the equivalent luxel for the Gouraud `r=g=b` byte (mirror `R_BuildLightMap` math but per-vertex).  Pack into `of_emit_vertex_t`.
-  - **Phase 5 — dispatch + wire-up (DONE).**  `R_DrawSurfaceTris` binds the surface's mip texture via `of_emit_bind_texture` (animated textures resolved through `R_TextureAnimation`), builds a triangle fan from `verts[0]`, dispatches via `of_emit_triangles_batch`.  `d_edge.c`'s per-surface dispatch gates on `D_GPU_WORLD_TRIS`: when on, calls `R_DrawSurfaceTris` instead of `D_CalcGradients` + `(*d_drawspans)`.  `D_DrawZSpans` still runs unconditionally to populate the CPU z-buffer (sprite/alias depth — triangle path doesn't co-write z post Phase 2.3).  Macro lives in `d_local.h` so both files see the same value.  Default still 0; flip to 1 to enable.  Flag-on build verified: text grows by ~2.3 KB, symbol resolves.  Visual regression on hardware required before flipping the default.
+  - **Phase 5 — dispatch + wire-up (DONE).**  `R_DrawSurfaceTris` binds the surface's mip texture via `of_emit_bind_texture` (animated textures resolved through `R_TextureAnimation`), builds a triangle fan from `verts[0]`, dispatches through one-triangle commands, and is now the unconditional normal-world surface path in `d_edge.c`.  `D_DrawZSpans` still runs unconditionally to populate the CPU z-buffer (sprite/alias depth — triangle path doesn't co-write z post Phase 2.3). Large-count `of_emit_triangles_batch` remains an RTL validation item before world rendering should depend on it.
   - **Phase 6 — quality fixes.**  For surfaces where the lightmap varies sharply (long walls with multi-luxel light), the triangle-fan approximation produces visible Mach banding.  Subdivide such surfaces into a 4×4 or 8×8 grid (lightmap-luxel-aligned).  Detect via lightmap variance threshold.
 
 Each phase is a separable commit.  Hardware visual testing is required from Phase 5 onward; the plan can't be completed in one session without that loop.
@@ -200,13 +201,13 @@ Particles are many tiny z-tested rectangles. Submitting each as GPU geometry lik
 
 ## 7. Recommended order
 
-Status: T0–T4 shipped, T6 simple shipped (`D_GPU_WORLD_LIGHT=1`), T8 inconclusive (~1.5 ms win not worth the complexity).  §4 gateware bugs all fixed in deployed bitstream.  Reference captures with `-O3 + LTO`: dense scene (AET 846) 104.8 ms / ~10 FPS; sparse scene (AET 151) 68.2 ms / ~14 FPS.
+Status: T0–T4 shipped, T6 better is now the default normal-world pixel path, T8 inconclusive (~1.5 ms win not worth the complexity).  §4 gateware bugs all fixed in deployed bitstream.  Reference captures with `-O3 + LTO`: dense scene (AET 846) 104.8 ms / ~10 FPS; sparse scene (AET 151) 68.2 ms / ~14 FPS.
 
 Remaining ranking:
 
-1. **T6 better — tessellate world to GPU triangles.**  Single largest lever available.  Projected ~104.8 ms → ~30 ms on the dense scene = ~33 FPS, ~50 FPS on sparse scenes.  Now reachable: §4 gateware blockers (triangle perspective, world span drift, mask state bleed) all landed in `gpu_core.v` and are live in the deployed bitstream.  ~1 week of engine work.
-2. **T5** — surface-cache flush ecall cost is on the order of hundreds of calls per frame; worth measuring with `pq_cycleprof 2` since it's now the only other untried lever.  Likely a few-ms win.
-3. **T7** — correctness work for surface-cache GPU lifetime.  Less urgent now that T6 simple is shipped (the surface-cache lifetime invariant the simple path needs is already enforced); becomes more relevant if T6 better leaves any cache references live across triangle batches.
+1. **GPU depth + AET removal.**  T6 better still pays `R_ScanEdges` and `D_DrawZSpans`; removing those requires GPU depth first.
+2. **T5** — surface-cache flush ecall cost is on the order of hundreds of calls per frame on legacy span paths; worth re-measuring with `pq_cycleprof 2` after triangle-world hardware captures.
+3. **T7** — correctness work for surface-cache GPU lifetime.  Less urgent now that normal world surfaces no longer use the legacy surface cache path.
 
 Beyond the catalog: algorithmic improvements to `R_RecursiveWorldNode` (BSP traversal) and `R_RenderFace`'s edge-emit half are still tractable but small (~5-8 ms estimated).  Higher CPU clock (gateware-only timing-closure work) gives a flat 25% across all buckets.  Adding I-cache miss/stall counters to the fabric would unblock measured tuning so future T8-style experiments aren't speculative.
 

@@ -39,71 +39,72 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 {
 	byte		*pbase = cacheblock;
 
-	/* GPU path. Each visible scanline of the projected sprite polygon
-	 * was already computed by D_SpriteScanLeftEdge / D_SpriteScanRightEdge
-	 * into sprite_spans[]. We emit one perspective-correct GPU span
-	 * per scanline — same math as world surfaces in d_scan.c, but
-	 * with SKIP_ZERO (Quake sprites use 0xFF as transparent — matches
-	 * the GPU's SKIP_ZERO) and DEPTH_TEST (sprites get occluded by
-	 * the world). DEPTH_WRITE is OFF since sprites are transparent
-	 * and shouldn't pollute z for things drawn after them.  No
-	 * COLORMAP — sprite colors pass through raw to the framebuffer.
-	 *
-	 * Flush the sprite frame's pixel data once per unique frame so
-	 * the GPU reads fresh bytes via AXI. Sprite frames are loaded once
-	 * per level and never modified, so the static-tracking is just to
-	 * amortise the syscall across many sprites of the same frame in
-	 * a single hot scene. */
-	{
-		static byte *last_sprite_flushed = 0;
-		if (pbase != last_sprite_flushed) {
-			last_sprite_flushed = pbase;
-			of_emit_cache_clean(pbase, cachewidth * sprite_height);
+	if (of_emit_supports(OF_EMIT_CAP_PERSP)) {
+		/* GPU perspective path. Each visible scanline of the projected
+		 * sprite polygon was already computed by D_SpriteScanLeftEdge /
+		 * D_SpriteScanRightEdge into sprite_spans[]. We emit one
+		 * perspective-correct GPU span per scanline — same math as world
+		 * surfaces in d_scan.c, but with SKIP_ZERO (Quake sprites use
+		 * 0xFF as transparent — matches the GPU's SKIP_ZERO). No COLORMAP
+		 * — sprite colors pass through raw to the framebuffer. If
+		 * perspective spans are not advertised, the legacy CPU path below
+		 * preserves the original z test.
+		 *
+		 * Flush the sprite frame's pixel data once per unique frame so
+		 * the GPU reads fresh bytes via AXI. Sprite frames are loaded once
+		 * per level and never modified, so the static-tracking is just to
+		 * amortise the syscall across many sprites of the same frame in
+		 * a single hot scene. */
+		{
+			static byte *last_sprite_flushed = 0;
+			if (pbase != last_sprite_flushed) {
+				last_sprite_flushed = pbase;
+				of_emit_cache_clean(pbase, cachewidth * sprite_height);
+			}
 		}
+
+		const float   sadjustf   = (float)sadjust;
+		const float   tadjustf   = (float)tadjust;
+		const int32_t sdivz_step = (int32_t)(d_sdivzstepu * 65536.0f);
+		const int32_t tdivz_step = (int32_t)(d_tdivzstepu * 65536.0f);
+		const int32_t zi_step    = (int32_t)(d_zistepu    * 65536.0f);
+		extern viddef_t vid;
+		const uint32_t fb_base   = (uint32_t)(uintptr_t)vid.buffer;
+		const int      fb_row    = vid.rowbytes;
+
+		do {
+			const int u = pspan->u;
+			const int v = pspan->v;
+			const int count = pspan->count;
+			if (count <= 0) { pspan++; continue; }
+
+			const float sdivz_q = d_sdivzorigin + v*d_sdivzstepv + u*d_sdivzstepu;
+			const float tdivz_q = d_tdivzorigin + v*d_tdivzstepv + u*d_tdivzstepu;
+			const float zi_q    = d_ziorigin    + v*d_zistepv    + u*d_zistepu;
+
+			of_emit_span_t sp = {
+				.fb_addr    = fb_base + (uint32_t)(v * fb_row + u),
+				.tex_addr   = (uint32_t)(uintptr_t)pbase,
+				.count      = (uint16_t)count,
+				.flags      = OF_EMIT_PERSP | OF_EMIT_SKIP_ZERO,
+				.fb_stride  = 1,
+				.tex_width  = (uint16_t)cachewidth,
+				.sdivz      = (int32_t)(sdivz_q * 65536.0f + sadjustf * zi_q),
+				.tdivz      = (int32_t)(tdivz_q * 65536.0f + tadjustf * zi_q),
+				.zi_persp   = (int32_t)(zi_q    * 65536.0f),
+				.sdivz_step = sdivz_step,
+				.tdivz_step = tdivz_step,
+				.zi_step    = zi_step,
+			};
+			of_emit_span(&sp);
+
+			pspan++;
+		} while (pspan->count != DS_SPAN_LIST_END);
+
+		of_emit_kick();
+		return;
 	}
 
-	const float   sadjustf   = (float)sadjust;
-	const float   tadjustf   = (float)tadjust;
-	const int32_t sdivz_step = (int32_t)(d_sdivzstepu * 65536.0f);
-	const int32_t tdivz_step = (int32_t)(d_tdivzstepu * 65536.0f);
-	const int32_t zi_step    = (int32_t)(d_zistepu    * 65536.0f);
-	const int32_t izi_step   = (int32_t)(d_zistepu * 0x8000 * 0x10000);
-	extern viddef_t vid;
-	const uint32_t fb_base   = (uint32_t)(uintptr_t)vid.buffer;
-	const int      fb_row    = vid.rowbytes;
-
-	do {
-		const int u = pspan->u;
-		const int v = pspan->v;
-		const int count = pspan->count;
-		if (count <= 0) { pspan++; continue; }
-
-		const float sdivz_q = d_sdivzorigin + v*d_sdivzstepv + u*d_sdivzstepu;
-		const float tdivz_q = d_tdivzorigin + v*d_tdivzstepv + u*d_tdivzstepu;
-		const float zi_q    = d_ziorigin    + v*d_zistepv    + u*d_zistepu;
-
-		of_emit_span_t sp = {
-			.fb_addr    = fb_base + (uint32_t)(v * fb_row + u),
-			.tex_addr   = (uint32_t)(uintptr_t)pbase,
-			.count      = (uint16_t)count,
-			.flags      = OF_EMIT_PERSP | OF_EMIT_SKIP_ZERO,
-			.fb_stride  = 1,
-			.tex_width  = (uint16_t)cachewidth,
-			.sdivz      = (int32_t)(sdivz_q * 65536.0f + sadjustf * zi_q),
-			.tdivz      = (int32_t)(tdivz_q * 65536.0f + tadjustf * zi_q),
-			.zi_persp   = (int32_t)(zi_q    * 65536.0f),
-			.sdivz_step = sdivz_step,
-			.tdivz_step = tdivz_step,
-			.zi_step    = zi_step,
-		};
-		of_emit_span(&sp);
-
-		pspan++;
-	} while (pspan->count != DS_SPAN_LIST_END);
-
-	of_emit_kick();
-	return;
-#if 0   /* legacy CPU path, kept for reference */
 	int			count, spancount, izistep;
 	int			izi;
 	byte		*pdest;
@@ -252,7 +253,6 @@ NextSpan:
 		pspan++;
 
 	} while (pspan->count != DS_SPAN_LIST_END);
-#endif  /* legacy CPU path */
 }
 
 #endif
@@ -506,4 +506,3 @@ void D_DrawSprite (void)
 	D_SpriteScanRightEdge ();
 	D_SpriteDrawSpans (sprite_spans);
 }
-

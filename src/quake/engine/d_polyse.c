@@ -295,97 +295,100 @@ void D_DrawNonSubdiv (void)
 	}
 
 #if D_USE_GPU_ALIAS == 2
-	/* Bind the alias skin as the active texture. One SET_TEXTURE per
-	 * model (not per triangle) — cheap MMIO. */
-	{
-		of_emit_texture_t skin = {
-			.addr   = (uint32_t)(uintptr_t)r_affinetridesc.pskin,
-			.width  = (uint16_t)r_affinetridesc.skinwidth,
-			.height = (uint16_t)r_affinetridesc.skinheight,
-		};
-		of_emit_bind_texture(&skin);
-	}
-
-	/* Batch front-facing triangles into one DRAW_TRIANGLES command per
-	 * model (or per chunk if the model is huge). At 18 ring words per
-	 * triangle in batched form (1 cmd hdr + 1 count + 18N), 128 tris
-	 * = 2 + 128*18 = 2306 words = 9.2 KB, comfortably under the 16 KB
-	 * ring. Most Quake alias models have <300 triangles, so a single
-	 * model usually fits in one or two batches. */
-	#define BATCH_TRIS_MAX  128
-	static of_emit_vertex_t batch_buf[BATCH_TRIS_MAX * 3];
-	int batch_count = 0;
-
-	#define PACK_V(dst, src, sval) do {                                     \
-		int _z = (src)->v[5] >> 16;                                         \
-		if (_z > 0xFFFF) _z = 0xFFFF;                                       \
-		if (_z < 0)      _z = 0;                                            \
-		int _w;                                                             \
-		if (D_ALIAS_PERSP) {                                                \
-			_w = (src)->v[5] >> 15;                                         \
-			if (_w >= 0x10000) _w = 0xFFFF;                                 \
-			if (_w < 1)        _w = 1;                                      \
-		} else {                                                            \
-			_w = 0x10000;                                                   \
-		}                                                                   \
-		byte _l;                                                            \
-		if (D_ALIAS_GOURAUD) {                                              \
-			int _row = (src)->v[4] >> 8;                                    \
-			if (_row > 63) _row = 63;                                       \
-			if (_row < 0)  _row = 0;                                        \
-			_l = (byte)_row;                                                \
-		} else {                                                            \
-			_l = 0;                                                         \
-		}                                                                   \
-		(dst).x   = (int16_t)((src)->v[0] << 4);                            \
-		(dst).y   = (int16_t)((src)->v[1] << 4);                            \
-		(dst).z   = (uint16_t)_z;                                           \
-		(dst).pad = 0;                                                      \
-		(dst).s   = (sval);                                                 \
-		(dst).t   = (src)->v[3];                                            \
-		(dst).w   = (int32_t)_w;                                            \
-		(dst).r = _l; (dst).g = _l; (dst).b = _l; (dst).a = 0xFF;           \
-	} while (0)
-
-	for (i = 0; i < lnumtriangles; i++, ptri++) {
-		index0 = pfv + ptri->vertindex[0];
-		index1 = pfv + ptri->vertindex[1];
-		index2 = pfv + ptri->vertindex[2];
-
-		d_xdenom = (index0->v[1]-index1->v[1]) *
-		           (index0->v[0]-index2->v[0]) -
-		           (index0->v[0]-index1->v[0]) *
-		           (index0->v[1]-index2->v[1]);
-		if (d_xdenom >= 0)
-			continue;   /* back-face cull */
-
-		int s0 = index0->v[2], s1 = index1->v[2], s2 = index2->v[2];
-		if (!ptri->facesfront) {
-			if (index0->flags & ALIAS_ONSEAM) s0 += r_affinetridesc.seamfixupX16;
-			if (index1->flags & ALIAS_ONSEAM) s1 += r_affinetridesc.seamfixupX16;
-			if (index2->flags & ALIAS_ONSEAM) s2 += r_affinetridesc.seamfixupX16;
+	if (of_emit_supports(OF_EMIT_CAP_TRIANGLES)) {
+		/* Bind the alias skin as the active texture. One SET_TEXTURE per
+		 * model (not per triangle) — cheap MMIO. */
+		{
+			of_emit_texture_t skin = {
+				.addr   = (uint32_t)(uintptr_t)r_affinetridesc.pskin,
+				.width  = (uint16_t)r_affinetridesc.skinwidth,
+				.height = (uint16_t)r_affinetridesc.skinheight,
+			};
+			of_emit_bind_texture(&skin);
 		}
 
-		PACK_V(batch_buf[batch_count*3 + 0], index0, s0);
-		PACK_V(batch_buf[batch_count*3 + 1], index1, s1);
-		PACK_V(batch_buf[batch_count*3 + 2], index2, s2);
-		batch_count++;
+		/* Batch front-facing triangles into one DRAW_TRIANGLES command per
+		 * model (or per chunk if the model is huge). At 18 ring words per
+		 * triangle in batched form (1 cmd hdr + 1 count + 18N), 128 tris
+		 * = 2 + 128*18 = 2306 words = 9.2 KB, comfortably under the 16 KB
+		 * ring. Most Quake alias models have <300 triangles, so a single
+		 * model usually fits in one or two batches. */
+		#define BATCH_TRIS_MAX  128
+		static of_emit_vertex_t batch_buf[BATCH_TRIS_MAX * 3];
+		int batch_count = 0;
 
-		if (batch_count == BATCH_TRIS_MAX) {
+		#define PACK_V(dst, src, sval) do {                                     \
+			int _z = (src)->v[5] >> 16;                                         \
+			if (_z > 0xFFFF) _z = 0xFFFF;                                       \
+			if (_z < 0)      _z = 0;                                            \
+			int _w;                                                             \
+			if (D_ALIAS_PERSP) {                                                \
+				_w = (src)->v[5] >> 15;                                         \
+				if (_w >= 0x10000) _w = 0xFFFF;                                 \
+				if (_w < 1)        _w = 1;                                      \
+			} else {                                                            \
+				_w = 0x10000;                                                   \
+			}                                                                   \
+			byte _l;                                                            \
+			if (D_ALIAS_GOURAUD) {                                              \
+				int _row = (src)->v[4] >> 8;                                    \
+				if (_row > 63) _row = 63;                                       \
+				if (_row < 0)  _row = 0;                                        \
+				_l = (byte)_row;                                                \
+			} else {                                                            \
+				_l = 0;                                                         \
+			}                                                                   \
+			(dst).x   = (int16_t)((src)->v[0] << 4);                            \
+			(dst).y   = (int16_t)((src)->v[1] << 4);                            \
+			(dst).z   = (uint16_t)_z;                                           \
+			(dst).pad = 0;                                                      \
+			(dst).s   = (sval);                                                 \
+			(dst).t   = (src)->v[3];                                            \
+			(dst).w   = (int32_t)_w;                                            \
+			(dst).r = _l; (dst).g = _l; (dst).b = _l; (dst).a = 0xFF;           \
+		} while (0)
+
+		for (i = 0; i < lnumtriangles; i++, ptri++) {
+			index0 = pfv + ptri->vertindex[0];
+			index1 = pfv + ptri->vertindex[1];
+			index2 = pfv + ptri->vertindex[2];
+
+			d_xdenom = (index0->v[1]-index1->v[1]) *
+			           (index0->v[0]-index2->v[0]) -
+			           (index0->v[0]-index1->v[0]) *
+			           (index0->v[1]-index2->v[1]);
+			if (d_xdenom >= 0)
+				continue;   /* back-face cull */
+
+			int s0 = index0->v[2], s1 = index1->v[2], s2 = index2->v[2];
+			if (!ptri->facesfront) {
+				if (index0->flags & ALIAS_ONSEAM) s0 += r_affinetridesc.seamfixupX16;
+				if (index1->flags & ALIAS_ONSEAM) s1 += r_affinetridesc.seamfixupX16;
+				if (index2->flags & ALIAS_ONSEAM) s2 += r_affinetridesc.seamfixupX16;
+			}
+
+			PACK_V(batch_buf[batch_count*3 + 0], index0, s0);
+			PACK_V(batch_buf[batch_count*3 + 1], index1, s1);
+			PACK_V(batch_buf[batch_count*3 + 2], index2, s2);
+			batch_count++;
+
+			if (batch_count == BATCH_TRIS_MAX) {
+				of_emit_triangles_batch(batch_buf, batch_count * 3);
+				of_emit_kick();
+				batch_count = 0;
+			}
+		}
+
+		if (batch_count > 0) {
 			of_emit_triangles_batch(batch_buf, batch_count * 3);
 			of_emit_kick();
-			batch_count = 0;
 		}
-	}
 
-	if (batch_count > 0) {
-		of_emit_triangles_batch(batch_buf, batch_count * 3);
-		of_emit_kick();
+		#undef PACK_V
+		#undef BATCH_TRIS_MAX
+		return;
 	}
-
-	#undef PACK_V
-	#undef BATCH_TRIS_MAX
-#else
+#endif
 	for (i = 0; i < lnumtriangles; i++, ptri++) {
 		index0 = pfv + ptri->vertindex[0];
 		index1 = pfv + ptri->vertindex[1];
@@ -411,7 +414,6 @@ void D_DrawNonSubdiv (void)
 		D_PolysetSetEdgeTable ();
 		D_RasterizeAliasPolySmooth ();
 	}
-#endif
 }
 
 

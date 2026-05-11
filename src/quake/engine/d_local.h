@@ -91,6 +91,13 @@ PQ_FASTTEXT void D_DrawZSpans (espan_t *pspans);
 #define D_GPU_WORLD_TRIS 1
 #endif
 
+/* Radical GPU-world path: render ordinary static BSP faces directly as
+ * GPU triangles during BSP traversal and leave the old edge/AET renderer
+ * for sky, turbulent water, and bmodels. */
+#ifndef D_GPU_WORLD_DIRECT
+#define D_GPU_WORLD_DIRECT 1
+#endif
+
 struct msurface_s;
 void R_DrawSurfaceTris (struct msurface_s *fa, int miplevel);
 /* Flush any accumulated world triangles to the GPU.  Caller must
@@ -134,4 +141,3 @@ extern int		d_minmip;
 extern float	d_scalemip[3];
 
 extern void (*d_drawspans) (espan_t *pspan);
-

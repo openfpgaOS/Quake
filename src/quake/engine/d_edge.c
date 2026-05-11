@@ -24,11 +24,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "sysreg_stub.h"
 
 extern int	pq_combined_z_active;
+extern int	r_gpu_world_direct_active;
 
 /* Sub-profiling for D_DrawSurfaces breakdown */
 unsigned int pq_prof_ds_calcgrad_cycles;
 unsigned int pq_prof_ds_cachesurf_cycles;
 unsigned int pq_prof_ds_sky_cycles;
+extern unsigned int pq_prof_spans8_cycles_frame;
+extern unsigned int pq_prof_zspans_cycles_frame;
 extern cvar_t pq_cycleprof;
 
 static int	miplevel;
@@ -208,7 +211,9 @@ PQ_HOT void D_DrawSurfaces (void)
 			d_ziorigin = s->d_ziorigin;
 
 			D_DrawSolidSurface (s, (int)s->data & 0xFF);
+			if (profiling) prof_t = SYS_CYCLE_LO;
 			D_DrawZSpans (s->spans);
+			if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
 		}
 	}
 	else
@@ -243,8 +248,13 @@ PQ_HOT void D_DrawSurfaces (void)
 				d_zistepv = 0;
 				d_ziorigin = -0.9;
 
-				D_DrawSolidSurface (s, (int)r_clearcolor.value & 0xFF);
-				D_DrawZSpans (s->spans);
+				if (!r_gpu_world_direct_active)
+				{
+					D_DrawSolidSurface (s, (int)r_clearcolor.value & 0xFF);
+					if (profiling) prof_t = SYS_CYCLE_LO;
+					D_DrawZSpans (s->spans);
+					if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+				}
 			}
 			else if (s->flags & SURF_DRAWTURB)
 			{
@@ -299,7 +309,11 @@ PQ_HOT void D_DrawSurfaces (void)
 				if (profiling) pq_prof_ds_calcgrad_cycles += SYS_CYCLE_LO - prof_t;
 				Turbulent8 (s->spans);
 				if (!pq_combined_z_active)
+				{
+					if (profiling) prof_t = SYS_CYCLE_LO;
 					D_DrawZSpans (s->spans);
+					if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+				}
 				pq_combined_z_active = 0;
 			}
 			else
@@ -363,7 +377,7 @@ PQ_HOT void D_DrawSurfaces (void)
 #endif
 				if (profiling) pq_prof_ds_cachesurf_cycles += SYS_CYCLE_LO - prof_t;
 
-#if D_GPU_WORLD_TRIS
+	#if D_GPU_WORLD_TRIS && !D_GPU_WORLD_DIRECT
 				/* T6 better: tessellate the surface into GPU triangles
 				 * with per-vertex Gouraud light from blocklights[]
 				 * (populated by D_GpuLightSurface above).  Replaces
@@ -377,14 +391,20 @@ PQ_HOT void D_DrawSurfaces (void)
 				D_CalcGradients (pface);
 				if (profiling) pq_prof_ds_calcgrad_cycles += SYS_CYCLE_LO - prof_t;
 
+				if (profiling) prof_t = SYS_CYCLE_LO;
 				(*d_drawspans) (s->spans);
+				if (profiling) pq_prof_spans8_cycles_frame += SYS_CYCLE_LO - prof_t;
 #endif
 
 				/* CPU-side z-fill for sprite/alias depth occlusion.
 				 * Triangle path doesn't co-write z (depth dropped in
 				 * lean Phase 2.3) so this always runs under T6 better. */
 				if (!pq_combined_z_active)
+				{
+					if (profiling) prof_t = SYS_CYCLE_LO;
 					D_DrawZSpans (s->spans);
+					if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+				}
 				pq_combined_z_active = 0;
 			}
 		}
@@ -411,4 +431,3 @@ PQ_HOT void D_DrawSurfaces (void)
 	R_FlushWorldTriBatch ();
 #endif
 }
-

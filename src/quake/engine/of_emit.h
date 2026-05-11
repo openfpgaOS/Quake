@@ -33,6 +33,7 @@ typedef struct of_emit_span_s {
     uint16_t count;
     uint8_t  light;
     uint8_t  flags;
+    uint8_t  colormap_id;
     int16_t  fb_stride;
     uint16_t tex_width;
     /* POT wrap masks (tex_w-1 / tex_h-1).  Both 0 = no wrap. */
@@ -89,6 +90,23 @@ void of_emit_kick(void);    /* publish queued commands without waiting */
 void of_emit_cache_clean(const void *addr, uint32_t size);
 void of_emit_clear(uint32_t flags, uint16_t color, uint16_t depth);
 void of_emit_depth_test(of_emit_depth_func_t func);
+
+/* Runtime GPU capability gates, derived from openfpgaOS caps at init.
+ * SPAN is Quake's required floor; everything else is optional and must
+ * be checked before using newer commands. */
+#define OF_EMIT_CAP_SPAN       (1u << 0)
+#define OF_EMIT_CAP_PERSP      (1u << 1)
+#define OF_EMIT_CAP_TRIANGLES  (1u << 2)
+#define OF_EMIT_CAP_VCOLOR     (1u << 3)
+#define OF_EMIT_CAP_FRAGPIPE   (1u << 4)
+#define OF_EMIT_CAP_ALPHA      (1u << 5)
+#define OF_EMIT_CAP_FLIP       (1u << 6)
+#define OF_EMIT_CAP_SPAN_BATCH (1u << 7)
+
+int of_emit_supports(uint32_t cap);
+int of_emit_gpu_ready(void);
+void of_emit_prof_frame_start(void);
+void of_emit_prof_frame_end(void);
 
 /* ------- Draw submission -------------------------------------------- */
 

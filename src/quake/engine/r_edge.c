@@ -1280,6 +1280,9 @@ PQ_FASTTEXT void R_ScanEdges (void)
 	surf_t	*s;
 	int profiling = (int)pq_cycleprof.value;
 	unsigned int prof_t;
+	unsigned int prof_delta;
+	unsigned int final_t;
+	unsigned int final_attr;
 
 	if (profiling) {
 		pq_prof_se_insert_cycles = 0;
@@ -1391,7 +1394,8 @@ PQ_FASTTEXT void R_ScanEdges (void)
 // This block was the bulk of SE.Other before — D_DrawSurfaces here flushes
 // every surface that didn't trigger an in-loop overflow, which in
 // typical scenes is most of them.
-	if (profiling) prof_t = SYS_CYCLE_LO;
+	final_attr = 0;
+	if (profiling) final_t = SYS_CYCLE_LO;
 
 	current_iv = iv;
 	fv = (float)iv;
@@ -1400,21 +1404,45 @@ PQ_FASTTEXT void R_ScanEdges (void)
 	surfaces[1].spanstate = 1;
 
 	if (newedges[iv])
+	{
+		if (profiling) prof_t = SYS_CYCLE_LO;
 		R_InsertNewEdges_Array (newedges[iv]);
+		if (profiling) {
+			prof_delta = SYS_CYCLE_LO - prof_t;
+			pq_prof_se_insert_cycles += prof_delta;
+			final_attr += prof_delta;
+		}
+	}
 
+	if (profiling) prof_t = SYS_CYCLE_LO;
 #if HW_SCANLINE_ACCEL
 	R_GenerateSpans_HW ();
 #else
 	(*pdrawfunc_array) ();
 #endif
+	if (profiling) {
+		prof_delta = SYS_CYCLE_LO - prof_t;
+		pq_prof_se_generate_cycles += prof_delta;
+		final_attr += prof_delta;
+	}
 
 // draw whatever's left in the span list
+	if (profiling) prof_t = SYS_CYCLE_LO;
 	if (r_drawculledpolys)
 		R_DrawCulledPolys ();
 	else
 		D_DrawSurfaces ();
+	if (profiling) {
+		prof_delta = SYS_CYCLE_LO - prof_t;
+		pq_prof_se_draw_cycles += prof_delta;
+		final_attr += prof_delta;
+	}
 
-	if (profiling) pq_prof_se_final_cycles += SYS_CYCLE_LO - prof_t;
+	if (profiling) {
+		prof_delta = SYS_CYCLE_LO - final_t;
+		pq_prof_se_final_cycles += (prof_delta > final_attr)
+			? prof_delta - final_attr : 0;
+	}
 
 	if (profiling)
 		pq_prof_aet_total_edges = aet_alloc;

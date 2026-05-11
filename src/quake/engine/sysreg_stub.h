@@ -5,9 +5,9 @@
  * SYS_CYCLE_LO and a bunch of SYS_PERF_* and SPAN_PERF_* registers to
  * build the in-game profiler overlay. Those MMIOs don't exist on
  * openfpgaOS.  SYS_CYCLE_LO is synthesised from of_time_us() so the
- * per-frame timings populate; the SYS_PERF_* / SPAN_PERF_* counters
- * stay at zero (no fabric counters to read), and the profiler's HW
- * utilisation rows just display 0%.
+ * per-frame timings populate.  The renderer profiler reads GPU-native
+ * command/ring/DMA counters via of_gpu_debug_snapshot(); these legacy
+ * SYS_PERF_* / SPAN_PERF_* definitions remain only for old code paths.
  */
 
 #ifndef SYSREG_STUB_H

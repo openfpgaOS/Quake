@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "r_local.h"
+#include "d_local.h"
 #include "sysreg_stub.h"
 
 /* =====================================================================
@@ -83,6 +84,8 @@ void R_BspCache_Init(void)
 /* Sub-profiling: R_RenderFace time within R_RecursiveWorldNode */
 unsigned int pq_prof_rw_renderface_cycles;
 extern cvar_t pq_cycleprof;
+extern cvar_t r_gpuworld;
+int r_gpu_world_direct_active;
 
 //
 // current entity info
@@ -519,6 +522,178 @@ void R_DrawSubmodelPolygons (model_t *pmodel, int clipflags)
 }
 
 
+#if D_GPU_WORLD_DIRECT
+static void R_RenderFaceGpuDirect (msurface_t *surf, int clipflags, float dot)
+{
+	if (surf->flags & (SURF_DRAWSKY | SURF_DRAWTURB))
+	{
+		R_RenderFace (surf, clipflags, dot);
+		return;
+	}
+
+	float nearzi = (dot != 0.0f) ? (1.0f / dot) : 1.0f;
+	if (nearzi < 0.0f)
+		nearzi = -nearzi;
+
+	int miplevel = D_MipLevelForScale (nearzi * scale_for_mip *
+		surf->texinfo->mipadjust);
+
+	(void)D_GpuLightSurface (surf, miplevel);
+	R_DrawSurfaceTris (surf, miplevel);
+}
+
+static void R_RecursiveWorldNodeGpu (mnode_t *node, int clipflags)
+{
+	int			i, c, side, *pindex;
+	mplane_t	*plane;
+	msurface_t	*surf;
+	mleaf_t		*pleaf;
+	float		d, dot;
+	int			profiling = (int)pq_cycleprof.value;
+	unsigned int prof_t;
+
+	if (node->contents == CONTENTS_SOLID)
+		return;
+
+	if (node->visframe != r_visframecount)
+		return;
+
+	if (cull_threshold_sq > 0)
+	{
+		float dx, dy, dz, dist_sq;
+
+		dx = 0; dy = 0; dz = 0;
+		if (modelorg[0] < node->minmaxs[0])
+			dx = modelorg[0] - node->minmaxs[0];
+		else if (modelorg[0] > node->minmaxs[3])
+			dx = modelorg[0] - node->minmaxs[3];
+		if (modelorg[1] < node->minmaxs[1])
+			dy = modelorg[1] - node->minmaxs[1];
+		else if (modelorg[1] > node->minmaxs[4])
+			dy = modelorg[1] - node->minmaxs[4];
+		if (modelorg[2] < node->minmaxs[2])
+			dz = modelorg[2] - node->minmaxs[2];
+		else if (modelorg[2] > node->minmaxs[5])
+			dz = modelorg[2] - node->minmaxs[5];
+		dist_sq = dx*dx + dy*dy + dz*dz;
+
+		if (dist_sq > 40000.0f)
+		{
+			float ex = node->minmaxs[3] - node->minmaxs[0];
+			float ey = node->minmaxs[4] - node->minmaxs[1];
+			float ez = node->minmaxs[5] - node->minmaxs[2];
+			float max_extent = ex;
+			if (ey > max_extent) max_extent = ey;
+			if (ez > max_extent) max_extent = ez;
+
+			if (max_extent * max_extent * cull_xscale_sq <
+			    cull_threshold_sq * dist_sq)
+				return;
+		}
+	}
+
+	if (clipflags)
+	{
+		for (i=0 ; i<4 ; i++)
+		{
+			float *n;
+			float dist;
+
+			if (! (clipflags & (1<<i)) )
+				continue;
+
+			pindex = pfrustum_indexes[i];
+			n = view_clipplanes[i].normal;
+			dist = view_clipplanes[i].dist;
+
+			d = (float)node->minmaxs[pindex[0]] * n[0] +
+			    (float)node->minmaxs[pindex[1]] * n[1] +
+			    (float)node->minmaxs[pindex[2]] * n[2] - dist;
+
+			if (d <= 0)
+				return;
+
+			d = (float)node->minmaxs[pindex[3]] * n[0] +
+			    (float)node->minmaxs[pindex[4]] * n[1] +
+			    (float)node->minmaxs[pindex[5]] * n[2] - dist;
+
+			if (d >= 0)
+				clipflags &= ~(1<<i);
+		}
+	}
+
+	if (node->contents < 0)
+	{
+		pleaf = (mleaf_t *)node;
+
+		if (pleaf->efrags)
+			R_StoreEfrags (&pleaf->efrags);
+
+		pleaf->key = r_currentkey;
+		r_currentkey++;
+		return;
+	}
+
+	plane = node->plane;
+	switch (plane->type)
+	{
+	case PLANE_X:
+		dot = modelorg[0] - plane->dist;
+		break;
+	case PLANE_Y:
+		dot = modelorg[1] - plane->dist;
+		break;
+	case PLANE_Z:
+		dot = modelorg[2] - plane->dist;
+		break;
+	default:
+		dot = DotProduct (modelorg, plane->normal) - plane->dist;
+		break;
+	}
+
+	side = (dot >= 0) ? 0 : 1;
+
+	/* Painter order for the no-depth GPU world path: far child, node
+	 * surfaces, near child.  This deliberately bypasses the AET. */
+	R_RecursiveWorldNodeGpu (node->children[!side], clipflags);
+
+	c = node->numsurfaces;
+	if (c)
+	{
+		surf = cl.worldmodel->surfaces + node->firstsurface;
+
+		if (profiling) prof_t = SYS_CYCLE_LO;
+
+		if (dot < -BACKFACE_EPSILON)
+		{
+			do
+			{
+				if (surf->flags & SURF_PLANEBACK)
+					R_RenderFaceGpuDirect (surf, clipflags, dot);
+				surf++;
+			} while (--c);
+		}
+		else if (dot > BACKFACE_EPSILON)
+		{
+			do
+			{
+				if (!(surf->flags & SURF_PLANEBACK))
+					R_RenderFaceGpuDirect (surf, clipflags, dot);
+				surf++;
+			} while (--c);
+		}
+
+		if (profiling)
+			pq_prof_rw_renderface_cycles += SYS_CYCLE_LO - prof_t;
+
+		r_currentkey++;
+	}
+
+	R_RecursiveWorldNodeGpu (node->children[side], clipflags);
+}
+#endif
+
+
 /*
 ================
 R_RecursiveWorldNode
@@ -747,6 +922,15 @@ void R_RenderWorld (void)
 	cull_threshold_sq = r_cullsize.value * r_cullsize.value;
 	cull_xscale_sq = xscale * xscale;
 
+#if D_GPU_WORLD_DIRECT
+	if (r_gpu_world_direct_active)
+	{
+		R_RecursiveWorldNodeGpu (clmodel->nodes, 15);
+		R_FlushWorldTriBatch ();
+		return;
+	}
+#endif
+
 	R_RecursiveWorldNode (clmodel->nodes, 15);
 
 // if the driver wants the polygons back to front, play the visible ones back
@@ -759,4 +943,3 @@ void R_RenderWorld (void)
 		}
 	}
 }
-

@@ -71,6 +71,14 @@ int		pq_combined_z_active;  /* tells d_edge.c to skip D_DrawZSpans when 1 */
 
 void D_DrawTurbulent8Span (void);
 
+static inline int32_t D_SpanMad2I32 (int32_t origin,
+	int32_t stepv, int v, int32_t stepu, int u)
+{
+	return (int32_t)((uint32_t)origin
+		+ (uint32_t)stepv * (uint32_t)v
+		+ (uint32_t)stepu * (uint32_t)u);
+}
+
 
 /*
 =============
@@ -724,18 +732,19 @@ PQ_HOT void R_DrawSurfaceTris (msurface_t *fa, int miplevel)
 =============
 D_DrawSpans8
 
-World textured spans. Two modes (compile-time via D_USE_GPU_PERSP):
-  1. GPU perspective: one of_emit_span per scanline, the GPU does
-     1/z reciprocal per 16-pixel sub-segment internally.
-  2. CPU-side per-16-pixel affine: we pre-compute 16.16 s/sstep and
-     emit one span per sub-segment.
+World textured spans. Two modes:
+  1. Runtime GPU perspective, when OF_HW_GPU_PERSP is advertised.
+  2. CPU-side per-16-pixel affine fallback, still emitted as GPU spans.
 =============
 */
 PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 {
 	unsigned char *pbase = (unsigned char *)cacheblock;
+	int profiling = (int)pq_cycleprof.value;
 
-#if D_USE_GPU_PERSP
+	if (profiling)
+		pq_prof_spans8_calls_frame++;
+
 #if !D_GPU_WORLD_LIGHT
 	/* Pre-lit surface cache path: the CPU just wrote new bytes into
 	 * `cacheblock` via R_DrawSurfaceBlock8_mipN, so flush them so
@@ -747,53 +756,46 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 	of_emit_cache_clean(pbase, cachewidth * ((bbextentt >> 16) + 1));
 #endif
 
-	/* tex_w_mask / tex_h_mask intentionally LEFT 0 → GPU treats as
-	 * 0xFFFF (no-wrap legacy default). Setting POT masks here works
-	 * for world (cachewidth is POT for mipped surface caches) but
-	 * leaves sp_tex_w_mask sticky for the next DRAW_TRIANGLES — alias
-	 * skins are non-POT (224×64 etc), so the inherited mask would
-	 * read garbage for skin widths > 2× the world surface's width.
-	 * The triangle path in gpu_core.v doesn't reset masks at span
-	 * emit; flagging that as a gateware design issue. */
+#if D_USE_GPU_PERSP
+	if (of_emit_supports(OF_EMIT_CAP_PERSP)) {
+		/* tex_w_mask / tex_h_mask intentionally LEFT 0 → GPU treats as
+		 * 0xFFFF (no-wrap legacy default). Setting POT masks here works
+		 * for world (cachewidth is POT for mipped surface caches) but
+		 * leaves sp_tex_w_mask sticky for the next DRAW_TRIANGLES — alias
+		 * skins are non-POT (224×64 etc), so the inherited mask would
+		 * read garbage for skin widths > 2× the world surface's width.
+		 * The triangle path in gpu_core.v doesn't reset masks at span
+		 * emit; flagging that as a gateware design issue. */
 
-	/* Bake Quake's `+ sadjust` offset into both the starting sdivz AND
-	 * the per-pixel step so GPU output stays exact across the scanline:
-	 *   target: s_16.16(u) = sdivz_q(u) * 0x10000 / zi_q(u) + sadjust
-	 *   GPU:    s_out(u)   = sdivz_sent(u) * 0x10000 / zi_persp_sent(u)
-	 * with zi_persp_sent(u) = zi_q(u) * 0x10000, the math gives
-	 *   sdivz_sent(u) = sdivz_q(u) * 0x10000 + sadjust * zi_q(u)
-	 * Linear-in-u, so init = sdivz_q*0x10000 + sadjust*zi_q,
-	 * step = sdivzstep*0x10000 + sadjust*zistep.
-	 *
-	 * Computing the step in float keeps int overflow at bay even when
-	 * sadjust × zistep gets large on oblique surfaces. */
-	const float   sadjustf   = (float)sadjust;
-	const float   tadjustf   = (float)tadjust;
-	const int32_t sdivz_step = (int32_t)(d_sdivzstepu * 65536.0f +
-	                                     sadjustf * d_zistepu);
-	const int32_t tdivz_step = (int32_t)(d_tdivzstepu * 65536.0f +
-	                                     tadjustf * d_zistepu);
-	const int32_t zi_step    = (int32_t)(d_zistepu    * 65536.0f);
-
-	/* zi step per pixel in Quake's 1/z × 0x8000 × 0x10000 space — same
-	 * math as PocketQuake's combined-z path. Per-pixel zistep is
-	 * constant across scanlines. */
-	const int32_t izi_step = (int32_t)(d_zistepu * 0x8000 * 0x10000);
-
-	do {
-		const int u = pspan->u, v = pspan->v;
-		const float sdivz_q = d_sdivzorigin + v*d_sdivzstepv + u*d_sdivzstepu;
-		const float tdivz_q = d_tdivzorigin + v*d_tdivzstepv + u*d_tdivzstepu;
-		const float zi_q    = d_ziorigin    + v*d_zistepv    + u*d_zistepu;
+		/* Bake Quake's `+ sadjust` offset into the projection-space planes
+		 * so GPU output stays exact across the scanline:
+		 *   target: s_16.16(u) = sdivz_q(u) * 0x10000 / zi_q(u) + sadjust
+		 *   GPU:    s_out(u)   = sdivz_sent(u) * 0x10000 / zi_persp_sent(u)
+		 * with zi_persp_sent(u) = zi_q(u) * 0x10000, the math gives
+		 *   sdivz_sent(u) = sdivz_q(u) * 0x10000 + sadjust * zi_q(u)
+		 * This is still linear in screen u/v, so compute descriptor-space
+		 * plane coefficients once per surface and do integer MAD per span. */
+		const float   sadjustf   = (float)sadjust;
+		const float   tadjustf   = (float)tadjust;
+		const int32_t sdivz_org  = (int32_t)(d_sdivzorigin * 65536.0f +
+		                                     sadjustf * d_ziorigin);
+		const int32_t tdivz_org  = (int32_t)(d_tdivzorigin * 65536.0f +
+		                                     tadjustf * d_ziorigin);
+		const int32_t zi_org     = (int32_t)(d_ziorigin    * 65536.0f);
+		const int32_t sdivz_stepv = (int32_t)(d_sdivzstepv * 65536.0f +
+		                                      sadjustf * d_zistepv);
+		const int32_t tdivz_stepv = (int32_t)(d_tdivzstepv * 65536.0f +
+		                                      tadjustf * d_zistepv);
+		const int32_t zi_stepv    = (int32_t)(d_zistepv    * 65536.0f);
+		const int32_t sdivz_stepu = (int32_t)(d_sdivzstepu * 65536.0f +
+		                                      sadjustf * d_zistepu);
+		const int32_t tdivz_stepu = (int32_t)(d_tdivzstepu * 65536.0f +
+		                                      tadjustf * d_zistepu);
+		const int32_t zi_stepu    = (int32_t)(d_zistepu    * 65536.0f);
+		const uint32_t fb_base = (uint32_t)(uintptr_t)d_viewbuffer;
 
 		of_emit_span_t sp = {
-			.fb_addr    = (uint32_t)(uintptr_t)d_viewbuffer + screenwidth*v + u,
 			.tex_addr   = (uint32_t)(uintptr_t)pbase,
-			.count      = (uint16_t)pspan->count,
-			/* World is drawn back-to-front via BSP, so DEPTH_TEST
-			 * isn't strictly required — but DEPTH_WRITE populates
-			 * the z-buffer for subsequent alias/sprite passes,
-			 * replacing the CPU-side D_DrawZSpans loop. */
 #if D_GPU_WORLD_LIGHT
 			.flags      = OF_EMIT_PERSP | OF_EMIT_COLORMAP,
 			.light      = pq_world_light,
@@ -802,27 +804,35 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 #endif
 			.fb_stride  = 1,
 			.tex_width  = (uint16_t)cachewidth,
-			.sdivz      = (int32_t)(sdivz_q * 65536.0f + sadjustf * zi_q),
-			.tdivz      = (int32_t)(tdivz_q * 65536.0f + tadjustf * zi_q),
-			.zi_persp   = (int32_t)(zi_q    * 65536.0f),
-			.sdivz_step = sdivz_step,
-			.tdivz_step = tdivz_step,
-			.zi_step    = zi_step,
+			.sdivz_step = sdivz_stepu,
+			.tdivz_step = tdivz_stepu,
+			.zi_step    = zi_stepu,
 		};
-		of_emit_span(&sp);
-	} while ((pspan = pspan->pnext) != NULL);
 
-	/* Kick the GPU so it starts consuming this surface's spans while
-	 * the CPU moves on to building the next surface's cache + spans.
-	 * Without this, the GPU sits idle until the ring fills or
-	 * of_emit_finish() is called at frame end. One MMIO write — cheap. */
-	of_emit_kick();
+		do {
+			const int u = pspan->u, v = pspan->v;
+			sp.fb_addr  = fb_base + screenwidth*v + u;
+			sp.count    = (uint16_t)pspan->count;
+			sp.sdivz    = D_SpanMad2I32(sdivz_org, sdivz_stepv, v, sdivz_stepu, u);
+			sp.tdivz    = D_SpanMad2I32(tdivz_org, tdivz_stepv, v, tdivz_stepu, u);
+			sp.zi_persp = D_SpanMad2I32(zi_org,    zi_stepv,    v, zi_stepu,    u);
+			of_emit_span(&sp);
+		} while ((pspan = pspan->pnext) != NULL);
 
-	/* GPU co-wrote z in the same pass — d_edge.c's D_DrawZSpans call
-	 * is now redundant. Setting this flag tells it to skip. */
-	pq_combined_z_active = 1;
+		/* Kick the GPU so it starts consuming this surface's spans while
+		 * the CPU moves on to building the next surface's cache + spans.
+		 * Without this, the GPU sits idle until the ring fills or
+		 * of_emit_finish() is called at frame end. One MMIO write — cheap. */
+		of_emit_kick();
 
-#else  /* CPU-side perspective, affine per-16-pixel GPU spans */
+		/* The lean GPU has no depth writer. Keep d_edge.c's CPU
+		 * D_DrawZSpans pass active for alias/sprite occlusion. */
+		pq_combined_z_active = 0;
+		return;
+	}
+#endif /* D_USE_GPU_PERSP */
+
+	/* CPU-side perspective, affine per-16-pixel GPU spans. */
 	const float sdivzNstepu = d_sdivzstepu * 16;
 	const float tdivzNstepu = d_tdivzstepu * 16;
 	const float ziNstepu    = d_zistepu    * 16;
@@ -884,7 +894,12 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 				.tex_addr  = (uint32_t)(uintptr_t)pbase,
 				.s = s, .t = t, .sstep = sstep, .tstep = tstep,
 				.count     = (uint16_t)spancount,
+#if D_GPU_WORLD_LIGHT
+				.light     = pq_world_light,
+				.flags     = OF_EMIT_COLORMAP,
+#else
 				.flags     = 0,
+#endif
 				.fb_stride = 1,
 				.tex_width = (uint16_t)cachewidth,
 			};
@@ -895,7 +910,6 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 	} while ((pspan = pspan->pnext) != NULL);
 
 	pq_combined_z_active = 0;
-#endif /* D_USE_GPU_PERSP */
 }
 
 #endif
@@ -917,6 +931,10 @@ PQ_FASTTEXT void D_DrawZSpans (espan_t *pspan)
 	float  du, dv;
 	int    doublecount;
 	unsigned ltemp;
+	int profiling = (int)pq_cycleprof.value;
+
+	if (profiling)
+		pq_prof_zspans_calls_frame++;
 
 	izistep = (int)(d_zistepu * 0x8000 * 0x10000);
 
