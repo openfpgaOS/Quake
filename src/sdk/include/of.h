@@ -25,9 +25,9 @@
  *       }
  *   }
  *
- * Platform: Analogue Pocket FPGA, RISC-V (VexRiscv) @ 100 MHz
- * Video:    320x240, 8-bit indexed color, double-buffered
- * Audio:    48 kHz PCM FIFO + 48-voice hardware mixer; sample-based
+ * Platform: Analogue Pocket FPGA, RISC-V (VexiiRiscv) @ 100 MHz
+ * Video:    320x240, 8-bit indexed color, triple-buffered
+ * Audio:    48 kHz PCM FIFO + 32-voice mixer; sample-based
  *           MIDI synth (SF2 → .ofsf banks)
  * Input:    2 controllers, d-pad + ABXY + L/R + sticks + triggers
  * Memory:   64 MB SDRAM, 16 MB CRAM0, 16 MB CRAM1, 256 KB SRAM
@@ -57,6 +57,7 @@ extern "C" {
 #include "of_input.h"
 #include "of_timer.h"
 #include "of_file.h"
+#include "of_mount.h"
 #include "of_net.h"
 #include "of_analogizer.h"
 #include "of_terminal.h"

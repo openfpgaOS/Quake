@@ -26,6 +26,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #define SKY_SPAN_SHIFT	8
 #define SKY_SPAN_MAX	(1 << SKY_SPAN_SHIFT)
+#define SKY_ROW_BYTES	(SKYSIZE * 2)
 
 
 /*
@@ -116,7 +117,7 @@ void D_DrawSkyScans8 (espan_t *pspan)
 				.count     = (uint16_t)spancount,
 				.flags     = 0,
 				.fb_stride = 1,
-				.tex_width = SKYSIZE,
+				.tex_width = SKY_ROW_BYTES,
 				.tex_w_mask = SKYSIZE - 1,
 				.tex_h_mask = SKYSIZE - 1,
 			};
@@ -130,4 +131,3 @@ void D_DrawSkyScans8 (espan_t *pspan)
 
 	of_emit_kick();
 }
-

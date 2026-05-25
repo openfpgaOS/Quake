@@ -24,9 +24,141 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "d_local.h"
 #include "of_emit.h"
 
+#ifndef D_USE_GPU_SPRITES
+#define D_USE_GPU_SPRITES 1
+#endif
+#ifndef D_USE_GPU_SPRITES_LEGACY_NOZ
+#define D_USE_GPU_SPRITES_LEGACY_NOZ 0
+#endif
+
 static int		sprite_height;
 static int		minindex, maxindex;
 static sspan_t	*sprite_spans;
+static of_emit_param_span_record_t d_sprite_param_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS];
+extern cvar_t pq_gpu_zwrite;
+extern int pq_gpu_zwrite_pending;
+
+static inline int32_t D_SpriteMad2I32(int32_t origin,
+	int32_t stepv, int v, int32_t stepu, int u)
+{
+	return (int32_t)((uint32_t)origin
+		+ (uint32_t)stepv * (uint32_t)v
+		+ (uint32_t)stepu * (uint32_t)u);
+}
+
+#if D_USE_GPU_SPRITES
+static int D_SpriteDrawSpans_ParamZ(sspan_t *pspan, byte *pbase)
+{
+	sspan_t *span;
+	int base_u = 0, base_v = 0;
+	uint32_t total_records = 0;
+
+	if (!(int)pq_gpu_zwrite.value ||
+	    !of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_ZTEST) ||
+	    d_pzbuffer == NULL || d_zwidth == 0)
+		return 0;
+
+	for (span = pspan; span->count != DS_SPAN_LIST_END; span++) {
+		if (span->count <= 0)
+			continue;
+		if (total_records == 0 || span->u < base_u)
+			base_u = span->u;
+		if (total_records == 0 || span->v < base_v)
+			base_v = span->v;
+		total_records++;
+	}
+
+	if (total_records == 0)
+		return 1;
+
+	{
+		static byte *last_sprite_flushed = 0;
+		if (pbase != last_sprite_flushed) {
+			last_sprite_flushed = pbase;
+			of_emit_cache_clean(pbase, cachewidth * sprite_height);
+		}
+	}
+
+	const double sadjustd = (double)sadjust;
+	const double tadjustd = (double)tadjust;
+	const double fixscale = 65536.0;
+	const int32_t sdivz_org = (int32_t)((double)d_sdivzorigin * fixscale +
+	                                    sadjustd * (double)d_ziorigin);
+	const int32_t tdivz_org = (int32_t)((double)d_tdivzorigin * fixscale +
+	                                    tadjustd * (double)d_ziorigin);
+	const int32_t zi_org = (int32_t)((double)d_ziorigin * fixscale);
+	const int32_t sdivz_stepv = (int32_t)((double)d_sdivzstepv * fixscale +
+	                                      sadjustd * (double)d_zistepv);
+	const int32_t tdivz_stepv = (int32_t)((double)d_tdivzstepv * fixscale +
+	                                      tadjustd * (double)d_zistepv);
+	const int32_t zi_stepv = (int32_t)((double)d_zistepv * fixscale);
+	const int32_t sdivz_stepu = (int32_t)((double)d_sdivzstepu * fixscale +
+	                                      sadjustd * (double)d_zistepu);
+	const int32_t tdivz_stepu = (int32_t)((double)d_tdivzstepu * fixscale +
+	                                      tadjustd * (double)d_zistepu);
+	const int32_t zi_stepu = (int32_t)((double)d_zistepu * fixscale);
+
+	of_emit_param_span_list_t params;
+	memset(&params, 0, sizeof(params));
+	params.fb_base = (uint32_t)(uintptr_t)
+		(d_viewbuffer + screenwidth * base_v + base_u);
+	params.fb_major_step = screenwidth;
+	params.fb_minor_step = 1;
+	params.tex_addr = (uint32_t)(uintptr_t)pbase;
+	params.tex_width = (uint16_t)cachewidth;
+	params.flags = OF_EMIT_SKIP_ZERO;
+	params.attr_mode = OF_EMIT_PARAM_ATTR_PERSP;
+	params.span_axis = OF_EMIT_PARAM_AXIS_X;
+	params.z_mode = OF_EMIT_PARAM_Z_TEST_WRITE;
+	params.attr_origin[0] =
+		D_SpriteMad2I32(sdivz_org, sdivz_stepv, base_v, sdivz_stepu, base_u);
+	params.attr_origin[1] =
+		D_SpriteMad2I32(tdivz_org, tdivz_stepv, base_v, tdivz_stepu, base_u);
+	params.attr_origin[2] =
+		D_SpriteMad2I32(zi_org, zi_stepv, base_v, zi_stepu, base_u);
+	params.attr_du[0] = sdivz_stepu;
+	params.attr_du[1] = tdivz_stepu;
+	params.attr_du[2] = zi_stepu;
+	params.attr_dv[0] = sdivz_stepv;
+	params.attr_dv[1] = tdivz_stepv;
+	params.attr_dv[2] = zi_stepv;
+	params.clamp_min[0] = 0;
+	params.clamp_max[0] = bbextents;
+	params.clamp_min[1] = 0;
+	params.clamp_max[1] = bbextentt;
+	params.z_base = (uint32_t)(uintptr_t)
+		(d_pzbuffer + d_zwidth * base_v + base_u);
+	params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
+	params.z_minor_step = (int32_t)sizeof(short);
+
+	uint32_t batch_count = 0;
+	uint32_t submitted = 0;
+	for (span = pspan; span->count != DS_SPAN_LIST_END; span++) {
+		if (span->count > 0) {
+			of_emit_param_span_record_t *rec =
+				&d_sprite_param_records[batch_count++];
+			rec->u = (uint16_t)(span->u - base_u);
+			rec->v = (uint16_t)(span->v - base_v);
+			rec->count = (uint16_t)span->count;
+			if (batch_count == OF_EMIT_PARAM_SPAN_MAX_RECORDS) {
+				submitted += of_emit_param_span_list(
+					&params, d_sprite_param_records, batch_count);
+				batch_count = 0;
+			}
+		}
+	}
+	if (batch_count != 0) {
+		submitted += of_emit_param_span_list(
+			&params, d_sprite_param_records, batch_count);
+	}
+
+	if (submitted != total_records)
+		return 0;
+
+	pq_gpu_zwrite_pending = 1;
+	return 1;
+}
+#endif
 
 #if !id386
 
@@ -39,6 +171,12 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 {
 	byte		*pbase = cacheblock;
 
+#if D_USE_GPU_SPRITES
+	if (D_SpriteDrawSpans_ParamZ(pspan, pbase))
+		return;
+#endif
+
+#if D_USE_GPU_SPRITES_LEGACY_NOZ
 	if (of_emit_supports(OF_EMIT_CAP_PERSP)) {
 		/* GPU perspective path. Each visible scanline of the projected
 		 * sprite polygon was already computed by D_SpriteScanLeftEdge /
@@ -104,6 +242,10 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 		of_emit_kick();
 		return;
 	}
+#endif
+
+	of_emit_prepare_framebuffer_for_cpu();
+	pq_gpu_zwrite_pending = 0;
 
 	int			count, spancount, izistep;
 	int			izi;
@@ -458,7 +600,7 @@ void D_DrawSprite (void)
 	int			i, nump;
 	float		ymin, ymax;
 	emitpoint_t	*pverts;
-	sspan_t		spans[MAXHEIGHT+1];
+	static sspan_t	spans[MAXHEIGHT+1];
 
 	sprite_spans = spans;
 

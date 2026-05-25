@@ -41,8 +41,8 @@ CFLAGS += -ffast-math -fno-math-errno -fno-trapping-math
 # (411888 → 451992) for cross-TU inlining of the r_edge ↔ r_draw ↔
 # d_scan hot path.  An earlier "regression" against a 68.2 ms reading
 # was apples-to-oranges — that capture was at AET 151 (5× sparser).
-CFLAGS  += -O3 -flto
-LDFLAGS += -O3 -flto
+CFLAGS  += -O3 -flto=auto
+LDFLAGS += -O3 -flto=auto
 
 .DEFAULT_GOAL := all
 

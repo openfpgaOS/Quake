@@ -52,6 +52,7 @@ clipplane_t	view_clipplanes[4];
 clipplane_t	world_clipplanes[16];
 
 medge_t			*r_pedge;
+static medge_t	r_dummyedge;
 
 qboolean		r_leftclipped, r_rightclipped;
 static qboolean	makeleftedge, makerightedge;
@@ -257,7 +258,7 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 	removeedges[v2] = edge;
 
 	// Store v_end in edge->prev (unused by array-based AET, same cache line)
-	*(unsigned short *)&edge->prev = (unsigned short)v2;
+	edge->prev = (edge_t *)(unsigned long)(unsigned short)v2;
 }
 
 
@@ -400,7 +401,7 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 	mplane_t	*pplane;
 	float		distinv;
 	vec3_t		p_normal;
-	medge_t		*pedges, tedge;
+	medge_t		*pedges;
 	clipplane_t	*pclip;
 
 // skip out if no more surfs
@@ -505,7 +506,7 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 // FIXME: share clipped edges?
 	if (makeleftedge)
 	{
-		r_pedge = &tedge;
+		r_pedge = &r_dummyedge;
 		r_lastvertvalid = false;
 		R_ClipEdge (&r_leftexit, &r_leftenter, pclip->next);
 	}
@@ -513,7 +514,7 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 // if there was a clip off the right edge, get the right r_nearzi
 	if (makerightedge)
 	{
-		r_pedge = &tedge;
+		r_pedge = &r_dummyedge;
 		r_lastvertvalid = false;
 		r_nearzionly = true;
 		R_ClipEdge (&r_rightexit, &r_rightenter, view_clipplanes[1].next);
@@ -561,7 +562,6 @@ void R_RenderBmodelFace (bedge_t *pedges, msurface_t *psurf)
 	mplane_t	*pplane;
 	float		distinv;
 	vec3_t		p_normal;
-	medge_t		tedge;
 	clipplane_t	*pclip;
 
 // skip out if no more surfs
@@ -581,7 +581,7 @@ void R_RenderBmodelFace (bedge_t *pedges, msurface_t *psurf)
 	c_faceclip++;
 
 // this is a dummy to give the caching mechanism someplace to write to
-	r_pedge = &tedge;
+	r_pedge = &r_dummyedge;
 
 // set up clip planes
 	pclip = NULL;
@@ -620,14 +620,14 @@ void R_RenderBmodelFace (bedge_t *pedges, msurface_t *psurf)
 // FIXME: share clipped edges?
 	if (makeleftedge)
 	{
-		r_pedge = &tedge;
+		r_pedge = &r_dummyedge;
 		R_ClipEdge (&r_leftexit, &r_leftenter, pclip->next);
 	}
 
 // if there was a clip off the right edge, get the right r_nearzi
 	if (makerightedge)
 	{
-		r_pedge = &tedge;
+		r_pedge = &r_dummyedge;
 		r_nearzionly = true;
 		R_ClipEdge (&r_rightexit, &r_rightenter, view_clipplanes[1].next);
 	}

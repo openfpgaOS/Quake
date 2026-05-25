@@ -32,7 +32,6 @@ surfcache_t                     *sc_rover, *sc_base;
 
 #define GUARDSIZE       4
 
-
 int     D_SurfaceCacheForRes (int width, int height)
 {
 	int             size, pix;
@@ -100,6 +99,7 @@ void D_InitCaches (void *buffer, int size)
 	sc_base->next = NULL;
 	sc_base->owner = NULL;
 	sc_base->size = sc_size;
+	sc_base->gpu_dirty = 0;
 	
 	D_ClearCacheGuard ();
 }
@@ -138,6 +138,7 @@ void D_FlushCaches (void)
 	sc_base->next = NULL;
 	sc_base->owner = NULL;
 	sc_base->size = sc_size;
+	sc_base->gpu_dirty = 0;
 }
 
 /*
@@ -200,6 +201,7 @@ surfcache_t     *D_SCAlloc (int width, int size)
 		sc_rover->next = new->next;
 		sc_rover->width = 0;
 		sc_rover->owner = NULL;
+		sc_rover->gpu_dirty = 0;
 		new->next = sc_rover;
 		new->size = size;
 	}
@@ -207,6 +209,7 @@ surfcache_t     *D_SCAlloc (int width, int size)
 		sc_rover = new->next;
 	
 	new->width = width;
+	new->gpu_dirty = 0;
 // DEBUG
 	if (width > 0)
 		new->height = (size - sizeof(*new) + sizeof(new->data)) / width;
@@ -326,6 +329,10 @@ PQ_HOT byte D_GpuLightSurface (msurface_t *surface, int miplevel)
 	/* Raw mip texture, not a built cache block. */
 	cacheblock = (pixel_t *)((byte *)mt + mt->offsets[miplevel]);
 	cachewidth = mt->width >> miplevel;
+	pq_world_tex_w_mask = (uint16_t)(cachewidth - 1);
+	pq_world_tex_h_mask = (uint16_t)((mt->height >> miplevel) - 1);
+	pq_world_tex_s_offset = (surface->texturemins[0] * 65536) >> miplevel;
+	pq_world_tex_t_offset = (surface->texturemins[1] * 65536) >> miplevel;
 
 	/* blocklights[0] is post-bound/inverted/shifted into the same
 	 * 8.8 range used by alias light (range [64..16320]); >> 8 maps
@@ -416,15 +423,16 @@ PQ_FASTTEXT surfcache_t *D_CacheSurface (msurface_t *surface, int miplevel)
 
 	R_DrawSurface ();
 
+	cache->gpu_dirty = 1;
+
 #if HW_SURFBLOCK_ACCEL
 	/* Wait for VLIW to finish writing surface cache to SDRAM, then
 	 * invalidate D-cache lines so CPU sees fresh data when reading textures. */
 	span_wait();
 	dcache_flush_lines((unsigned int)cache->data,
 	                   r_drawsurf.surfwidth * r_drawsurf.surfheight);
+	cache->gpu_dirty = 0;
 #endif
 
 	return surface->cachespots[miplevel];
 }
-
-

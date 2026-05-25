@@ -20,13 +20,13 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 //
 // openfpgaOS port: world spans are emitted to the GPU via
 // of_emit_span() from of_emit.h.  Lighting goes through one of two
-// paths chosen at compile time by D_GPU_WORLD_LIGHT: the default
-// (=0) pre-lights the surface cache CPU-side and submits raw bytes
+// paths gated by D_GPU_WORLD_LIGHT and pq_gpu_world_light: the safe
+// default pre-lights the surface cache CPU-side and submits raw bytes
 // (the GPU runs no colormap so we don't double-index already-lit
 // pixels), while the GPU path (=1) ships unlit cache + per-span
 // shade and lets the GPU's COLORMAP lookup do the lighting.  The
-// CPU-side z-buffer is populated by D_DrawZSpans (below) — the GPU
-// dropped depth_test/depth_write in lean Phase 2.3.
+// CPU-side z-buffer is populated by D_DrawZSpans (below), or by the
+// param-span GPU z-write path when the runtime bitstream advertises it.
 
 #include "quakedef.h"
 #include "r_local.h"
@@ -56,6 +56,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  * D_GpuLightSurface() right before each surface's D_DrawSpans8 call,
  * embedded in the span's `light` field below. */
 byte pq_world_light;
+unsigned short pq_world_tex_w_mask;
+unsigned short pq_world_tex_h_mask;
+int pq_world_tex_s_offset;
+int pq_world_tex_t_offset;
 
 unsigned char	*r_turb_pbase, *r_turb_pdest;
 fixed16_t		r_turb_s, r_turb_t, r_turb_sstep, r_turb_tstep;
@@ -66,8 +70,15 @@ unsigned int	pq_prof_spans8_calls_frame;
 unsigned int	pq_prof_zspans_cycles_frame;
 unsigned int	pq_prof_zspans_calls_frame;
 extern cvar_t	pq_cycleprof;
+extern cvar_t	pq_gpu_zwrite;
+extern cvar_t	pq_gpu_world_light;
+extern cvar_t	pq_gpu_persp;
+extern cvar_t	pq_gpu_param;
 
 int		pq_combined_z_active;  /* tells d_edge.c to skip D_DrawZSpans when 1 */
+int		pq_gpu_zwrite_pending; /* GPU wrote d_pzbuffer; CPU z readers need a retire barrier */
+
+static of_emit_param_span_record_t pq_param_span_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS];
 
 void D_DrawTurbulent8Span (void);
 
@@ -77,6 +88,94 @@ static inline int32_t D_SpanMad2I32 (int32_t origin,
 	return (int32_t)((uint32_t)origin
 		+ (uint32_t)stepv * (uint32_t)v
 		+ (uint32_t)stepu * (uint32_t)u);
+}
+
+static inline int64_t D_ShrTrunc64 (int64_t value, unsigned shift)
+{
+	if (shift == 0)
+		return value;
+	if (value >= 0)
+		return value >> shift;
+
+	uint64_t mag = (uint64_t)(-(value + 1)) + 1u;
+	return -(int64_t)(mag >> shift);
+}
+
+static inline int64_t D_FloatToScaledI64 (float value, int scale)
+{
+	union { float f; uint32_t u; } in = { value };
+	uint32_t bits = in.u;
+	uint32_t sign = bits >> 31;
+	uint32_t exp = (bits >> 23) & 0xffu;
+	uint32_t frac = bits & 0x7fffffu;
+	uint64_t mant;
+	uint64_t mag;
+	int shift;
+
+	if (exp == 0xffu)
+		return sign ? INT64_MIN : INT64_MAX;
+	if (exp == 0) {
+		if (frac == 0)
+			return 0;
+		mant = frac;
+		shift = -126 - 23 + scale;
+	} else {
+		mant = (1u << 23) | frac;
+		shift = (int)exp - 127 - 23 + scale;
+	}
+
+	if (shift >= 0) {
+		if (shift >= 63 || mant > (UINT64_MAX >> shift))
+			mag = UINT64_MAX;
+		else
+			mag = mant << shift;
+	} else {
+		unsigned rshift = (unsigned)-shift;
+		mag = rshift >= 64 ? 0 : (mant >> rshift);
+	}
+
+	if (!sign) {
+		if (mag > (uint64_t)INT64_MAX)
+			return INT64_MAX;
+		return (int64_t)mag;
+	}
+	if (mag > (uint64_t)INT64_MAX + 1u)
+		return INT64_MIN;
+	return -(int64_t)mag;
+}
+
+static inline int32_t D_Q29FromQ45 (int64_t q45)
+{
+	return (int32_t)D_ShrTrunc64(q45, 16);
+}
+
+static inline int32_t D_Q29Numerator (float divz, fixed16_t adjust,
+	int64_t zi_q45)
+{
+	int32_t adj_hi = adjust >> 16;
+	uint32_t adj_lo = (uint32_t)adjust - ((uint32_t)adj_hi << 16);
+	int64_t acc = D_FloatToScaledI64(divz, 45);
+
+	acc += (int64_t)adj_hi * zi_q45;
+	acc += D_ShrTrunc64((int64_t)adj_lo * zi_q45, 16);
+	return D_Q29FromQ45(acc);
+}
+
+static inline int32_t D_Q16FromQ45 (int64_t q45)
+{
+	return (int32_t)D_ShrTrunc64(q45, 29);
+}
+
+static inline int32_t D_Q16Numerator (float divz, fixed16_t adjust,
+	int64_t zi_q45)
+{
+	int32_t adj_hi = adjust >> 16;
+	uint32_t adj_lo = (uint32_t)adjust - ((uint32_t)adj_hi << 16);
+	int64_t acc = D_FloatToScaledI64(divz, 32);
+
+	acc += D_ShrTrunc64((int64_t)adj_hi * zi_q45, 13);
+	acc += D_ShrTrunc64((int64_t)adj_lo * zi_q45, 29);
+	return (int32_t)D_ShrTrunc64(acc, 16);
 }
 
 
@@ -99,6 +198,8 @@ void D_WarpScreen (void)
 	byte	*rowptr[MAXHEIGHT+(AMP2*2)];
 	int		column[MAXWIDTH+(AMP2*2)];
 	float	wratio, hratio;
+
+	of_emit_prepare_framebuffer_for_cpu();
 
 	w = r_refdef.vrect.width;
 	h = r_refdef.vrect.height;
@@ -174,6 +275,8 @@ void Turbulent8 (espan_t *pspan)
 	fixed16_t		snext, tnext;
 	float			sdivz, tdivz, zi, z, du, dv, spancountminus1;
 	float			sdivz16stepu, tdivz16stepu, zi16stepu;
+
+	of_emit_prepare_framebuffer_for_cpu();
 
 	r_turb_turb = sintable + ((int)(cl.time*SPEED)&(CYCLE-1));
 
@@ -565,7 +668,7 @@ static void R_PackTriVert(const msurface_t *fa, int miplevel,
  * The batch state lives at file scope so D_DrawSurfaces can call
  * R_FlushWorldTriBatch() at the end of its loop to drain pending
  * triangles before any state change (FB rebind, kick, finish). */
-#define R_WORLD_BATCH_CAP   384       /* ~128 tris × 3 = 384 verts. */
+#define R_WORLD_BATCH_CAP   672       /* 224 tris; fits one 16 KB GPU command stream. */
 static of_emit_vertex_t r_world_batch[R_WORLD_BATCH_CAP];
 static int              r_world_batch_count;
 static uint32_t         r_world_batch_tex_addr;
@@ -732,9 +835,8 @@ PQ_HOT void R_DrawSurfaceTris (msurface_t *fa, int miplevel)
 =============
 D_DrawSpans8
 
-World textured spans. Two modes:
-  1. Runtime GPU perspective, when OF_HW_GPU_PERSP is advertised.
-  2. CPU-side per-16-pixel affine fallback, still emitted as GPU spans.
+World textured spans. Prefer the unified param-span path when advertised;
+fall back to older SDK helpers or CPU-side per-16-pixel affine spans.
 =============
 */
 PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
@@ -745,28 +847,145 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 	if (profiling)
 		pq_prof_spans8_calls_frame++;
 
-#if !D_GPU_WORLD_LIGHT
-	/* Pre-lit surface cache path: the CPU just wrote new bytes into
-	 * `cacheblock` via R_DrawSurfaceBlock8_mipN, so flush them so
-	 * the GPU's AXI reads see fresh data. With D_GPU_WORLD_LIGHT,
-	 * cacheblock points at raw mip texture data that's loaded once
-	 * at level start and never modified — no per-span flush needed.
-	 * The kernel's PAK loader is expected to leave loaded data
-	 * coherent (or write-through) so the GPU sees it. */
-	of_emit_cache_clean(pbase, cachewidth * ((bbextentt >> 16) + 1));
+#if D_GPU_WORLD_LIGHT
+	const int gpu_world_light = (int)pq_gpu_world_light.value;
+#else
+	const int gpu_world_light = 0;
 #endif
+	const int tex_s_offset = gpu_world_light ? pq_world_tex_s_offset : 0;
+	const int tex_t_offset = gpu_world_light ? pq_world_tex_t_offset : 0;
+
+	/* Pre-lit surface cache path: D_CacheSurface marks cache blocks dirty
+	 * only when R_DrawSurfaceBlock8_mipN rebuilt data[]. Cache hits are
+	 * already clean in SDRAM, so avoid re-flushing/re-draining those lines. */
+	if (!gpu_world_light) {
+		surfcache_t *surf_cache = D_SurfCacheForData(pbase);
+		if (surf_cache->gpu_dirty) {
+			of_emit_cache_clean(pbase, cachewidth * ((bbextentt >> 16) + 1));
+			surf_cache->gpu_dirty = 0;
+		}
+	}
 
 #if D_USE_GPU_PERSP
-	if (of_emit_supports(OF_EMIT_CAP_PERSP)) {
-		/* tex_w_mask / tex_h_mask intentionally LEFT 0 → GPU treats as
-		 * 0xFFFF (no-wrap legacy default). Setting POT masks here works
-		 * for world (cachewidth is POT for mipped surface caches) but
-		 * leaves sp_tex_w_mask sticky for the next DRAW_TRIANGLES — alias
-		 * skins are non-POT (224×64 etc), so the inherited mask would
-		 * read garbage for skin widths > 2× the world surface's width.
-		 * The triangle path in gpu_core.v doesn't reset masks at span
-		 * emit; flagging that as a gateware design issue. */
+	if ((int)pq_gpu_persp.value &&
+	    (int)pq_gpu_param.value &&
+	    !gpu_world_light &&
+	    of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST)) {
+		espan_t *span;
+		int base_u = 0, base_v = 0;
+		uint32_t total_records = 0;
 
+		const int64_t zi_org_q45 = D_FloatToScaledI64(d_ziorigin, 45);
+		const int64_t zi_stepv_q45 = D_FloatToScaledI64(d_zistepv, 45);
+		const int64_t zi_stepu_q45 = D_FloatToScaledI64(d_zistepu, 45);
+		const int32_t sdivz_org =
+			D_Q29Numerator(d_sdivzorigin, sadjust, zi_org_q45);
+		const int32_t tdivz_org =
+			D_Q29Numerator(d_tdivzorigin, tadjust, zi_org_q45);
+		const int32_t zi_org =
+			D_Q29FromQ45(zi_org_q45);
+		const int32_t sdivz_stepv =
+			D_Q29Numerator(d_sdivzstepv, sadjust, zi_stepv_q45);
+		const int32_t tdivz_stepv =
+			D_Q29Numerator(d_tdivzstepv, tadjust, zi_stepv_q45);
+		const int32_t zi_stepv =
+			D_Q29FromQ45(zi_stepv_q45);
+		const int32_t sdivz_stepu =
+			D_Q29Numerator(d_sdivzstepu, sadjust, zi_stepu_q45);
+		const int32_t tdivz_stepu =
+			D_Q29Numerator(d_tdivzstepu, tadjust, zi_stepu_q45);
+		const int32_t zi_stepu =
+			D_Q29FromQ45(zi_stepu_q45);
+		uint8_t flags = OF_EMIT_PERSP;
+		if (gpu_world_light)
+			flags |= OF_EMIT_COLORMAP;
+		const int gpu_zwrite =
+			(int)pq_gpu_zwrite.value &&
+			of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_Z) &&
+			d_pzbuffer != NULL && d_zwidth != 0 &&
+			(flags & (OF_EMIT_SKIP_ZERO | OF_EMIT_COLUMN)) == 0;
+
+		for (span = pspan; span != NULL; span = span->pnext) {
+			if (span->count <= 0)
+				continue;
+			if (total_records == 0 || span->u < base_u)
+				base_u = span->u;
+			if (total_records == 0 || span->v < base_v)
+				base_v = span->v;
+			total_records++;
+		}
+
+		of_emit_param_span_list_t params;
+		memset(&params, 0, sizeof(params));
+		params.fb_base       = (uint32_t)(uintptr_t)
+			(d_viewbuffer + screenwidth * base_v + base_u);
+		params.fb_major_step = screenwidth;
+		params.fb_minor_step = 1;
+		params.tex_addr      = (uint32_t)(uintptr_t)pbase;
+		params.tex_width     = (uint16_t)cachewidth;
+		params.flags         = flags;
+		params.attr_mode     = OF_EMIT_PARAM_ATTR_PERSP_Q29;
+		params.span_axis     = OF_EMIT_PARAM_AXIS_X;
+		params.z_mode        = gpu_zwrite ? OF_EMIT_PARAM_Z_WRITE_ZI
+		                                  : OF_EMIT_PARAM_Z_NONE;
+		/* Keep record coordinates local to this surface batch.  This avoids
+		 * large absolute u/v products in the GPU's Q29 start calculation on
+		 * steep floors, while preserving the same projected planes. */
+		params.attr_origin[0] =
+			D_SpanMad2I32(sdivz_org, sdivz_stepv, base_v, sdivz_stepu, base_u);
+		params.attr_origin[1] =
+			D_SpanMad2I32(tdivz_org, tdivz_stepv, base_v, tdivz_stepu, base_u);
+		params.attr_origin[2] =
+			D_SpanMad2I32(zi_org, zi_stepv, base_v, zi_stepu, base_u);
+		params.attr_du[0] = sdivz_stepu;
+		params.attr_du[1] = tdivz_stepu;
+		params.attr_du[2] = zi_stepu;
+		params.attr_dv[0] = sdivz_stepv;
+		params.attr_dv[1] = tdivz_stepv;
+		params.attr_dv[2] = zi_stepv;
+		params.clamp_min[0] = 0;
+		params.clamp_max[0] = bbextents;
+		params.clamp_min[1] = 0;
+		params.clamp_max[1] = bbextentt;
+		if (gpu_zwrite) {
+			params.z_base = (uint32_t)(uintptr_t)
+				(d_pzbuffer + d_zwidth * base_v + base_u);
+			params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
+			params.z_minor_step = (int32_t)sizeof(short);
+		}
+
+		uint32_t batch_count = 0;
+		uint32_t submitted_records = 0;
+		for (span = pspan; span != NULL; span = span->pnext) {
+			if (span->count > 0) {
+				of_emit_param_span_record_t *rec =
+					&pq_param_span_records[batch_count++];
+				rec->u = (uint16_t)(span->u - base_u);
+				rec->v = (uint16_t)(span->v - base_v);
+				rec->count = (uint16_t)span->count;
+
+				if (batch_count == OF_EMIT_PARAM_SPAN_MAX_RECORDS) {
+					submitted_records += of_emit_param_span_list(
+						&params, pq_param_span_records, batch_count);
+					batch_count = 0;
+				}
+			}
+		}
+
+		if (batch_count != 0) {
+			submitted_records += of_emit_param_span_list(
+				&params, pq_param_span_records, batch_count);
+		}
+
+		pq_combined_z_active = gpu_zwrite &&
+			total_records != 0 &&
+			submitted_records == total_records;
+		if (pq_combined_z_active)
+			pq_gpu_zwrite_pending = 1;
+		return;
+	}
+
+	if ((int)pq_gpu_persp.value && of_emit_supports(OF_EMIT_CAP_PERSP)) {
 		/* Bake Quake's `+ sadjust` offset into the projection-space planes
 		 * so GPU output stays exact across the scanline:
 		 *   target: s_16.16(u) = sdivz_q(u) * 0x10000 / zi_q(u) + sadjust
@@ -775,39 +994,43 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 		 *   sdivz_sent(u) = sdivz_q(u) * 0x10000 + sadjust * zi_q(u)
 		 * This is still linear in screen u/v, so compute descriptor-space
 		 * plane coefficients once per surface and do integer MAD per span. */
-		const float   sadjustf   = (float)sadjust;
-		const float   tadjustf   = (float)tadjust;
-		const int32_t sdivz_org  = (int32_t)(d_sdivzorigin * 65536.0f +
-		                                     sadjustf * d_ziorigin);
-		const int32_t tdivz_org  = (int32_t)(d_tdivzorigin * 65536.0f +
-		                                     tadjustf * d_ziorigin);
-		const int32_t zi_org     = (int32_t)(d_ziorigin    * 65536.0f);
-		const int32_t sdivz_stepv = (int32_t)(d_sdivzstepv * 65536.0f +
-		                                      sadjustf * d_zistepv);
-		const int32_t tdivz_stepv = (int32_t)(d_tdivzstepv * 65536.0f +
-		                                      tadjustf * d_zistepv);
-		const int32_t zi_stepv    = (int32_t)(d_zistepv    * 65536.0f);
-		const int32_t sdivz_stepu = (int32_t)(d_sdivzstepu * 65536.0f +
-		                                      sadjustf * d_zistepu);
-		const int32_t tdivz_stepu = (int32_t)(d_tdivzstepu * 65536.0f +
-		                                      tadjustf * d_zistepu);
-		const int32_t zi_stepu    = (int32_t)(d_zistepu    * 65536.0f);
+		const fixed16_t sadjust_tex = sadjust + tex_s_offset;
+		const fixed16_t tadjust_tex = tadjust + tex_t_offset;
+		const int64_t zi_org_q45 = D_FloatToScaledI64(d_ziorigin, 45);
+		const int64_t zi_stepv_q45 = D_FloatToScaledI64(d_zistepv, 45);
+		const int64_t zi_stepu_q45 = D_FloatToScaledI64(d_zistepu, 45);
+		const int32_t sdivz_org =
+			D_Q16Numerator(d_sdivzorigin, sadjust_tex, zi_org_q45);
+		const int32_t tdivz_org =
+			D_Q16Numerator(d_tdivzorigin, tadjust_tex, zi_org_q45);
+		const int32_t zi_org = D_Q16FromQ45(zi_org_q45);
+		const int32_t sdivz_stepv =
+			D_Q16Numerator(d_sdivzstepv, sadjust_tex, zi_stepv_q45);
+		const int32_t tdivz_stepv =
+			D_Q16Numerator(d_tdivzstepv, tadjust_tex, zi_stepv_q45);
+		const int32_t zi_stepv = D_Q16FromQ45(zi_stepv_q45);
+		const int32_t sdivz_stepu =
+			D_Q16Numerator(d_sdivzstepu, sadjust_tex, zi_stepu_q45);
+		const int32_t tdivz_stepu =
+			D_Q16Numerator(d_tdivzstepu, tadjust_tex, zi_stepu_q45);
+		const int32_t zi_stepu = D_Q16FromQ45(zi_stepu_q45);
 		const uint32_t fb_base = (uint32_t)(uintptr_t)d_viewbuffer;
 
 		of_emit_span_t sp = {
 			.tex_addr   = (uint32_t)(uintptr_t)pbase,
-#if D_GPU_WORLD_LIGHT
-			.flags      = OF_EMIT_PERSP | OF_EMIT_COLORMAP,
-			.light      = pq_world_light,
-#else
 			.flags      = OF_EMIT_PERSP,
-#endif
 			.fb_stride  = 1,
 			.tex_width  = (uint16_t)cachewidth,
 			.sdivz_step = sdivz_stepu,
 			.tdivz_step = tdivz_stepu,
 			.zi_step    = zi_stepu,
 		};
+		if (gpu_world_light) {
+			sp.flags |= OF_EMIT_COLORMAP;
+			sp.light = pq_world_light;
+			sp.tex_w_mask = pq_world_tex_w_mask;
+			sp.tex_h_mask = pq_world_tex_h_mask;
+		}
 
 		do {
 			const int u = pspan->u, v = pspan->v;
@@ -892,17 +1115,21 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 			of_emit_span_t sp = {
 				.fb_addr   = (uint32_t)(uintptr_t)pdest,
 				.tex_addr  = (uint32_t)(uintptr_t)pbase,
-				.s = s, .t = t, .sstep = sstep, .tstep = tstep,
+				.s = s + tex_s_offset,
+				.t = t + tex_t_offset,
+				.sstep = sstep,
+				.tstep = tstep,
 				.count     = (uint16_t)spancount,
-#if D_GPU_WORLD_LIGHT
-				.light     = pq_world_light,
-				.flags     = OF_EMIT_COLORMAP,
-#else
 				.flags     = 0,
-#endif
 				.fb_stride = 1,
 				.tex_width = (uint16_t)cachewidth,
 			};
+			if (gpu_world_light) {
+				sp.flags = OF_EMIT_COLORMAP;
+				sp.light = pq_world_light;
+				sp.tex_w_mask = pq_world_tex_w_mask;
+				sp.tex_h_mask = pq_world_tex_h_mask;
+			}
 			of_emit_span(&sp);
 			pdest += spancount;
 			s = snext; t = tnext;

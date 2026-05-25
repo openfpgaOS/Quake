@@ -157,7 +157,7 @@ void R_MakeSky (void)
 	{
 		extern void of_emit_cache_clean(const void *addr,
 		                                unsigned int size);
-		of_emit_cache_clean(r_skysource, SKYSIZE * SKYSIZE);
+		of_emit_cache_clean(r_skysource, SKYSIZE * SKYSIZE * 2);
 	}
 }
 
@@ -285,5 +285,4 @@ void R_SetSkyFrame (void)
 
 	r_skymade = 0;
 }
-
 

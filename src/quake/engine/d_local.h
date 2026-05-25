@@ -48,9 +48,15 @@ typedef struct surfcache_s
 	// Pad so data[] starts at 64-byte D-cache line boundary (offset 64).
 	// CPU metadata writes (above) and HW pixel writes (data[]) are in
 	// separate cache lines, eliminating the need for fence.i in D_CacheSurface.
-	int					_pad[4];
+	int					gpu_dirty;	// CPU rebuilt data[]; GPU needs cache clean before read
+	int					_pad[3];
 	byte				data[4];	// width*height elements
 } surfcache_t;
+
+static inline surfcache_t *D_SurfCacheForData (void *data)
+{
+	return (surfcache_t *)((byte *)data - __builtin_offsetof(surfcache_t, data));
+}
 
 // !!! if this is changed, it must be changed in asm_draw.h too !!!
 typedef struct sspan_s
@@ -78,24 +84,17 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspans);
 void D_DrawSpans16 (espan_t *pspans);
 PQ_FASTTEXT void D_DrawZSpans (espan_t *pspans);
 
-/* T6 better — tessellate world surfaces directly into GPU triangles,
- * bypassing D_DrawSpans8 + D_CalcGradients per visible surface.
- * Per-vertex Gouraud light is sampled from blocklights[] (which
- * D_GpuLightSurface populates), so colormap lookup runs per pixel
- * on the GPU's triangle path.  Defined under the same gate in
- * d_scan.c; d_edge.c gates the call site on the same flag.
- *
- * Default 0 — flip to 1 to enable.  Phase 5 of the T6 plan; see
- * optimizations.md §6 T6 for the phased implementation. */
+/* Experimental world-triangle path.  The shipped LITE GPU has no
+ * triangle rasterizer, so keep this out of the default build and run
+ * the supported span path explicitly. */
 #ifndef D_GPU_WORLD_TRIS
-#define D_GPU_WORLD_TRIS 1
+#define D_GPU_WORLD_TRIS 0
 #endif
 
-/* Radical GPU-world path: render ordinary static BSP faces directly as
- * GPU triangles during BSP traversal and leave the old edge/AET renderer
- * for sky, turbulent water, and bmodels. */
+/* Direct BSP-to-triangle path. Retired on current openfpgaOS SDKs; keep the
+ * code compiled out and use parametric spans for the supported GPU path. */
 #ifndef D_GPU_WORLD_DIRECT
-#define D_GPU_WORLD_DIRECT 1
+#define D_GPU_WORLD_DIRECT 0
 #endif
 
 struct msurface_s;
@@ -115,6 +114,11 @@ void (*prealspandrawer)(void);
 surfcache_t	*D_CacheSurface (msurface_t *surface, int miplevel);
 byte		D_GpuLightSurface (msurface_t *surface, int miplevel);
 extern unsigned blocklights[18*18];
+extern byte pq_world_light;
+extern unsigned short pq_world_tex_w_mask;
+extern unsigned short pq_world_tex_h_mask;
+extern int pq_world_tex_s_offset;
+extern int pq_world_tex_t_offset;
 
 extern int D_MipLevelForScale (float scale);
 

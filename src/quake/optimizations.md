@@ -2,7 +2,7 @@
 
 Reviewed against the current source in `src/quake/engine` and `src/sdk/include/of_gpu.h`.
 
-Target: Analogue Pocket, VexiiRiscv rv32imafc @ 100 MHz, custom asynchronous span/triangle GPU with a 16 KB M10K ring, I8 texture path, SRAM/SDRAM framebuffer writes, colormap LUT, and GEQUAL depth testing.
+Target: Analogue Pocket, VexiiRiscv rv32imafc @ 100 MHz, openfpgaOS LITE span GPU with a 16 KB M10K ring, doorbell command DMA, I8 texture path, SDRAM framebuffer writes, colormap LUT, and no active triangle/depth path in this build.
 
 Framebuffer and z-buffer are 320x240. The 3D view rect is dynamic: default `viewsize 90` with the full status bar renders about 288x192; `viewsize 100` renders 320x192; `viewsize 110` renders 320x216; fullscreen/intermission can use 320x240.
 
@@ -10,7 +10,9 @@ Framebuffer and z-buffer are 320x240. The 3D view rect is dynamic: default `view
 
 | Area | Current default | Source | Notes |
 |------|-----------------|--------|-------|
-| World spans | `D_USE_GPU_PERSP=1` | `d_scan.c` | One GPU perspective span per scanline. |
+| World spans | `D_USE_GPU_PERSP=1` | `d_scan.c` | One GPU perspective span per scanline only when `OF_HW_GPU_PERSP` is advertised; otherwise it falls back to CPU-subdivided affine GPU spans. |
+| World triangles | `D_GPU_WORLD_TRIS=0` | `d_local.h` | FULL-only experiment; compiled out on the current triangle-disabled core. |
+| Direct BSP triangles | `D_GPU_WORLD_DIRECT=0` | `d_local.h` | Requires the FULL triangle/vcolor fabric. |
 | Alias models | `D_USE_GPU_ALIAS=2` | `d_polyse.c` | Hardware triangle path, not CPU alias spans. |
 | Alias perspective | `D_ALIAS_PERSP=1` | `d_polyse.c` | Per-vertex `w` is submitted from Quake 1/z. |
 | Alias lighting | `D_ALIAS_GOURAUD=1` | `d_polyse.c` | Vertex `r=g=b` gets the colormap light row from `finalvert_t.v[4] >> 8`. |
@@ -27,8 +29,8 @@ Framebuffer and z-buffer are 320x240. The 3D view rect is dynamic: default `view
 |------|------|------------------|
 | Startup clears | `VID_Init` -> `of_emit_clear(COLOR|DEPTH)` | Clears all three back buffers once, with an `of_emit_finish()` after each clear. |
 | Per-frame flip/clear | `VID_Update` | Drains all queued GPU work, flips, rebinds the new framebuffer/z-buffer, then queues a depth-only clear. The clear is not explicitly kicked there. |
-| World spans | `D_DrawSpans8` -> `of_emit_span` | Default build has `D_GPU_WORLD_LIGHT=1` (T6 simple): submits raw mip texture + `OF_EMIT_PERSP | OF_EMIT_COLORMAP` and the GPU does `colormap[light*256 + texel]` per pixel.  `pq_world_light` is set per-surface from `R_BuildLightMap`'s output via `D_GpuLightSurface` — no per-texel CPU rebuild.  Fallback path (`D_GPU_WORLD_LIGHT=0`) goes through the legacy CPU-pre-lit surface cache. |
-| Alias triangles | `D_DrawNonSubdiv` -> `of_emit_triangles` | Binds one I8 skin texture per model, then emits one `DRAW_TRIANGLES` command per triangle. Vertices are screen-space 12.4 x/y, 16-bit GEQUAL z, 16.16 s/t, perspective `w`, and monochrome colormap-light bytes. |
+| World spans | `D_DrawSpans8` -> `of_emit_span` | Default build has `D_GPU_WORLD_LIGHT=1` (T6 simple): submits raw mip texture + colormap light. If `OF_HW_GPU_PERSP` is advertised, spans use `OF_EMIT_PERSP`; otherwise Quake uses the existing CPU 16-pixel subdivision fallback and `vid_of.c` lowers those affine spans to `DRAW_AFFINE_SPAN_GROUP`. |
+| Alias triangles | `D_DrawNonSubdiv` -> `of_emit_triangles` | FULL-only path. On the current core `OF_EMIT_CAP_TRIANGLES=0`, so this is not the active rendering path. |
 | Colormap | `VID_Init` -> `of_emit_upload_colormap` | Uploads 64x256 bytes once at startup. |
 | Depth test state | `of_emit_init` | Sets global GEQUAL depth. The SDK no longer has a `SET_SHADE` or `SET_BLEND` command. |
 
@@ -90,7 +92,7 @@ These fixes unblock T6 (world rendering on the GPU) and remove the constraint on
 - `of_dbg_verify_cmap_row0()` and the `/* GPU up, GEQUAL, Gouraud on */` inline comment in `VID_Init` are removed (T0).
 - `vid.fullbright` reads byte at `VID_GRADES * 256` with a heuristic for both `marker = start_index` (id1) and `marker = count` (this PAK's) conventions — landed already, but worth documenting that `vid.fullbright = 32` is the canonical value and any other value indicates a non-standard `colormap.lmp`.
 - `sram_fill_start()` / `sram_fill_wait()` are stubs in `sys_of.c`, so the `Z-clr wt` profiler row should be effectively zero. The call sites also use the old PocketQuake argument order; if a real fill engine is reintroduced, fix them before enabling it.
-- `GPU_CMD_DRAW_SPANS_BATCH` (`0x41`) is now shipped in the SDK (PocketDukeNukem-SDK uses it in production via `d3d_gpu.c`'s `span_buf[]` accumulator). `vid_of.c` accumulates spans through `of_emit_span()` and dispatches via `of_gpu_draw_spans_batch()`; flushes happen on `bind_fb`/`bind_texture`/`clear`/`triangles*`/`kick`/`finish` so command-ring ordering is preserved.
+- The SDK span path is now `DRAW_AFFINE_SPAN_GROUP` (`0x47`) and `DRAW_PERSP_SPAN_GROUP` (`0x46`). `vid_of.c` accumulates `of_emit_span()` descriptors and lowers them to those group commands; flushes happen on `bind_fb`/`bind_texture`/`clear`/`triangles*`/`kick`/`finish` so command-ring ordering is preserved.
 - `of_gpu_draw_triangles_batch()` exists in the SDK, but `of_emit.h` does not expose it and `D_DrawNonSubdiv()` currently emits one triangle command at a time.
 
 ## 6. Optimization catalog

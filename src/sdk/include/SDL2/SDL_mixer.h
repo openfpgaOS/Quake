@@ -31,10 +31,13 @@
  * ====================================================================== */
 
 typedef struct {
-    uint8_t  *pcm_u8;
+    int       allocated;
+    Uint8    *abuf;
+    Uint32    alen;
+    int       volume;
+    int16_t  *pcm_s16;
     uint32_t  sample_count;
     uint32_t  sample_rate;
-    int       volume;
 } Mix_Chunk;
 
 typedef struct { int unused; } Mix_Music;
@@ -45,7 +48,7 @@ typedef struct { int unused; } Mix_Music;
 
 static int __mix_initialized;
 static int __mix_max_channels = 8;
-static int __mix_voice_ids[32];
+static of_mixer_handle_t __mix_voice_ids[32];
 
 /* ======================================================================
  * Init / Open / Close
@@ -65,6 +68,10 @@ static inline void Mix_CloseAudio(void) {
 }
 
 static inline const char *Mix_GetError(void) { return ""; }
+
+static inline int16_t __mix_read_s16le(const uint8_t *p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
 
 /* ======================================================================
  * WAV loading
@@ -94,33 +101,37 @@ static inline Mix_Chunk *Mix_LoadWAV(const char *file) {
     if (result.bits_per_sample == 16) num_samples /= 2;
     if (result.channels == 2) num_samples /= 2;
 
-    uint8_t *pcm_u8 = (uint8_t *)malloc(num_samples);
-    if (!pcm_u8) { free(data); return NULL; }
+    Mix_Chunk *chunk = (Mix_Chunk *)calloc(1, sizeof(Mix_Chunk));
+    if (!chunk) { free(data); return NULL; }
+
+    int16_t *pcm_s16 = (int16_t *)of_mixer_alloc_samples(num_samples * sizeof(int16_t));
+    if (!pcm_s16) { free(chunk); free(data); return NULL; }
 
     if (result.bits_per_sample == 16) {
-        const int16_t *s = (const int16_t *)result.pcm;
         int step = result.channels;
         for (uint32_t i = 0; i < num_samples; i++)
-            pcm_u8[i] = (uint8_t)((s[i * step] >> 8) + 128);
+            pcm_s16[i] = __mix_read_s16le(result.pcm + (i * step * 2));
     } else {
         int step = result.channels;
         for (uint32_t i = 0; i < num_samples; i++)
-            pcm_u8[i] = result.pcm[i * step];
+            pcm_s16[i] = (int16_t)(((int)result.pcm[i * step] - 128) << 8);
     }
     free(data);
 
-    Mix_Chunk *chunk = (Mix_Chunk *)calloc(1, sizeof(Mix_Chunk));
-    if (!chunk) { free(pcm_u8); return NULL; }
-    chunk->pcm_u8 = pcm_u8;
+    chunk->allocated = 0; /* sample-pool allocations are freed as a pool */
+    chunk->abuf = (Uint8 *)pcm_s16;
+    chunk->alen = (Uint32)(num_samples * sizeof(int16_t));
+    chunk->volume = MIX_MAX_VOLUME;
+    chunk->pcm_s16 = pcm_s16;
     chunk->sample_count = num_samples;
     chunk->sample_rate = result.sample_rate;
-    chunk->volume = MIX_MAX_VOLUME;
     return chunk;
 }
 
 static inline void Mix_FreeChunk(Mix_Chunk *chunk) {
     if (!chunk) return;
-    free(chunk->pcm_u8);
+    if (chunk->allocated && chunk->abuf)
+        free(chunk->abuf);
     free(chunk);
 }
 
@@ -129,24 +140,26 @@ static inline void Mix_FreeChunk(Mix_Chunk *chunk) {
  * ====================================================================== */
 
 static inline int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops) {
-    if (!chunk || !chunk->pcm_u8) return -1;
+    if (!chunk || !chunk->pcm_s16) return -1;
     (void)loops;
 
     if (!__mix_initialized) {
         of_audio_init();
         of_mixer_init(__mix_max_channels, OF_AUDIO_RATE);
         __mix_initialized = 1;
-        memset(__mix_voice_ids, -1, sizeof(__mix_voice_ids));
+        memset(__mix_voice_ids, 0, sizeof(__mix_voice_ids));
     }
 
     int vol = (chunk->volume * 255) / 128;
-    int voice = of_mixer_play(chunk->pcm_u8, chunk->sample_count,
-                              chunk->sample_rate, 0, vol);
-    if (voice < 0) return -1;
+    of_mixer_handle_t voice = of_mixer_play_h((const uint8_t *)chunk->pcm_s16,
+                                              chunk->sample_count,
+                                              chunk->sample_rate, 0, vol);
+    if (voice == OF_MIXER_HANDLE_INVALID) return -1;
 
     if (channel < 0) {
         for (int i = 0; i < __mix_max_channels; i++) {
-            if (__mix_voice_ids[i] < 0 || !of_mixer_voice_active(__mix_voice_ids[i])) {
+            if (__mix_voice_ids[i] == OF_MIXER_HANDLE_INVALID ||
+                !of_mixer_handle_active(__mix_voice_ids[i])) {
                 channel = i; break;
             }
         }
@@ -159,8 +172,8 @@ static inline int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops) {
 static inline void Mix_HaltChannel(int channel) {
     if (!__mix_initialized) return;
     if (channel < 0) { of_mixer_stop_all(); return; }
-    if (channel < 32 && __mix_voice_ids[channel] >= 0)
-        of_mixer_stop(__mix_voice_ids[channel]);
+    if (channel < 32 && __mix_voice_ids[channel] != OF_MIXER_HANDLE_INVALID)
+        of_mixer_stop_h(__mix_voice_ids[channel]);
 }
 
 static inline void Mix_Pause(int ch)  { (void)ch; }

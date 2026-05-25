@@ -113,7 +113,7 @@ static int aet_count;                                // number of active edges
 static int aet_alloc;                                // next free pool slot (monotonic within frame)
 
 // Store v_end in edge_t->prev (unused by array-based AET, same cache line as u/surfs)
-#define EDGE_V_END(e)  (*(unsigned short *)&(e)->prev)
+#define EDGE_V_END(e)  ((unsigned short)(unsigned long)((e)->prev))
 
 void R_GenerateSpans (void);
 void R_GenerateSpansBackward (void);

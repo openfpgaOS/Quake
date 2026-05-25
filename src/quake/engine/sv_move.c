@@ -318,7 +318,7 @@ void SV_NewChaseDir (edict_t *actor, edict_t *enemy, float dist)
 	}
 
 // try other directions
-	if ( ((rand()&3) & 1) ||  abs(deltay)>abs(deltax))
+	if ( ((rand()&3) & 1) ||  fabsf(deltay)>fabsf(deltax))
 	{
 		tdir=d[1];
 		d[1]=d[2];
@@ -424,4 +424,3 @@ void SV_MoveToGoal (void)
 		SV_NewChaseDir (ent, goal, dist);
 	}
 }
-

@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "d_local.h"
+#include "of_emit.h"
 
 
 /*
@@ -41,7 +42,7 @@ D_StartParticles
 */
 void D_StartParticles (void)
 {
-// not used by software driver
+	of_emit_prepare_framebuffer_for_cpu();
 }
 
 
@@ -206,4 +207,3 @@ PQ_HOT void D_DrawParticle (particle_t *pparticle)
 }
 
 #endif	// !id386
-

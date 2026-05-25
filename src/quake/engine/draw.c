@@ -178,6 +178,7 @@ void Draw_Character (int x, int y, int num)
 
 	if (r_pixbytes == 1)
 	{
+		of_emit_prepare_framebuffer_for_cpu();
 		dest = vid.conbuffer + y*vid.conrowbytes + x;
 
 		while (drawline--)
@@ -412,6 +413,7 @@ void Draw_TransPicTranslate (int x, int y, qpic_t *pic, byte *translation)
 
 	if (r_pixbytes == 1)
 	{
+		of_emit_prepare_framebuffer_for_cpu();
 		dest = vid.buffer + y * vid.rowbytes + x;
 
 		if (pic->width & 7)
@@ -529,6 +531,7 @@ void Draw_ConsoleBackground (int lines)
 // draw the pic
 	if (r_pixbytes == 1)
 	{
+		of_emit_prepare_framebuffer_for_cpu();
 		dest = vid.conbuffer;
 
 		for (y=0 ; y<lines ; y++, dest += vid.conrowbytes)
@@ -779,6 +782,8 @@ void Draw_FadeScreen (void)
 	int			x,y;
 	byte		*pbuf;
 
+	of_emit_prepare_framebuffer_for_cpu();
+
 	VID_UnlockBuffer ();
 	S_ExtraUpdate ();
 	VID_LockBuffer ();
@@ -833,4 +838,3 @@ void Draw_EndDisc (void)
 
 	D_EndDirectRect (vid.width - 24, 0, 24, 24);
 }
-

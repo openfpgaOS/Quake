@@ -20,6 +20,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // d_clear: clears a specified rectangle to the specified color
 
 #include "quakedef.h"
+#include "of_emit.h"
 
 
 /*
@@ -56,6 +57,8 @@ void D_FillRect (vrect_t *rect, int color)
 	if (rwidth < 1 || rheight < 1)
 		return;
 
+	of_emit_prepare_framebuffer_for_cpu();
+
 	dest = ((byte *)vid.buffer + ry*vid.rowbytes + rx);
 
 	if (((rwidth & 0x03) == 0) && (((long)dest & 0x03) == 0))
@@ -85,4 +88,3 @@ void D_FillRect (vrect_t *rect, int color)
 		}
 	}
 }
-

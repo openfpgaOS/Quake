@@ -155,6 +155,8 @@ extern unsigned int pq_gpu_fence_frame;
 extern unsigned int pq_gpu_tex_req_frame;
 extern unsigned int pq_gpu_tex_miss_frame;
 extern unsigned int pq_gpu_stall_total_frame;
+extern unsigned int pq_gpu_param_zwrite_spans_frame;
+extern unsigned int pq_gpu_param_ztest_spans_frame;
 extern unsigned int pq_prof_aet_peak;
 extern unsigned int pq_prof_aet_peak_scanline;
 extern unsigned int pq_prof_aet_total_edges;
@@ -167,6 +169,7 @@ extern unsigned int pq_dbg_hw_edges;
 extern unsigned int pq_dbg_hw_first_edge;
 extern unsigned int pq_dbg_hw_state;
 extern unsigned int pq_dbg_hw_edges_reg;
+extern int pq_gpu_zwrite_pending;
 /* D_DrawSurfaces sub-profiling (from d_edge.c) */
 extern unsigned int pq_prof_ds_calcgrad_cycles;
 extern unsigned int pq_prof_ds_cachesurf_cycles;
@@ -274,6 +277,8 @@ static unsigned int pq_gpu_status_or_accum;
 static unsigned int pq_gpu_tex_req_accum;
 static unsigned int pq_gpu_tex_miss_accum;
 static unsigned int pq_gpu_stall_total_accum;
+static unsigned int pq_gpu_param_zwrite_spans_accum;
+static unsigned int pq_gpu_param_ztest_spans_accum;
 
 /* openfpgaOS GPU command-path counters: averaged values. */
 static unsigned int pq_gpu_avg_batch_flushes;
@@ -290,6 +295,8 @@ static unsigned int pq_gpu_avg_status_or;
 static unsigned int pq_gpu_avg_tex_req;
 static unsigned int pq_gpu_avg_tex_miss;
 static unsigned int pq_gpu_avg_stall_total;
+static unsigned int pq_gpu_avg_param_zwrite_spans;
+static unsigned int pq_gpu_avg_param_ztest_spans;
 
 /* Mode tracking for display mode transitions */
 static int pq_prof_prev_mode;
@@ -324,7 +331,7 @@ cvar_t	r_maxedges = {"r_maxedges", "0"};
 cvar_t	r_numedges = {"r_numedges", "0"};
 cvar_t	r_aliastransbase = {"r_aliastransbase", "200"};
 cvar_t	r_aliastransadj = {"r_aliastransadj", "100"};
-cvar_t	pq_cycleprof = {"pq_cycleprof", "2"};
+cvar_t	pq_cycleprof = {"pq_cycleprof", "0"};
 
 extern cvar_t	scr_fov;
 
@@ -897,15 +904,7 @@ void R_DrawViewModel (void)
 	cl.light_level = r_viewlighting.ambientlight;
 #endif
 
-	{
-		volatile unsigned char *_fb = (volatile unsigned char *)d_viewbuffer;
-		int _r;
-		/* Row 25: mark BEFORE R_AliasDrawModel */
-		for(_r=25;_r<28;_r++) { _fb[_r*320]=251; _fb[_r*320+1]=251; _fb[_r*320+2]=251; _fb[_r*320+3]=251; }
-		R_AliasDrawModel (&r_viewlighting);
-		/* Row 25 col 8: mark AFTER R_AliasDrawModel (survived) */
-		for(_r=25;_r<28;_r++) { _fb[_r*320+8]=244; _fb[_r*320+9]=244; _fb[_r*320+10]=244; _fb[_r*320+11]=244; }
-	}
+	R_AliasDrawModel (&r_viewlighting);
 }
 
 
@@ -1247,6 +1246,12 @@ static void PQ_Prof_DrawTerminal(void)
 		pq_gpu_avg_stall_total);
 	term_puts(line);
 
+	term_setpos(row++, 0);
+	snprintf(line, sizeof(line), "ParamZ W:%u T:%u",
+		pq_gpu_avg_param_zwrite_spans,
+		pq_gpu_avg_param_ztest_spans);
+	term_puts(line);
+
 	/* FPS estimate */
 	unsigned int total_ms = pq_prof_avg_total / 105000;
 	term_setpos(row++, 0);
@@ -1450,23 +1455,24 @@ SetVisibilityByPassages ();
 
 	pq_dbg_stage = 0x3206;
 
-	/* Wait for z-buffer clear started at end of previous frame.
-	   First frame: no fill running yet, so start one synchronously. */
+	/* Z clear is queued on the GPU at the end of each frame before the
+	 * flip fence. First frame has no previous clear, so do one now. */
 	{
-		static qboolean zfill_started = false;
-		if (!zfill_started) {
-			sram_fill_start(0x38000000, d_zwidth * vid.height * sizeof(short), 0);
-			zfill_started = true;
+		static qboolean zclear_started = false;
+		if (!zclear_started) {
+			if (profiling)
+				prof_start = SYS_CYCLE_LO;
+			of_emit_clear(OF_EMIT_CLEAR_DEPTH, 0, 0);
+			of_emit_finish();
+			if (profiling)
+				pq_prof_zfill_wait_cycles_frame = SYS_CYCLE_LO - prof_start;
+			zclear_started = true;
 		}
 	}
-	if (profiling)
-		prof_start = SYS_CYCLE_LO;
-	sram_fill_wait();
-	if (profiling)
-		pq_prof_zfill_wait_cycles_frame = SYS_CYCLE_LO - prof_start;
 
 	if (profiling)
 		prof_start = SYS_CYCLE_LO;
+	pq_gpu_zwrite_pending = 0;
 	R_EdgeDrawing ();
 	if (profiling)
 		pq_prof_edge_cycles_frame = SYS_CYCLE_LO - prof_start;
@@ -1477,6 +1483,12 @@ SetVisibilityByPassages ();
 	S_ExtraUpdate();
 
 	pq_dbg_stage = 0x3208;
+
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_finish();
+		pq_gpu_zwrite_pending = 0;
+	}
 
 	if (r_dspeeds.value)
 	{
@@ -1515,6 +1527,12 @@ SetVisibilityByPassages ();
 		dp_time1 = Sys_FloatTime ();
 	}
 	pq_dbg_stage = 0x320D;
+
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_finish();
+		pq_gpu_zwrite_pending = 0;
+	}
 
 	if (r_drawparticles.value)
 		R_DrawParticles ();
@@ -1562,7 +1580,7 @@ SetVisibilityByPassages ();
 		if (profiling == 1) {
 			/* Mode 1: existing Con_Printf every 30 frames */
 			if ((pq_prof_frame_counter % 30) == 0) {
-				Con_Printf ("pq_prof cyc edge:%u spans:%u z:%u alias:%u calls s:%u z:%u batch:%u/%u dma:%u ringw:%u\n",
+				Con_Printf ("pq_prof cyc edge:%u spans:%u z:%u alias:%u calls s:%u z:%u batch:%u/%u dma:%u ringw:%u pz:%u/%u\n",
 					pq_prof_edge_cycles_frame,
 					pq_prof_spans8_cycles_frame,
 					pq_prof_zspans_cycles_frame,
@@ -1572,7 +1590,9 @@ SetVisibilityByPassages ();
 					pq_gpu_batch_flushes_frame,
 					pq_gpu_batch_spans_frame,
 					pq_gpu_cmd_dma_flushes_frame,
-					pq_gpu_ring_waits_frame);
+					pq_gpu_ring_waits_frame,
+					pq_gpu_param_zwrite_spans_frame,
+					pq_gpu_param_ztest_spans_frame);
 			}
 		} else if (profiling == 2) {
 			/* Mode 2: accumulate, average every 64 frames, draw terminal */
@@ -1627,6 +1647,8 @@ SetVisibilityByPassages ();
 			pq_gpu_tex_req_accum += pq_gpu_tex_req_frame;
 			pq_gpu_tex_miss_accum += pq_gpu_tex_miss_frame;
 			pq_gpu_stall_total_accum += pq_gpu_stall_total_frame;
+			pq_gpu_param_zwrite_spans_accum += pq_gpu_param_zwrite_spans_frame;
+			pq_gpu_param_ztest_spans_accum += pq_gpu_param_ztest_spans_frame;
 
 			if ((pq_prof_frame_counter & 63) == 0) {
 				pq_prof_avg_total = pq_prof_total_accum >> 6;
@@ -1675,6 +1697,8 @@ SetVisibilityByPassages ();
 				pq_gpu_avg_tex_req = pq_gpu_tex_req_accum >> 6;
 				pq_gpu_avg_tex_miss = pq_gpu_tex_miss_accum >> 6;
 				pq_gpu_avg_stall_total = pq_gpu_stall_total_accum >> 6;
+				pq_gpu_avg_param_zwrite_spans = pq_gpu_param_zwrite_spans_accum >> 6;
+				pq_gpu_avg_param_ztest_spans = pq_gpu_param_ztest_spans_accum >> 6;
 
 				pq_prof_total_accum = 0;
 				pq_prof_zfill_wait_accum = 0;
@@ -1722,6 +1746,8 @@ SetVisibilityByPassages ();
 				pq_gpu_tex_req_accum = 0;
 				pq_gpu_tex_miss_accum = 0;
 				pq_gpu_stall_total_accum = 0;
+				pq_gpu_param_zwrite_spans_accum = 0;
+				pq_gpu_param_ztest_spans_accum = 0;
 
 				PQ_Prof_DrawTerminal();
 			}
@@ -1775,6 +1801,8 @@ SetVisibilityByPassages ();
 		pq_gpu_tex_req_accum = 0;
 		pq_gpu_tex_miss_accum = 0;
 		pq_gpu_stall_total_accum = 0;
+		pq_gpu_param_zwrite_spans_accum = 0;
+		pq_gpu_param_ztest_spans_accum = 0;
 	} else if (profiling != 2 && pq_prof_prev_mode == 2) {
 		/* Leaving mode 2: switch back to framebuffer */
 		SYS_DISPLAY_MODE = 1;
@@ -1784,9 +1812,10 @@ SetVisibilityByPassages ();
 // back to high floating-point precision
 	pq_dbg_stage = 0x3210;
 
-	// Start z-buffer clear for NEXT frame now that this frame's z-buffer is no longer needed.
-	// Runs in background during buffer swap, console, network, input, and next frame's setup.
-	sram_fill_start(0x38000000, d_zwidth * vid.height * sizeof(short), 0);
+	/* Queue z-buffer clear for the next frame.  VID_Update places the flip
+	 * after this command, so the next frame's wait-sync also retires the
+	 * clear without a separate CPU-side memset. */
+	of_emit_clear(OF_EMIT_CLEAR_DEPTH, 0, 0);
 }
 
 void R_RenderView (void)

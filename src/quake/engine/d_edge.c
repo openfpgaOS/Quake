@@ -21,10 +21,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "d_local.h"
+#include "of_emit.h"
 #include "sysreg_stub.h"
 
 extern int	pq_combined_z_active;
 extern int	r_gpu_world_direct_active;
+extern cvar_t	pq_gpu_world_light;
 
 /* Sub-profiling for D_DrawSurfaces breakdown */
 unsigned int pq_prof_ds_calcgrad_cycles;
@@ -98,6 +100,8 @@ void D_DrawSolidSurface (surf_t *surf, int color)
 	byte	*pdest;
 	int		u, u2, pix;
 	
+	of_emit_prepare_framebuffer_for_cpu();
+
 	pix = (color<<24) | (color<<16) | (color<<8) | color;
 	for (span=surf->spans ; span ; span=span->pnext)
 	{
@@ -134,13 +138,10 @@ D_CalcGradients
 */
 PQ_FASTTEXT void D_CalcGradients (msurface_t *pface)
 {
-	mplane_t	*pplane;
 	float		mipscale;
 	vec3_t		p_temp1;
 	vec3_t		p_saxis, p_taxis;
 	float		t;
-
-	pplane = pface->plane;
 
 	mipscale = 1.0f / (float)(1 << miplevel);
 
@@ -363,18 +364,26 @@ PQ_HOT void D_DrawSurfaces (void)
 
 				if (profiling) prof_t = SYS_CYCLE_LO;
 #if D_GPU_WORLD_LIGHT
-				/* T6 GPU lighting: skip D_CacheSurface entirely.
-				 * D_GpuLightSurface points cacheblock at the raw mip
-				 * texture, runs R_BuildLightMap, returns the per-
-				 * surface colormap row that D_DrawSpans8 puts in the
-				 * span's `light` field with OF_EMIT_COLORMAP. */
-				pq_world_light = D_GpuLightSurface (pface, miplevel);
-				(void)pcurrentcache;
-#else
-				pcurrentcache = D_CacheSurface (pface, miplevel);
-				cacheblock = (pixel_t *)pcurrentcache->data;
-				cachewidth = pcurrentcache->width;
+				if ((int)pq_gpu_world_light.value)
+				{
+					/* Optional raw-texture GPU lighting path.  Keep it
+					 * opt-in until the GPU perspective path is exact with
+					 * large absolute texture coordinates. */
+					pq_world_light = D_GpuLightSurface (pface, miplevel);
+					(void)pcurrentcache;
+				}
+				else
 #endif
+				{
+					pcurrentcache = D_CacheSurface (pface, miplevel);
+					cacheblock = (pixel_t *)pcurrentcache->data;
+					cachewidth = pcurrentcache->width;
+					pq_world_light = 0;
+					pq_world_tex_w_mask = 0;
+					pq_world_tex_h_mask = 0;
+					pq_world_tex_s_offset = 0;
+					pq_world_tex_t_offset = 0;
+				}
 				if (profiling) pq_prof_ds_cachesurf_cycles += SYS_CYCLE_LO - prof_t;
 
 	#if D_GPU_WORLD_TRIS && !D_GPU_WORLD_DIRECT
@@ -396,9 +405,8 @@ PQ_HOT void D_DrawSurfaces (void)
 				if (profiling) pq_prof_spans8_cycles_frame += SYS_CYCLE_LO - prof_t;
 #endif
 
-				/* CPU-side z-fill for sprite/alias depth occlusion.
-				 * Triangle path doesn't co-write z (depth dropped in
-				 * lean Phase 2.3) so this always runs under T6 better. */
+				/* CPU-side z-fill for sprite/alias depth occlusion when the
+				 * selected world draw path did not co-write compatible z. */
 				if (!pq_combined_z_active)
 				{
 					if (profiling) prof_t = SYS_CYCLE_LO;

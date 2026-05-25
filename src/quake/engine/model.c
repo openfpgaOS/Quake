@@ -687,8 +687,11 @@ void Mod_LoadTexinfo (lump_t *l)
 
 	for ( i=0 ; i<count ; i++, in++, out++)
 	{
-		for (j=0 ; j<8 ; j++)
+		for (j=0 ; j<4 ; j++)
+		{
 			out->vecs[0][j] = LittleFloat (in->vecs[0][j]);
+			out->vecs[1][j] = LittleFloat (in->vecs[1][j]);
+		}
 		len1 = Length (out->vecs[0]);
 		len2 = Length (out->vecs[1]);
 		len1 = (len1 + len2)/2;
@@ -1696,6 +1699,7 @@ void * Mod_LoadSpriteFrame (void * pin, mspriteframe_t **ppframe)
 	dspriteframe_t		*pinframe;
 	mspriteframe_t		*pspriteframe;
 	int					i, width, height, size, origin[2];
+	int					framebytes;
 	unsigned short		*ppixout;
 	byte				*ppixin;
 
@@ -1704,11 +1708,11 @@ void * Mod_LoadSpriteFrame (void * pin, mspriteframe_t **ppframe)
 	width = LittleLong (pinframe->width);
 	height = LittleLong (pinframe->height);
 	size = width * height;
+	framebytes = sizeof (*pspriteframe) + size*r_pixbytes;
 
-	pspriteframe = Hunk_AllocName (sizeof (mspriteframe_t) + size*r_pixbytes,
-								   loadname);
+	pspriteframe = Hunk_AllocName (framebytes, loadname);
 
-	Q_memset (pspriteframe, 0, sizeof (mspriteframe_t) + size);
+	Q_memset (pspriteframe, 0, framebytes);
 	*ppframe = pspriteframe;
 
 	pspriteframe->width = width;
@@ -1723,12 +1727,12 @@ void * Mod_LoadSpriteFrame (void * pin, mspriteframe_t **ppframe)
 
 	if (r_pixbytes == 1)
 	{
-		Q_memcpy (&pspriteframe->pixels[0], (byte *)(pinframe + 1), size);
+		Q_memcpy (pspriteframe->pixels, (byte *)(pinframe + 1), size);
 	}
 	else if (r_pixbytes == 2)
 	{
 		ppixin = (byte *)(pinframe + 1);
-		ppixout = (unsigned short *)&pspriteframe->pixels[0];
+		ppixout = (unsigned short *)pspriteframe->pixels;
 
 		for (i=0 ; i<size ; i++)
 			ppixout[i] = d_8to16table[ppixin[i]];

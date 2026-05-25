@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "r_local.h"
+#include "of_emit.h"
 
 
 /*
@@ -125,6 +126,8 @@ void R_LineGraph (int x, int y, int h)
 	
 	if (h>s)
 		h = s;
+
+	of_emit_prepare_framebuffer_for_cpu();
 		
 	for (i=0 ; i<h ; i++, dest -= vid.rowbytes*2)
 	{
@@ -520,4 +523,3 @@ r_refdef.viewangles[2]=    0;
 
 	D_SetupFrame ();
 }
-

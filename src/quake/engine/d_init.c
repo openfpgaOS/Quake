@@ -27,6 +27,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 cvar_t	d_subdiv16 = {"d_subdiv16", "1"};
 cvar_t	d_mipcap = {"d_mipcap", "0"};
 cvar_t	d_mipscale = {"d_mipscale", "0.3"};
+cvar_t	pq_gpu_zwrite = {"pq_gpu_zwrite", "1"};
+cvar_t	pq_gpu_world_light = {"pq_gpu_world_light", "0"};
+cvar_t	pq_gpu_persp = {"pq_gpu_persp", "1"};
+cvar_t	pq_gpu_param = {"pq_gpu_param", "1"};
 
 surfcache_t		*d_initial_rover;
 qboolean		d_roverwrapped;
@@ -53,6 +57,10 @@ void D_Init (void)
 	Cvar_RegisterVariable (&d_subdiv16);
 	Cvar_RegisterVariable (&d_mipcap);
 	Cvar_RegisterVariable (&d_mipscale);
+	Cvar_RegisterVariable (&pq_gpu_zwrite);
+	Cvar_RegisterVariable (&pq_gpu_world_light);
+	Cvar_RegisterVariable (&pq_gpu_persp);
+	Cvar_RegisterVariable (&pq_gpu_param);
 
 	r_drawpolys = false;
 	r_worldpolysbacktofront = false;

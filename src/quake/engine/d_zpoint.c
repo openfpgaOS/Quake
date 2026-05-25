@@ -21,6 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "d_local.h"
+#include "of_emit.h"
 
 
 /*
@@ -33,6 +34,8 @@ void D_DrawZPoint (void)
 	byte	*pdest;
 	short	*pz;
 	int		izi;
+
+	of_emit_prepare_framebuffer_for_cpu();
 	
 	pz = d_pzbuffer + (d_zwidth * r_zpointdesc.v) + r_zpointdesc.u;
 	pdest = d_viewbuffer + d_scantable[r_zpointdesc.v] + r_zpointdesc.u;
@@ -44,4 +47,3 @@ void D_DrawZPoint (void)
 		*pdest = r_zpointdesc.color;
 	}
 }
-
