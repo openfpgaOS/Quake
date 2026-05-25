@@ -38,6 +38,12 @@ byte		*draw_chars;				// 8*8 graphic characters
 qpic_t		*draw_disc;
 qpic_t		*draw_backtile;
 
+static byte draw_chars_keyed[128 * 128] __attribute__((aligned(64)));
+static byte draw_fade_pattern[8] __attribute__((aligned(64))) = {
+	TRANSPARENT_COLOR, 0, 0, 0,
+	0, 0, TRANSPARENT_COLOR, 0
+};
+
 //=============================================================================
 /* Support Routines */
 
@@ -116,6 +122,9 @@ void Draw_Init (void)
 	draw_disc = W_GetLumpName ("disc");
 	draw_backtile = W_GetLumpName ("backtile");
 
+	for (i=0 ; i<128*128 ; i++)
+		draw_chars_keyed[i] = draw_chars[i] ? draw_chars[i] : TRANSPARENT_COLOR;
+
 	r_rectdesc.width = draw_backtile->width;
 	r_rectdesc.height = draw_backtile->height;
 	r_rectdesc.ptexbytes = draw_backtile->data;
@@ -127,6 +136,8 @@ void Draw_Init (void)
 	 * blits through of_emit_blit (which reads via cached AXI alias). */
 	of_emit_cache_clean(draw_chars,
 	                    (uint32_t)(128 * 128));   /* conchars: 16x16 grid of 8x8 */
+	of_emit_cache_clean(draw_chars_keyed, (uint32_t)sizeof(draw_chars_keyed));
+	of_emit_cache_clean(draw_fade_pattern, (uint32_t)sizeof(draw_fade_pattern));
 	of_emit_cache_clean(draw_backtile->data,
 	                    (uint32_t)(draw_backtile->width * draw_backtile->height));
 }
@@ -178,29 +189,24 @@ void Draw_Character (int x, int y, int num)
 
 	if (r_pixbytes == 1)
 	{
-		of_emit_prepare_framebuffer_for_cpu();
-		dest = vid.conbuffer + y*vid.conrowbytes + x;
+		byte *gpu_source = draw_chars_keyed + (source - draw_chars);
 
-		while (drawline--)
+		for (int line=0 ; line<drawline ; line++)
 		{
-			if (source[0])
-				dest[0] = source[0];
-			if (source[1])
-				dest[1] = source[1];
-			if (source[2])
-				dest[2] = source[2];
-			if (source[3])
-				dest[3] = source[3];
-			if (source[4])
-				dest[4] = source[4];
-			if (source[5])
-				dest[5] = source[5];
-			if (source[6])
-				dest[6] = source[6];
-			if (source[7])
-				dest[7] = source[7];
-			source += 128;
-			dest += vid.conrowbytes;
+			of_emit_span_t sp = {
+				.fb_addr   = (uint32_t)(uintptr_t)
+					(vid.conbuffer + (y + line) * vid.conrowbytes + x),
+				.tex_addr  = (uint32_t)(uintptr_t)(gpu_source + line * 128),
+				.s         = 0,
+				.t         = 0,
+				.sstep     = 0x10000,
+				.tstep     = 0,
+				.count     = 8,
+				.flags     = OF_EMIT_SKIP_ZERO,
+				.fb_stride = 1,
+				.tex_width = 128,
+			};
+			of_emit_span(&sp);
 		}
 	}
 	else
@@ -531,31 +537,27 @@ void Draw_ConsoleBackground (int lines)
 // draw the pic
 	if (r_pixbytes == 1)
 	{
-		of_emit_prepare_framebuffer_for_cpu();
-		dest = vid.conbuffer;
+		of_emit_cache_clean(conback->data,
+		                    (uint32_t)(conback->width * conback->height));
+		fstep = 320*0x10000/vid.conwidth;
 
-		for (y=0 ; y<lines ; y++, dest += vid.conrowbytes)
+		for (y=0 ; y<lines ; y++)
 		{
 			v = (vid.conheight - lines + y)*200/vid.conheight;
-			src = conback->data + v*320;
-			if (vid.conwidth == 320)
-				memcpy (dest, src, vid.conwidth);
-			else
-			{
-				f = 0;
-				fstep = 320*0x10000/vid.conwidth;
-				for (x=0 ; x<vid.conwidth ; x+=4)
-				{
-					dest[x] = src[f>>16];
-					f += fstep;
-					dest[x+1] = src[f>>16];
-					f += fstep;
-					dest[x+2] = src[f>>16];
-					f += fstep;
-					dest[x+3] = src[f>>16];
-					f += fstep;
-				}
-			}
+			of_emit_span_t sp = {
+				.fb_addr   = (uint32_t)(uintptr_t)
+					(vid.conbuffer + y * vid.conrowbytes),
+				.tex_addr  = (uint32_t)(uintptr_t)conback->data,
+				.s         = 0,
+				.t         = v << 16,
+				.sstep     = fstep,
+				.tstep     = 0,
+				.count     = (uint16_t)vid.conwidth,
+				.flags     = 0,
+				.fb_stride = 1,
+				.tex_width = 320,
+			};
+			of_emit_span(&sp);
 		}
 	}
 	else
@@ -781,6 +783,30 @@ void Draw_FadeScreen (void)
 {
 	int			x,y;
 	byte		*pbuf;
+
+	if (r_pixbytes == 1)
+	{
+		for (y=0 ; y<vid.height ; y++)
+		{
+			of_emit_span_t sp = {
+				.fb_addr   = (uint32_t)(uintptr_t)(vid.buffer + vid.rowbytes*y),
+				.tex_addr  = (uint32_t)(uintptr_t)draw_fade_pattern,
+				.s         = 0,
+				.t         = (y & 1) << 16,
+				.sstep     = 0x10000,
+				.tstep     = 0,
+				.count     = (uint16_t)vid.width,
+				.flags     = OF_EMIT_SKIP_ZERO,
+				.fb_stride = 1,
+				.tex_width = 4,
+				.tex_w_mask = 3,
+				.tex_h_mask = 1,
+			};
+			of_emit_span(&sp);
+		}
+		of_emit_kick();
+		return;
+	}
 
 	of_emit_prepare_framebuffer_for_cpu();
 
