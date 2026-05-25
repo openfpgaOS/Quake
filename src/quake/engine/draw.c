@@ -44,6 +44,13 @@ static byte draw_fade_pattern[8] __attribute__((aligned(64))) = {
 	0, 0, TRANSPARENT_COLOR, 0
 };
 
+#define DRAW_TEXTLINE_MAX_CHARS 40
+#define DRAW_TEXTLINE_BUFFERS 128
+
+static byte draw_textline_buffers[DRAW_TEXTLINE_BUFFERS]
+	[DRAW_TEXTLINE_MAX_CHARS * 8 * 8] __attribute__((aligned(64)));
+static int draw_textline_buffer_next;
+
 //=============================================================================
 /* Support Routines */
 
@@ -239,18 +246,116 @@ void Draw_Character (int x, int y, int num)
 	}
 }
 
+static byte *Draw_AllocTextLineBuffer (void)
+{
+	if (draw_textline_buffer_next >= DRAW_TEXTLINE_BUFFERS)
+	{
+		of_emit_finish();
+		draw_textline_buffer_next = 0;
+	}
+
+	return draw_textline_buffers[draw_textline_buffer_next++];
+}
+
+static void Draw_StringChunk8 (int x, int y, char *str, int len,
+	int src_row, int drawline)
+{
+	int row, col, pitch;
+	byte *scratch;
+
+	if (len <= 0 || drawline <= 0)
+		return;
+
+	pitch = len * 8;
+	scratch = Draw_AllocTextLineBuffer ();
+
+	for (row=0 ; row<drawline ; row++)
+	{
+		byte *dst = scratch + row * pitch;
+		for (col=0 ; col<len ; col++)
+		{
+			int ch = str[col] & 255;
+			byte *src = draw_chars_keyed +
+				((ch >> 4) << 10) + ((ch & 15) << 3) +
+				(src_row + row) * 128;
+			memcpy (dst + col * 8, src, 8);
+		}
+	}
+
+	of_emit_cache_clean(scratch, (uint32_t)(pitch * drawline));
+
+	for (row=0 ; row<drawline ; row++)
+	{
+		of_emit_span_t sp = {
+			.fb_addr   = (uint32_t)(uintptr_t)
+				(vid.conbuffer + (y + row) * vid.conrowbytes + x),
+			.tex_addr  = (uint32_t)(uintptr_t)(scratch + row * pitch),
+			.s         = 0,
+			.t         = 0,
+			.sstep     = 0x10000,
+			.tstep     = 0,
+			.count     = (uint16_t)pitch,
+			.flags     = OF_EMIT_SKIP_ZERO,
+			.fb_stride = 1,
+			.tex_width = (uint16_t)pitch,
+		};
+		of_emit_span(&sp);
+	}
+}
+
 /*
 ================
 Draw_String
 ================
 */
+void Draw_StringLen (int x, int y, char *str, int len);
+
 void Draw_String (int x, int y, char *str)
 {
-	while (*str)
+	Draw_StringLen (x, y, str, strlen(str));
+}
+
+void Draw_StringLen (int x, int y, char *str, int len)
+{
+	int i, src_row, drawline;
+
+	if (len <= 0 || y <= -8)
+		return;
+
+	while (len > 0 && (str[len-1] == ' ' || str[len-1] == 0))
+		len--;
+	if (len <= 0)
+		return;
+
+	if (y < 0)
 	{
-		Draw_Character (x, y, *str);
-		str++;
-		x += 8;
+		src_row = -y;
+		drawline = 8 + y;
+		y = 0;
+	}
+	else
+	{
+		src_row = 0;
+		drawline = 8;
+	}
+
+	if (r_pixbytes != 1 || len < 4)
+	{
+		for (i=0 ; i<len ; i++)
+			Draw_Character (x + i*8, y - src_row, str[i]);
+		return;
+	}
+
+	while (len > 0)
+	{
+		int chunk = len;
+		if (chunk > DRAW_TEXTLINE_MAX_CHARS)
+			chunk = DRAW_TEXTLINE_MAX_CHARS;
+
+		Draw_StringChunk8 (x, y, str, chunk, src_row, drawline);
+		x += chunk * 8;
+		str += chunk;
+		len -= chunk;
 	}
 }
 

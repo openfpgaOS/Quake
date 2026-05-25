@@ -151,12 +151,13 @@ void SCR_DrawCenterString (void)
 			if (start[l] == '\n' || !start[l])
 				break;
 		x = (vid.width - l*8)/2;
-		for (j=0 ; j<l ; j++, x+=8)
-		{
-			Draw_Character (x, y, start[j]);	
-			if (!remaining--)
-				return;
-		}
+		j = l;
+		if (j > remaining + 1)
+			j = remaining + 1;
+		Draw_StringLen (x, y, start, j);
+		remaining -= j;
+		if (j < l || remaining < 0)
+			return;
 			
 		y += 8;
 
@@ -721,8 +722,7 @@ void SCR_DrawNotifyString (void)
 			if (start[l] == '\n' || !start[l])
 				break;
 		x = (vid.width - l*8)/2;
-		for (j=0 ; j<l ; j++, x+=8)
-			Draw_Character (x, y, start[j]);	
+		Draw_StringLen (x, y, start, l);
 			
 		y += 8;
 
