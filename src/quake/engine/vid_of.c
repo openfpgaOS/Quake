@@ -98,9 +98,9 @@ unsigned       d_8to24table[256];
  *                            of_emit_finish() takes ~that long per call. */
 unsigned int   pq_prof_gpu_wait_cycles;
 
-/* Page-flip duration.  With OF_EMIT_CAP_FLIP this measures the
- * acquire_next syscall; otherwise it measures the conservative
- * kernel-driven of_video_flip() path. */
+/* Page-flip wait duration.  With OF_EMIT_CAP_FLIP this measures the
+ * deferred present wait plus the next acquire_next syscall.  Otherwise it
+ * measures the conservative kernel-driven of_video_flip() path. */
 unsigned int   pq_prof_video_flip_cycles;
 
 /* GPU command-path profiler.  These are architecture-native counters
@@ -131,6 +131,7 @@ unsigned int   pq_gpu_param_ztest_spans_frame;
 static int     draw_idx = -1;
 static int     pending_flip_idx = -1;
 static uint32_t pending_flip_token;
+static int     flip_present_pending;
 static int     zbuffer_cpu_cached;
 static uint32_t of_emit_caps;
 static int     of_emit_ready;
@@ -1069,18 +1070,23 @@ void VID_Update(vrect_t *rects)
     unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
 
     if (of_emit_supports(OF_EMIT_CAP_FLIP)) {
-        /* Runtime-advertised CMD_FLIP path: render commands and the
-         * page swap stay ordered in the GPU ring.  Do not acquire the
-         * next buffer here.  Deferring that wait to VID_WaitSync() lets
-         * host/audio/input/server work overlap the GPU's remaining
-         * raster work and the flip fence. */
+        /* Runtime-advertised CMD_FLIP path: render commands and the page
+         * swap stay ordered in the GPU ring.  Triple buffering lets the next
+         * frame render while the previous flip is still waiting for scanout;
+         * only block before queuing another flip. */
         flush_span_batch();
+        if (flip_present_pending) {
+            t0 = profiling ? SYS_CYCLE_LO : 0;
+            of_video_wait_flip();
+            if (profiling)
+                pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
+            flip_present_pending = 0;
+        }
+
         pending_flip_idx = draw_idx;
         pending_flip_token = of_gpu_flip_to(draw_idx);
         of_gpu_kick();
 
-        if (profiling)
-            pq_prof_video_flip_cycles = 0;
         draw_idx = -1;
         return;
     }
@@ -1111,17 +1117,17 @@ void VID_WaitSync(void)
     int profiling = (int)pq_cycleprof.value;
     unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
 
-    /* Wait until CMD_FLIP reaches the display side-port, then wait for
-     * that queued swap to present.  This happens at the next frame's
-     * screen boundary, after host/audio/input/server work had a chance
-     * to overlap the GPU. */
+    /* Wait only until CMD_FLIP reaches the display side-port.  The returned
+     * buffer is the third slot: not current scanout and not queued for the
+     * next vsync.  The actual present wait is deferred to VID_Update(), just
+     * before the next CMD_FLIP, so rendering can overlap scanout. */
     draw_idx = of_video_acquire_next(pending_flip_idx, pending_flip_token);
-    of_video_wait_flip();
 
     if (profiling)
-        pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
+        pq_prof_video_flip_cycles += SYS_CYCLE_LO - t0;
 
     of_emit_cpu_sync_needed = 0;
+    flip_present_pending = 1;
 
     pending_flip_idx = -1;
     pending_flip_token = 0;
