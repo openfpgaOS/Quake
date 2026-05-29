@@ -8,7 +8,7 @@
  */
 
 /* Force CPU-side alias vertex transform. The ATM MMIO coprocessor
- * below lives at 0x58000000 on PocketQuake's custom core — not on the
+ * below lives at 0x58000000 on Quake's custom core — not on the
  * openfpgaOS fabric. Leaving this on made every alias vertex project
  * to INT32_MAX (garbage reads from the non-existent MMIO), which made
  * every triangle degenerate and every backface-cull fail. */

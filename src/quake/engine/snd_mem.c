@@ -17,7 +17,7 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-// snd_mem.c -- sound caching and WAV loading for PocketQuake
+// snd_mem.c -- sound caching and WAV loading for Quake
 
 #include "quakedef.h"
 #include "of_cache.h"

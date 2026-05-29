@@ -383,7 +383,7 @@ void R_Init (void)
 // get stack position so we can guess if we are going to overflow
 	r_stack_start = (byte *)&dummy;
 
-	/* Microcode upload was for PocketQuake's VLIW span rasterizer.  The
+	/* Microcode upload was for Quake's VLIW span rasterizer.  The
 	 * openfpgaOS GPU has its pipeline baked into RTL, so nothing to do
 	 * here — of_emit_init() (called from VID_Init) has already booted
 	 * the GPU command ring. */
@@ -1126,7 +1126,7 @@ static void PQ_Prof_DrawTerminal(void)
 
 	/* Header */
 	term_setpos(row++, 0);
-	term_puts("---- PocketQuake Profiler ----");
+	term_puts("---- Quake " QUAKE_CORE_VERSION " Profiler ----");
 
 	/* Column header */
 	term_setpos(row++, 0);

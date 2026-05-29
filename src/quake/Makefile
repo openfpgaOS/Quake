@@ -23,7 +23,7 @@ SRCS_CXX    =
 # too, since the scan/edge walkers rely on FP associativity Quake
 # already tolerated.
 CFLAGS  = -Iengine
-CFLAGS += -std=gnu11 -fcommon -DPOCKET_QUAKE=1
+CFLAGS += -std=gnu11 -fcommon -DQUAKE_OPENFPGA=1
 CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function
 CFLAGS += -Wno-missing-field-initializers -Wno-sign-compare
 CFLAGS += -Wno-implicit-function-declaration -Wno-pointer-sign

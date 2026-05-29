@@ -24,7 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define	QUAKE_GAME			// as opposed to utilities
 
 #define	VERSION				1.09
-#define	POCKETQUAKE_VERSION	"2.0"
+#define	QUAKE_CORE_VERSION	"1.0.0"
 #define	GLQUAKE_VERSION		1.00
 #define	D3DQUAKE_VERSION	0.01
 #define	WINQUAKE_VERSION	0.996
@@ -126,7 +126,7 @@ void	VID_UnlockBuffer (void);
  * are now empty no-ops; the in-source annotations remain so a future
  * I-cache-counter-aware fabric can re-enable placement without
  * re-editing the engine. */
-#if defined(POCKET_QUAKE)
+#if defined(QUAKE_OPENFPGA)
 #define PQ_FASTTEXT
 #define PQ_HOT
 #define PQ_FASTDATA   __attribute__((section(".fastdata")))

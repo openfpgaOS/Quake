@@ -21,7 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "net_loop.h"
 
-/* Loopback-only build. The PocketQuake link-cable driver is stubbed
+/* Loopback-only build. The Quake link-cable driver is stubbed
  * pending an openfpgaOS equivalent — multiplayer is disabled for now. */
 net_driver_t net_drivers[MAX_NET_DRIVERS] =
 {

@@ -681,7 +681,7 @@ void Draw_ConsoleBackground (int lines)
 // hack the version number directly into the pic
 	if (conback != last_conback || generation != last_generation)
 	{
-		sprintf (ver, "PocketQuake %s", POCKETQUAKE_VERSION);
+		sprintf (ver, "Quake %s", QUAKE_CORE_VERSION);
 		dest = conback->data + 320*186 + 320 - 11 - 8*strlen(ver);
 
 		for (x=0 ; x<strlen(ver) ; x++)

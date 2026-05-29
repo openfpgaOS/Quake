@@ -17,7 +17,7 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-// snd_mix.c -- portable sound mixing for PocketQuake
+// snd_mix.c -- portable sound mixing for Quake
 
 #include "quakedef.h"
 

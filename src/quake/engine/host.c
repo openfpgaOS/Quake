@@ -99,7 +99,7 @@ void Host_EndGame (char *message, ...)
 	va_end (argptr);
 	Con_DPrintf ("Host_EndGame: %s\n",string);
 
-#ifdef POCKET_QUAKE
+#ifdef QUAKE_OPENFPGA
 	/* Switch to terminal so the message is visible */
 	(*(volatile unsigned int *)0x4000000C) = 0;
 	printf("Host_EndGame: %s\n", string);
@@ -150,7 +150,7 @@ void Host_Error (char *error, ...)
 	Sys_Printf ("Host_Error: %s\n",string);
 	Con_Printf ("Host_Error: %s\n",string);
 
-#ifdef POCKET_QUAKE
+#ifdef QUAKE_OPENFPGA
 	/* Switch to terminal so the message is visible */
 	(*(volatile unsigned int *)0x4000000C) = 0;
 	printf("Host_Error: %s\n", string);
@@ -664,7 +664,7 @@ void _Host_Frame (float time)
 	static float		time2 = 0;
 	static float		time3 = 0;
 	int			pass1, pass2, pass3;
-#ifdef POCKET_QUAKE
+#ifdef QUAKE_OPENFPGA
 	static int          live_hb = 0;
 #endif
 
@@ -787,7 +787,7 @@ void _Host_Frame (float time)
 	
 	host_framecount++;
 
-#ifdef POCKET_QUAKE
+#ifdef QUAKE_OPENFPGA
 	/* Low-rate liveness marker: disabled (clutters terminal with debug output) */
 #endif
 }
@@ -1031,7 +1031,7 @@ void Host_Init (quakeparms_t *parms)
 
 	Cbuf_InsertText ("exec quake.rc\n");
 
-	// Queue PocketQuake defaults AFTER quake.rc/default.cfg.
+	// Queue Quake defaults AFTER quake.rc/default.cfg.
 	// Cbuf_InsertText puts quake.rc at the front; Cbuf_AddText appends
 	// these after it, so they override default.cfg's values.
 	Cbuf_AddText ("gamma 0.7\n");

@@ -210,7 +210,7 @@ void SV_SendServerinfo (client_t *client)
 	char			message[2048];
 
 	MSG_WriteByte (&client->message, svc_print);
-	sprintf (message, "%c\nPocketQuake %s SERVER (%i CRC)", 2, POCKETQUAKE_VERSION, pr_crc);
+	sprintf (message, "%c\nQuake %s SERVER (%i CRC)", 2, QUAKE_CORE_VERSION, pr_crc);
 	MSG_WriteString (&client->message,message);
 
 	MSG_WriteByte (&client->message, svc_serverinfo);
@@ -1313,4 +1313,3 @@ void SV_SpawnServer (char *server)
 
 	Con_DPrintf ("Server spawned.\n");
 }
-

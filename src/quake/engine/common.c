@@ -1667,7 +1667,7 @@ pack_t *COM_LoadPackFile (char *packfile)
 	if (numpackfiles > MAX_FILES_IN_PACK)
 		Sys_Error ("%s has %i files", packfile, numpackfiles);
 
-	(void)numpackfiles;  // PocketQuake: skip anti-piracy checks
+	(void)numpackfiles;  // Quake: skip anti-piracy checks
 
 	newfiles = Hunk_AllocName (numpackfiles * sizeof(packfile_t), "packfile");
 
@@ -1678,7 +1678,7 @@ pack_t *COM_LoadPackFile (char *packfile)
 	CRC_Init (&crc);
 	for (i=0 ; i<header.dirlen ; i++)
 		CRC_ProcessByte (&crc, ((byte *)info)[i]);
-	(void)crc;  // PocketQuake: skip anti-piracy checks
+	(void)crc;  // Quake: skip anti-piracy checks
 
 // parse the directory
 	for (i=0 ; i<numpackfiles ; i++)

@@ -26,7 +26,7 @@ void Host_Init(quakeparms_t *parms);
 void Host_Frame(float time);
 void Sys_Printf(char *fmt, ...);
 
-/* Static args — PocketQuake used a sysreg to select game mode; we
+/* Static args — Quake used a sysreg to select game mode; we
  * default to base id1 and let a config file override. */
 static char *quake_argv[] = { "quake", NULL };
 

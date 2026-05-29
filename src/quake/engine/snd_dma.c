@@ -17,7 +17,7 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-// snd_dma.c -- Quake sound engine for PocketQuake
+// snd_dma.c -- Quake sound engine
 
 #include "quakedef.h"
 #include "of_caps.h"

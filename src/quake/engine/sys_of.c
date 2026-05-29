@@ -20,7 +20,7 @@
 /* Quake globals */
 qboolean isDedicated = false;
 
-/* Hang-debug stage counters — PocketQuake wrote these from various hot
+/* Hang-debug stage counters — Quake wrote these from various hot
  * paths so a post-mortem hex dump of SDRAM would show where execution
  * had last been. Not needed here, but still written by the engine. */
 volatile unsigned int pq_dbg_stage;
@@ -193,10 +193,10 @@ void Sys_SendKeyEvents(void) { IN_SendKeyEvents(); }
 void Sys_MakeCodeWriteable(unsigned long a, unsigned long b)
 { (void)a; (void)b; }
 
-/* DMA stats — stub for parity with PocketQuake's terminal dump. */
+/* DMA stats — stub for parity with Quake's terminal dump. */
 void Sys_PrintDmaStats(void) { }
 
-/* PocketQuake's on-screen debug terminal.  The engine drives this as a
+/* Quake's on-screen debug terminal.  The engine drives this as a
  * cursor-positioned grid (term_setpos + term_puts per row), but on
  * openfpgaOS there is no real TUI — output goes to UART.  Map each
  * row to one printed line: term_setpos becomes a no-op (row/col carry
@@ -208,7 +208,7 @@ void term_clear(void)                 { fputs("\r\n", stdout); }
 void term_setpos(int row, int col)    { (void)row; (void)col; }
 void term_puts(const char *s)         { if (s) { fputs(s, stdout); fputs("\r\n", stdout); } }
 
-/* PocketQuake SRAM-fill coprocessor — not present on openfpgaOS.  Stubbed. */
+/* Quake SRAM-fill coprocessor — not present on openfpgaOS.  Stubbed. */
 void sram_fill_start(uint32_t dst, uint16_t value, uint32_t count)
 { (void)dst; (void)value; (void)count; }
 void sram_fill_wait(void) { }

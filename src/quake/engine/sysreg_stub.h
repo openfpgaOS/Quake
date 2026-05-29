@@ -1,5 +1,5 @@
 /*
- * sysreg_stub.h -- stand-ins for PocketQuake sysreg MMIO.
+ * sysreg_stub.h -- stand-ins for Quake sysreg MMIO.
  *
  * The engine's pq_cycleprof / HW performance-counter code reads
  * SYS_CYCLE_LO and a bunch of SYS_PERF_* and SPAN_PERF_* registers to
@@ -16,7 +16,7 @@
 #include <stdint.h>
 #include "of_timer.h"  /* of_time_us — see SYS_CYCLE_LO below */
 
-/* PocketQuake scanline accelerator is not present on this port. */
+/* Quake scanline accelerator is not present on this port. */
 #ifndef HW_SCANLINE_ACCEL
 #define HW_SCANLINE_ACCEL 0
 #endif
