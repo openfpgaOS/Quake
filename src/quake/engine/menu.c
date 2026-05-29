@@ -28,6 +28,12 @@ void (*vid_menukeyfn)(int key);
 
 enum {m_none, m_main, m_singleplayer, m_load, m_save, m_multiplayer, m_setup, m_net, m_options, m_video, m_keys, m_help, m_quit, m_serialconfig, m_modemconfig, m_lanconfig, m_gameoptions, m_search, m_slist} m_state;
 
+static void M_StopGameSoundsOnOpen(void)
+{
+	if (key_dest != key_menu)
+		S_StopAllSounds(true);
+}
+
 void M_Menu_Main_f (void);
 	void M_Menu_SinglePlayer_f (void);
 		void M_Menu_Load_f (void);
@@ -281,6 +287,7 @@ void M_Menu_Main_f (void)
 {
 	if (key_dest != key_menu)
 	{
+		M_StopGameSoundsOnOpen ();
 		m_save_demonum = cls.demonum;
 		cls.demonum = -1;
 	}
@@ -367,6 +374,7 @@ int	m_singleplayer_cursor;
 
 void M_Menu_SinglePlayer_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_singleplayer;
 	m_entersound = true;
@@ -444,37 +452,42 @@ int		load_cursor;		// 0 < load_cursor < MAX_SAVEGAMES
 #define	MAX_SAVEGAMES		12
 char	m_filenames[MAX_SAVEGAMES][SAVEGAME_COMMENT_LENGTH+1];
 int		loadable[MAX_SAVEGAMES];
+int		foreignsave[MAX_SAVEGAMES];
 
 void M_ScanSaves (void)
 {
-	int		i, j;
+	int		i;
 	char	name[MAX_OSPATH];
+	char	comment[SAVEGAME_COMMENT_LENGTH+1];
 	FILE	*f;
-	int		version;
+	qboolean	wrong_game;
 
 	for (i=0 ; i<MAX_SAVEGAMES ; i++)
 	{
 		strcpy (m_filenames[i], "--- UNUSED SLOT ---");
 		loadable[i] = false;
+		foreignsave[i] = false;
 		sprintf (name, "%s/s%i.sav", com_gamedir, i);
 		f = fopen (name, "r");
 		if (!f)
 			continue;
-		fscanf (f, "%i\n", &version);
-		fscanf (f, "%79s\n", name);
-		strncpy (m_filenames[i], name, sizeof(m_filenames[i])-1);
-
-	// change _ back to space
-		for (j=0 ; j<SAVEGAME_COMMENT_LENGTH ; j++)
-			if (m_filenames[i][j] == '_')
-				m_filenames[i][j] = ' ';
-		loadable[i] = true;
+		if (Host_ReadSavegameHeader (f, comment, &wrong_game))
+		{
+			strcpy (m_filenames[i], comment);
+			loadable[i] = true;
+		}
+		else if (wrong_game && m_state == m_save)
+		{
+			strcpy (m_filenames[i], "--- OTHER MOD SAVE ---");
+			foreignsave[i] = true;
+		}
 		fclose (f);
 	}
 }
 
 void M_Menu_Load_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	m_entersound = true;
 	m_state = m_load;
 	key_dest = key_menu;
@@ -490,6 +503,7 @@ void M_Menu_Save_f (void)
 		return;
 	if (svs.maxclients != 1)
 		return;
+	M_StopGameSoundsOnOpen ();
 	m_entersound = true;
 	m_state = m_save;
 	key_dest = key_menu;
@@ -580,6 +594,12 @@ void M_Save_Key (int k)
 		break;
 
 	case K_ENTER:
+		if (foreignsave[load_cursor])
+		{
+			S_LocalSound ("misc/menu3.wav");
+			if (!SCR_ModalMessage ("Overwrite save from\nanother game or mod?\n"))
+				return;
+		}
 		m_state = m_none;
 		key_dest = key_game;
 		Cbuf_AddText (va("save s%i\n", load_cursor));
@@ -612,6 +632,7 @@ int	m_multiplayer_cursor;
 
 void M_Menu_MultiPlayer_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_multiplayer;
 	m_entersound = true;
@@ -712,6 +733,7 @@ int		setup_bottom;
 
 void M_Menu_Setup_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_setup;
 	m_entersound = true;
@@ -901,6 +923,7 @@ char *net_helpMessage [] =
 
 void M_Menu_Net_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_net;
 	m_entersound = true;
@@ -1065,6 +1088,7 @@ int		options_cursor;
 
 void M_Menu_Options_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_options;
 	m_entersound = true;
@@ -1358,6 +1382,7 @@ int		bind_grab;
 
 void M_Menu_Keys_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_keys;
 	m_entersound = true;
@@ -1523,6 +1548,7 @@ void M_Keys_Key (int k)
 
 void M_Menu_Video_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_video;
 	m_entersound = true;
@@ -1549,6 +1575,7 @@ int		help_page;
 
 void M_Menu_Help_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_help;
 	m_entersound = true;
@@ -1645,6 +1672,7 @@ void M_Menu_Quit_f (void)
 {
 	if (m_state == m_quit)
 		return;
+	M_StopGameSoundsOnOpen ();
 	wasInMenus = (key_dest == key_menu);
 	key_dest = key_menu;
 	m_quit_prevstate = m_state;
@@ -1754,6 +1782,7 @@ void M_Menu_SerialConfig_f (void)
 	int		baudrate;
 	qboolean	useModem;
 
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_serialconfig;
 	m_entersound = true;
@@ -2033,6 +2062,7 @@ char	modemConfig_hangup [16];
 
 void M_Menu_ModemConfig_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_modemconfig;
 	m_entersound = true;
@@ -2204,6 +2234,7 @@ char	lanConfig_joinname[22];
 
 void M_Menu_LanConfig_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_lanconfig;
 	m_entersound = true;
@@ -2550,6 +2581,7 @@ float m_serverInfoMessageTime;
 
 void M_Menu_GameOptions_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_gameoptions;
 	m_entersound = true;
@@ -2864,6 +2896,7 @@ float		searchCompleteTime;
 
 void M_Menu_Search_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_search;
 	m_entersound = false;
@@ -2927,6 +2960,7 @@ qboolean slist_sorted;
 
 void M_Menu_ServerList_f (void)
 {
+	M_StopGameSoundsOnOpen ();
 	key_dest = key_menu;
 	m_state = m_slist;
 	m_entersound = true;

@@ -83,7 +83,8 @@ typedef struct of_emit_param_span_list_s {
     uint8_t  attr_mode;
     uint8_t  span_axis;
     uint8_t  z_mode;
-    uint8_t  reserved[3];
+    uint8_t  q29_attr_shift;
+    uint8_t  reserved[2];
 
     int32_t  attr_origin[3];
     int32_t  attr_du[3];
@@ -151,7 +152,10 @@ void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
 void of_emit_finish(void);
 void of_emit_kick(void);    /* publish queued commands without waiting */
 void of_emit_prepare_framebuffer_for_cpu(void);
+void of_emit_texture_cache_flush(void);
 void of_emit_cache_clean(const void *addr, uint32_t size);
+void of_emit_cache_clean_once(const void *addr, uint32_t size);
+void of_emit_cache_clean_forget(const void *addr, uint32_t size);
 void of_emit_clear(uint32_t flags, uint16_t color, uint16_t depth);
 void of_emit_depth_test(of_emit_depth_func_t func);
 
@@ -169,6 +173,7 @@ void of_emit_depth_test(of_emit_depth_func_t func);
 #define OF_EMIT_CAP_PARAM_SPAN_LIST (1u << 8)
 #define OF_EMIT_CAP_PARAM_SPAN_Z    (1u << 9)
 #define OF_EMIT_CAP_PARAM_SPAN_ZTEST (1u << 10)
+#define OF_EMIT_CAP_Q29_SCALE       (1u << 11) /* local cap for OF_HW_GPU_PARAM_SPAN_Q29_SCALE */
 
 int of_emit_supports(uint32_t cap);
 int of_emit_gpu_ready(void);
@@ -187,6 +192,8 @@ int of_emit_param_span_list(const of_emit_param_span_list_t *params,
  * `color` is a paletted byte.  Single ring command, no per-pixel CPU
  * work — beats `Draw_Fill`'s tight uncached-SDRAM byte-write loop. */
 void of_emit_clear_rect(int dst_x, int dst_y, int w, int h, unsigned char color);
+void of_emit_clear_rect_addr(uint32_t fb_addr, int fb_stride,
+                             int w, int h, unsigned char color);
 
 /* 1-to-1 paletted blit of an `src_w × src_h` source rectangle (rooted
  * at (`src_x`, `src_y`) within `src_pitch`-wide image `src`) into the

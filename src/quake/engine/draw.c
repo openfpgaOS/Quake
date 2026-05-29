@@ -46,10 +46,15 @@ static byte draw_fade_pattern[8] __attribute__((aligned(64))) = {
 
 #define DRAW_TEXTLINE_MAX_CHARS 40
 #define DRAW_TEXTLINE_BUFFERS 128
+#define DRAW_TRANSLATE_MAX_WIDTH 1280
+#define DRAW_TRANSLATE_ROW_BUFFERS 128
 
 static byte draw_textline_buffers[DRAW_TEXTLINE_BUFFERS]
 	[DRAW_TEXTLINE_MAX_CHARS * 8 * 8] __attribute__((aligned(64)));
 static int draw_textline_buffer_next;
+static byte draw_translate_row_buffers[DRAW_TRANSLATE_ROW_BUFFERS]
+	[DRAW_TRANSLATE_MAX_WIDTH] __attribute__((aligned(64)));
+static int draw_translate_row_buffer_next;
 
 //=============================================================================
 /* Support Routines */
@@ -58,16 +63,53 @@ typedef struct cachepic_s
 {
 	char		name[MAX_QPATH];
 	cache_user_t	cache;
+	unsigned	generation;
 } cachepic_t;
 
 #define	MAX_CACHED_PICS		128
 cachepic_t	menu_cachepics[MAX_CACHED_PICS];
 int			menu_numcachepics;
 
+static uint32_t Draw_PicDataSize (const qpic_t *pic)
+{
+	if (!pic || pic->width <= 0 || pic->height <= 0)
+		return 0;
+
+	return (uint32_t)(pic->width * pic->height);
+}
+
+static void Draw_CleanPicForGpu (qpic_t *pic, qboolean force)
+{
+	uint32_t size;
+
+	size = Draw_PicDataSize (pic);
+	if (!size)
+		return;
+
+	if (force)
+		of_emit_cache_clean_forget (pic->data, size);
+	of_emit_cache_clean_once (pic->data, size);
+}
+
+static unsigned Draw_CachePicGeneration (char *path)
+{
+	cachepic_t	*pic;
+	int			i;
+
+	for (pic=menu_cachepics, i=0 ; i<menu_numcachepics ; pic++, i++)
+		if (!strcmp (path, pic->name))
+			return pic->generation;
+
+	return 0;
+}
 
 qpic_t	*Draw_PicFromWad (char *name)
 {
-	return W_GetLumpName (name);
+	qpic_t	*pic;
+
+	pic = W_GetLumpName (name);
+	Draw_CleanPicForGpu (pic, false);
+	return pic;
 }
 
 /*
@@ -110,6 +152,10 @@ qpic_t	*Draw_CachePic (char *path)
 	}
 
 	SwapPic (dat);
+	pic->generation++;
+	if (!pic->generation)
+		pic->generation = 1;
+	Draw_CleanPicForGpu (dat, true);
 
 	return dat;
 }
@@ -251,10 +297,23 @@ static byte *Draw_AllocTextLineBuffer (void)
 	if (draw_textline_buffer_next >= DRAW_TEXTLINE_BUFFERS)
 	{
 		of_emit_finish();
+		of_emit_texture_cache_flush();
 		draw_textline_buffer_next = 0;
 	}
 
 	return draw_textline_buffers[draw_textline_buffer_next++];
+}
+
+static byte *Draw_AllocTranslateRowBuffer (void)
+{
+	if (draw_translate_row_buffer_next >= DRAW_TRANSLATE_ROW_BUFFERS)
+	{
+		of_emit_finish();
+		of_emit_texture_cache_flush();
+		draw_translate_row_buffer_next = 0;
+	}
+
+	return draw_translate_row_buffers[draw_translate_row_buffer_next++];
 }
 
 static void Draw_StringChunk8 (int x, int y, char *str, int len,
@@ -422,14 +481,9 @@ void Draw_Pic (int x, int y, qpic_t *pic)
 
 	if (r_pixbytes == 1)
 	{
-		/* Route the blit through the GPU.  The source pic data sits
-		 * in the Hunk (cached SDRAM) and the GPU's AXI master reads
-		 * SDRAM directly, so clean the source range first to flush
-		 * any dirty CPU cache lines back to memory.  Pic data is
-		 * not modified after load, so subsequent frames re-using
-		 * the same pic only pay the cache_clean cost once per evict
-		 * cycle (cheap — ~1 µs per pic). */
-		of_emit_cache_clean(pic->data, (uint32_t)(pic->width * pic->height));
+		/* qpic pixels are immutable after load; publish each source to
+		 * SDRAM once, then let repeated HUD/menu draws reuse it. */
+		Draw_CleanPicForGpu (pic, false);
 		of_emit_blit(x, y, pic->width, pic->height,
 		             pic->data, pic->width, 0, 0, /*skip_key_ff=*/0);
 	}
@@ -476,7 +530,7 @@ void Draw_TransPic (int x, int y, qpic_t *pic)
 		 * (0xFF) maps to of_emit_blit's skip_key_ff path which
 		 * drops 0xFF texels via the SPAN_SKIP_ZERO flag in the
 		 * fragment processor. */
-		of_emit_cache_clean(pic->data, (uint32_t)(pic->width * pic->height));
+		Draw_CleanPicForGpu (pic, false);
 		of_emit_blit(x, y, pic->width, pic->height,
 		             pic->data, pic->width, 0, 0, /*skip_key_ff=*/1);
 	}
@@ -510,7 +564,7 @@ Draw_TransPicTranslate
 */
 void Draw_TransPicTranslate (int x, int y, qpic_t *pic, byte *translation)
 {
-	byte	*dest, *source, tbyte;
+	byte	*source, tbyte;
 	unsigned short	*pusdest;
 	int				v, u;
 
@@ -524,47 +578,35 @@ void Draw_TransPicTranslate (int x, int y, qpic_t *pic, byte *translation)
 
 	if (r_pixbytes == 1)
 	{
-		of_emit_prepare_framebuffer_for_cpu();
-		dest = vid.buffer + y * vid.rowbytes + x;
+		for (v=0 ; v<pic->height ; v++)
+		{
+			byte *scratch = Draw_AllocTranslateRowBuffer ();
 
-		if (pic->width & 7)
-		{	// general
-			for (v=0 ; v<pic->height ; v++)
+			for (u=0 ; u<pic->width ; u++)
 			{
-				for (u=0 ; u<pic->width ; u++)
-					if ( (tbyte=source[u]) != TRANSPARENT_COLOR)
-						dest[u] = translation[tbyte];
+				tbyte = source[u];
+				scratch[u] = (tbyte != TRANSPARENT_COLOR) ?
+					translation[tbyte] : TRANSPARENT_COLOR;
+			}
 
-				dest += vid.rowbytes;
-				source += pic->width;
-			}
-		}
-		else
-		{	// unwound
-			for (v=0 ; v<pic->height ; v++)
-			{
-				for (u=0 ; u<pic->width ; u+=8)
-				{
-					if ( (tbyte=source[u]) != TRANSPARENT_COLOR)
-						dest[u] = translation[tbyte];
-					if ( (tbyte=source[u+1]) != TRANSPARENT_COLOR)
-						dest[u+1] = translation[tbyte];
-					if ( (tbyte=source[u+2]) != TRANSPARENT_COLOR)
-						dest[u+2] = translation[tbyte];
-					if ( (tbyte=source[u+3]) != TRANSPARENT_COLOR)
-						dest[u+3] = translation[tbyte];
-					if ( (tbyte=source[u+4]) != TRANSPARENT_COLOR)
-						dest[u+4] = translation[tbyte];
-					if ( (tbyte=source[u+5]) != TRANSPARENT_COLOR)
-						dest[u+5] = translation[tbyte];
-					if ( (tbyte=source[u+6]) != TRANSPARENT_COLOR)
-						dest[u+6] = translation[tbyte];
-					if ( (tbyte=source[u+7]) != TRANSPARENT_COLOR)
-						dest[u+7] = translation[tbyte];
-				}
-				dest += vid.rowbytes;
-				source += pic->width;
-			}
+			of_emit_cache_clean(scratch, (uint32_t)pic->width);
+
+			of_emit_span_t sp = {
+				.fb_addr   = (uint32_t)(uintptr_t)
+					(vid.buffer + (y + v) * vid.rowbytes + x),
+				.tex_addr  = (uint32_t)(uintptr_t)scratch,
+				.s         = 0,
+				.t         = 0,
+				.sstep     = 0x10000,
+				.tstep     = 0,
+				.count     = (uint16_t)pic->width,
+				.flags     = OF_EMIT_SKIP_ZERO,
+				.fb_stride = 1,
+				.tex_width = (uint16_t)pic->width,
+			};
+			of_emit_span(&sp);
+
+			source += pic->width;
 		}
 	}
 	else
@@ -629,21 +671,30 @@ void Draw_ConsoleBackground (int lines)
 	int				f, fstep;
 	qpic_t			*conback;
 	char			ver[100];
+	unsigned		generation;
+	static qpic_t	*last_conback;
+	static unsigned	last_generation;
 
 	conback = Draw_CachePic ("gfx/conback.lmp");
+	generation = Draw_CachePicGeneration ("gfx/conback.lmp");
 
 // hack the version number directly into the pic
-	sprintf (ver, "PocketQuake %s", POCKETQUAKE_VERSION);
-	dest = conback->data + 320*186 + 320 - 11 - 8*strlen(ver);
+	if (conback != last_conback || generation != last_generation)
+	{
+		sprintf (ver, "PocketQuake %s", POCKETQUAKE_VERSION);
+		dest = conback->data + 320*186 + 320 - 11 - 8*strlen(ver);
 
-	for (x=0 ; x<strlen(ver) ; x++)
-		Draw_CharToConback (ver[x], dest+(x<<3));
+		for (x=0 ; x<strlen(ver) ; x++)
+			Draw_CharToConback (ver[x], dest+(x<<3));
+
+		Draw_CleanPicForGpu (conback, true);
+		last_conback = conback;
+		last_generation = generation;
+	}
 	
 // draw the pic
 	if (r_pixbytes == 1)
 	{
-		of_emit_cache_clean(conback->data,
-		                    (uint32_t)(conback->width * conback->height));
 		fstep = 320*0x10000/vid.conwidth;
 
 		for (y=0 ; y<lines ; y++)

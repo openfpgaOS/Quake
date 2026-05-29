@@ -20,6 +20,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // snd_mem.c -- sound caching and WAV loading for PocketQuake
 
 #include "quakedef.h"
+#include "of_cache.h"
+
+#ifndef SND_USE_HW_MIXER
+#define SND_USE_HW_MIXER 1
+#endif
 
 // ====================================================================
 // WAV loading
@@ -171,8 +176,148 @@ static void ResampleSfx(sfx_t *sfx, int inrate, int inwidth, byte *data, int ins
 
         // Linear interpolation, store as 16-bit signed
         out[i] = (short)(s0 + (((s1 - s0) * frac) >> 8));
-    }
+	}
 }
+
+#if SND_USE_HW_MIXER
+static int S_ScaleSamples(int samples, int inrate, int outrate)
+{
+    if (samples <= 0 || inrate <= 0 || outrate <= 0)
+        return 0;
+    return (int)((long long)samples * outrate / inrate);
+}
+
+static int S_ReadWavSample(byte *data, int width, int sample)
+{
+    if (width == 2) {
+        byte *p = data + sample * 2;
+        return (short)(p[0] | (p[1] << 8));
+    }
+
+    return ((int)data[sample] - 128) << 8;
+}
+
+static qboolean S_PrepareMixerSfxFromWav(sfx_t *sfx, wavinfo_t *info, byte *data)
+{
+    int size;
+    short *dst;
+
+    if (!sfx || !info || !data || info->samples <= 0)
+        return false;
+    if (info->width != 1 && info->width != 2)
+        return false;
+
+    if (sfx->mixer_data &&
+        sfx->mixer_length == info->samples &&
+        sfx->mixer_loopstart == info->loopstart &&
+        sfx->mixer_speed == info->rate)
+        return true;
+
+    if (sfx->mixer_data) {
+        free(sfx->mixer_data);
+        sfx->mixer_data = NULL;
+        sfx->mixer_length = 0;
+        sfx->mixer_loopstart = -1;
+        sfx->mixer_speed = 0;
+    }
+
+    size = info->samples * (int)sizeof(short);
+    dst = (short *)malloc(size);
+    if (!dst)
+        return false;
+
+    for (int i = 0; i < info->samples; i++)
+        dst[i] = (short)S_ReadWavSample(data, info->width, i);
+
+    if (info->loopstart < 0) {
+        int fade = 16;
+        if (fade > info->samples)
+            fade = info->samples;
+        for (int i = 0; i < fade; i++) {
+            int idx = info->samples - fade + i;
+            int scale = fade - i;
+            dst[idx] = (short)((int)dst[idx] * scale / fade);
+        }
+    }
+
+    of_cache_flush_range(dst, (uint32_t)size);
+    sfx->mixer_data = (byte *)dst;
+    sfx->mixer_length = info->samples;
+    sfx->mixer_loopstart = (info->loopstart >= 0 &&
+        info->loopstart < info->samples) ? info->loopstart : -1;
+    sfx->mixer_speed = info->rate;
+    return true;
+}
+
+static sfxcache_t *S_AllocMixerSfxMetadata(sfx_t *sfx)
+{
+    sfxcache_t *sc;
+
+    if (!sfx || !sfx->mixer_data || sfx->mixer_length <= 0 ||
+        sfx->mixer_speed <= 0 || !shm)
+        return NULL;
+
+    sc = Cache_Alloc(&sfx->cache, sizeof(sfxcache_t), sfx->name);
+    if (!sc)
+        return NULL;
+
+    sc->length = S_ScaleSamples(sfx->mixer_length, sfx->mixer_speed, shm->speed);
+    sc->loopstart = sfx->mixer_loopstart;
+    if (sc->loopstart >= 0)
+        sc->loopstart = S_ScaleSamples(sc->loopstart, sfx->mixer_speed, shm->speed);
+    sc->speed = shm->speed;
+    sc->width = 2;
+    sc->stereo = 0;
+    sc->data[0] = 0;
+    return sc;
+}
+#else
+static void S_PrepareMixerSfx(sfx_t *sfx, sfxcache_t *sc)
+{
+    int size;
+    short *src;
+    short *dst;
+
+    if (!sfx || !sc || sc->length <= 0)
+        return;
+
+    if (sfx->mixer_data &&
+        sfx->mixer_length == sc->length &&
+        sfx->mixer_loopstart == sc->loopstart &&
+        sfx->mixer_speed == sc->speed)
+        return;
+
+    if (sfx->mixer_data) {
+        free(sfx->mixer_data);
+        sfx->mixer_data = NULL;
+    }
+
+    size = sc->length * (int)sizeof(short);
+    dst = (short *)malloc(size);
+    if (!dst)
+        return;
+
+    src = (short *)sc->data;
+    memcpy(dst, src, size);
+
+    if (sc->loopstart < 0) {
+        int fade = 16;
+        if (fade > sc->length)
+            fade = sc->length;
+        for (int i = 0; i < fade; i++) {
+            int idx = sc->length - fade + i;
+            int scale = fade - i;
+            dst[idx] = (short)((int)dst[idx] * scale / fade);
+        }
+    }
+
+    of_cache_flush_range(dst, (uint32_t)size);
+    sfx->mixer_data = (byte *)dst;
+    sfx->mixer_length = sc->length;
+    sfx->mixer_loopstart = sc->loopstart;
+    sfx->mixer_speed = sc->speed;
+}
+#endif
 
 // ====================================================================
 // S_LoadSound
@@ -187,9 +332,20 @@ sfxcache_t *S_LoadSound(sfx_t *s)
     sfxcache_t *sc;
 
     // See if still in cache
-    sc = Cache_Check(&s->cache);
-    if (sc)
-        return sc;
+	sc = Cache_Check(&s->cache);
+#if SND_USE_HW_MIXER
+	if (sc && s->mixer_data)
+		return sc;
+	if (s->mixer_data)
+		return S_AllocMixerSfxMetadata(s);
+	if (sc)
+		Cache_Free(&s->cache);
+#else
+	if (sc) {
+		S_PrepareMixerSfx(s, sc);
+		return sc;
+	}
+#endif
 
     // Load it in
     Q_strcpy(namebuffer, "sound/");
@@ -207,6 +363,24 @@ sfxcache_t *S_LoadSound(sfx_t *s)
         return NULL;
     }
 
+#if SND_USE_HW_MIXER
+    if (!S_PrepareMixerSfxFromWav(s, &info, data + info.dataofs)) {
+        Con_Printf("Couldn't prepare mixer sample %s\n", namebuffer);
+        return NULL;
+    }
+
+    sc = S_AllocMixerSfxMetadata(s);
+    if (!sc) {
+        free(s->mixer_data);
+        s->mixer_data = NULL;
+        s->mixer_length = 0;
+        s->mixer_loopstart = -1;
+        s->mixer_speed = 0;
+        return NULL;
+    }
+
+    return sc;
+#else
     // Calculate output length at target sample rate
     len = (int)((long long)info.samples * shm->speed / info.rate);
     if (len <= 0) {
@@ -227,7 +401,9 @@ sfxcache_t *S_LoadSound(sfx_t *s)
     sc->width = 2;
     sc->stereo = 0;
 
-    ResampleSfx(s, info.rate, info.width, data + info.dataofs, info.samples);
+	ResampleSfx(s, info.rate, info.width, data + info.dataofs, info.samples);
+	S_PrepareMixerSfx(s, sc);
 
-    return sc;
+	return sc;
+#endif
 }

@@ -110,6 +110,7 @@ void	VID_UnlockBuffer (void);
 #define	MAX_MODELS		2048		// PROTOCOL_FITZQUAKE: 16-bit model indices
 #define	MAX_SOUNDS		2048		// PROTOCOL_FITZQUAKE: 16-bit sound indices
 
+#define	SAVEGAME_VERSION	5
 #define	SAVEGAME_COMMENT_LENGTH	39
 
 #define	MAX_STYLESTRING	64
@@ -336,6 +337,8 @@ void Host_Shutdown(void);
 void Host_Error (char *error, ...);
 void Host_EndGame (char *message, ...);
 void Host_Frame (float time);
+void Host_WriteSavegameHeader (FILE *f, char *comment);
+qboolean Host_ReadSavegameHeader (FILE *f, char *comment, qboolean *wrong_game);
 void Host_Quit_f (void);
 void Host_ClientCommands (char *fmt, ...);
 void Host_ShutdownServer (qboolean crash);

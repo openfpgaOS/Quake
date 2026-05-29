@@ -22,7 +22,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "quakedef.h"
 
 
-int			sb_updates;		// if >= vid.numpages, no update needed
+int			sb_updates;		// legacy redraw countdown for animated flashes
+
+#define SBAR_TRACKED_PAGES 4
+static int	sb_generation = 1;
+static int	sb_page_generation[SBAR_TRACKED_PAGES];
 
 #define STAT_MINUS		10	// num frame for '-' stats digit
 qpic_t		*sb_nums[2][11];
@@ -101,6 +105,12 @@ Sbar_Changed
 void Sbar_Changed (void)
 {
 	sb_updates = 0;	// update next frame
+	sb_generation++;
+	if (!sb_generation)
+	{
+		memset (sb_page_generation, 0, sizeof(sb_page_generation));
+		sb_generation = 1;
+	}
 }
 
 /*
@@ -925,10 +935,17 @@ Sbar_Draw
 */
 void Sbar_Draw (void)
 {
+	int		page;
+
 	if (scr_con_current == vid.height)
 		return;		// console is full screen
 
-	if (sb_updates >= vid.numpages)
+	page = VID_CurrentBufferIndex ();
+	if (page < 0 || page >= SBAR_TRACKED_PAGES)
+		page = -1;
+
+	if (sb_updates >= vid.numpages &&
+		(page < 0 || sb_page_generation[page] == sb_generation))
 		return;
 
 	scr_copyeverything = 1;
@@ -1041,6 +1058,9 @@ void Sbar_Draw (void)
 		if (cl.gametype == GAME_DEATHMATCH)
 			Sbar_MiniDeathmatchOverlay ();
 	}
+
+	if (page >= 0)
+		sb_page_generation[page] = sb_generation;
 }
 
 //=============================================================================

@@ -119,6 +119,7 @@ extern unsigned short pq_world_tex_w_mask;
 extern unsigned short pq_world_tex_h_mask;
 extern int pq_world_tex_s_offset;
 extern int pq_world_tex_t_offset;
+extern int pq_world_light_mode;
 
 extern int D_MipLevelForScale (float scale);
 

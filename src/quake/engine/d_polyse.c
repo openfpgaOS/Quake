@@ -46,9 +46,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #ifndef D_USE_GPU_ALIAS_ZTEST
 #define D_USE_GPU_ALIAS_ZTEST 1
 #endif
-/* The current bridge rejects param-span z-test unless the attributes are
- * perspective. Alias spans below are affine, so keep that attempted path
- * opt-in until the OS/bridge contract explicitly supports affine z-test. */
+/* The OS advertises generic param-span z-test, but current hardware only
+ * behaves correctly for perspective/Q29 attrs. Alias spans are affine, so keep
+ * the attempted direct z-test path off until there is an affine-z contract. */
 #ifndef D_USE_GPU_ALIAS_AFFINE_ZTEST
 #define D_USE_GPU_ALIAS_AFFINE_ZTEST 0
 #endif
@@ -62,6 +62,43 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #ifndef D_ALIAS_GOURAUD
 #define D_ALIAS_GOURAUD 1
 #endif
+
+#define D_ALIAS_SCRATCH_ROWS 128
+
+static byte d_alias_scratch_rows[D_ALIAS_SCRATCH_ROWS][MAXWIDTH]
+	__attribute__((aligned(64)));
+static int d_alias_scratch_row_next;
+static uint16_t d_alias_run_starts[MAXWIDTH];
+static uint16_t d_alias_run_counts[MAXWIDTH];
+
+static byte *D_AllocAliasScratchRow (void)
+{
+	if (d_alias_scratch_row_next >= D_ALIAS_SCRATCH_ROWS)
+	{
+		of_emit_finish();
+		of_emit_texture_cache_flush();
+		d_alias_scratch_row_next = 0;
+	}
+
+	return d_alias_scratch_rows[d_alias_scratch_row_next++];
+}
+
+static void D_EmitAliasScratchSpan (uint32_t fb_addr, byte *scratch, int count)
+{
+	of_emit_span_t sp = {
+		.fb_addr   = fb_addr,
+		.tex_addr  = (uint32_t)(uintptr_t)scratch,
+		.s         = 0,
+		.t         = 0,
+		.sstep     = 0x10000,
+		.tstep     = 0,
+		.count     = (uint16_t)count,
+		.flags     = 0,
+		.fb_stride = 1,
+		.tex_width = (uint16_t)count,
+	};
+	of_emit_span(&sp);
+}
 
 // TODO: put in span spilling to shrink list size
 // !!! if this is changed, it must be changed in d_polysa.s too !!!
@@ -198,7 +235,11 @@ void D_PolysetDrawFinalVerts (finalvert_t *fv, int numverts)
 	int		i, z;
 	short	*zbuf;
 
-	of_emit_prepare_framebuffer_for_cpu();
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_prepare_framebuffer_for_cpu();
+		pq_gpu_zwrite_pending = 0;
+	}
 
 	for (i=0 ; i<numverts ; i++, fv++)
 	{
@@ -216,7 +257,9 @@ void D_PolysetDrawFinalVerts (finalvert_t *fv, int numverts)
 				*zbuf = z;
 				pix = skintable[fv->v[3]>>16][fv->v[2]>>16];
 				pix = ((byte *)acolormap)[pix + (fv->v[4] & 0xFF00) ];
-				d_viewbuffer[d_scantable[fv->v[1]] + fv->v[0]] = pix;
+				of_emit_clear_rect_addr((uint32_t)(uintptr_t)
+					(d_viewbuffer + d_scantable[fv->v[1]] + fv->v[0]),
+					screenwidth, 1, 1, (unsigned char)pix);
 			}
 		}
 	}
@@ -234,6 +277,12 @@ void D_DrawSubdiv (void)
 	finalvert_t		*pfv, *index0, *index1, *index2;
 	int				i;
 	int				lnumtriangles;
+
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_prepare_framebuffer_for_cpu();
+		pq_gpu_zwrite_pending = 0;
+	}
 
 	pfv = r_affinetridesc.pfinalverts;
 	ptri = r_affinetridesc.ptriangles;
@@ -302,17 +351,10 @@ void D_DrawNonSubdiv (void)
 	lnumtriangles = r_affinetridesc.numtriangles;
 
 
-	/* Skin flush — once per skin change. GPU reads via AXI (cache-
-	 * incoherent), so we write back any dirty D-cache lines over the
-	 * skin bytes before the HW rasterizer reads them. */
-	{
-		static byte *last_skin_flushed = 0;
-		if (r_affinetridesc.pskin != last_skin_flushed) {
-			last_skin_flushed = r_affinetridesc.pskin;
-			of_emit_cache_clean(r_affinetridesc.pskin,
-			    r_affinetridesc.skinwidth * r_affinetridesc.skinheight);
-		}
-	}
+	/* Alias skins are immutable after model load; model reloads invalidate
+	 * the clean-once registry in Mod_LoadAliasModel. */
+	of_emit_cache_clean_once(r_affinetridesc.pskin,
+	    r_affinetridesc.skinwidth * r_affinetridesc.skinheight);
 
 #if D_USE_GPU_ALIAS == 2
 	if (of_emit_supports(OF_EMIT_CAP_TRIANGLES)) {
@@ -505,7 +547,9 @@ split:
 		
 		*zbuf = z;
 		pix = d_pcolormap[skintable[new[3]>>16][new[2]>>16]];
-		d_viewbuffer[d_scantable[new[1]] + new[0]] = pix;
+		of_emit_clear_rect_addr((uint32_t)(uintptr_t)
+			(d_viewbuffer + d_scantable[new[1]] + new[0]),
+			screenwidth, 1, 1, (unsigned char)pix);
 	}
 
 nodraw:
@@ -535,10 +579,9 @@ void D_PolysetUpdateTables (void)
 		s = skinstart;
 		for (i=0 ; i<MAX_LBM_HEIGHT ; i++, s+=skinwidth)
 			skintable[i] = s;
-		/* GPU skin cache flush lives in D_DrawNonSubdiv (per-skin-change,
-		 * gated on `last_skin_flushed`). The previous duplicate flush
-		 * here added a syscall on every model-table update without
-		 * changing GPU coherency. Removed. */
+		/* GPU skin cache flush lives in D_DrawNonSubdiv. It is clean-once
+		 * per immutable skin, with model-cache reloads invalidating the
+		 * registry in Mod_LoadAliasModel. */
 	}
 }
 
@@ -956,8 +999,11 @@ PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 #endif
 
 #if D_USE_GPU_ALIAS != 1
-	of_emit_prepare_framebuffer_for_cpu();
-	pq_gpu_zwrite_pending = 0;
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_prepare_framebuffer_for_cpu();
+		pq_gpu_zwrite_pending = 0;
+	}
 #endif
 
 	do
@@ -993,22 +1039,36 @@ PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 			};
 			of_emit_span(&sp);
 #else
-			byte *lpdest = pspanpackage->pdest;
 			byte *lptex  = pspanpackage->ptex;
 			short *lpz   = pspanpackage->pz;
 			int lsfrac   = pspanpackage->sfrac;
 			int ltfrac   = pspanpackage->tfrac;
 			int llight   = pspanpackage->light;
 			int lzi      = pspanpackage->zi;
+			byte *scratch = D_AllocAliasScratchRow ();
+			int pixel = 0;
+			int run_start = -1;
+			int run_count = 0;
+			int span_count = lcount;
 
 			do
 			{
 				if ((lzi >> 16) >= *lpz)
 				{
-					*lpdest = host_colormap[*lptex + (llight & 0xFF00)];
+					scratch[pixel] = host_colormap[*lptex + (llight & 0xFF00)];
 					*lpz = lzi >> 16;
+					if (run_start < 0)
+						run_start = pixel;
 				}
-				lpdest++;
+				else if (run_start >= 0)
+				{
+					d_alias_run_starts[run_count] = (uint16_t)run_start;
+					d_alias_run_counts[run_count] =
+						(uint16_t)(pixel - run_start);
+					run_count++;
+					run_start = -1;
+				}
+				pixel++;
 				lzi += r_zistepx;
 				lpz++;
 				llight += r_lstepx;
@@ -1022,7 +1082,31 @@ PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 					lptex += r_affinetridesc.skinwidth;
 					ltfrac &= 0xFFFF;
 				}
-			} while (--lcount);
+			} while (--span_count);
+
+			if (run_start >= 0)
+			{
+				d_alias_run_starts[run_count] = (uint16_t)run_start;
+				d_alias_run_counts[run_count] =
+					(uint16_t)(pixel - run_start);
+				run_count++;
+			}
+
+			if (run_count)
+			{
+				int run;
+
+				of_emit_cache_clean(scratch, (uint32_t)lcount);
+				for (run=0 ; run<run_count ; run++)
+				{
+					int start = d_alias_run_starts[run];
+					int count = d_alias_run_counts[run];
+
+					D_EmitAliasScratchSpan(
+						(uint32_t)(uintptr_t)pspanpackage->pdest + start,
+						scratch + start, count);
+				}
+			}
 #endif
 		}
 
@@ -1041,11 +1125,6 @@ The viewmodel renders last with ziscale*3, so it always passes the Z-test.
 PQ_HOT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
 {
 	int		lcount;
-
-#if !(D_USE_GPU_ALIAS || D_USE_GPU_ALIAS_NOZ)
-	of_emit_prepare_framebuffer_for_cpu();
-	pq_gpu_zwrite_pending = 0;
-#endif
 
 	do
 	{
@@ -1080,16 +1159,17 @@ PQ_HOT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
 			};
 			of_emit_span(&sp);
 #else
-			byte *lpdest = pspanpackage->pdest;
 			byte *lptex  = pspanpackage->ptex;
 			int lsfrac   = pspanpackage->sfrac;
 			int ltfrac   = pspanpackage->tfrac;
 			int llight   = pspanpackage->light;
+			byte *scratch = D_AllocAliasScratchRow ();
+			int pixel = 0;
+			int span_count = lcount;
 
 			do
 			{
-				*lpdest = host_colormap[*lptex + (llight & 0xFF00)];
-				lpdest++;
+				scratch[pixel++] = host_colormap[*lptex + (llight & 0xFF00)];
 				llight += r_lstepx;
 				lptex += a_ststepxwhole;
 				lsfrac += a_sstepxfrac;
@@ -1101,7 +1181,11 @@ PQ_HOT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
 					lptex += r_affinetridesc.skinwidth;
 					ltfrac &= 0xFFFF;
 				}
-			} while (--lcount);
+			} while (--span_count);
+
+			of_emit_cache_clean(scratch, (uint32_t)lcount);
+			D_EmitAliasScratchSpan((uint32_t)(uintptr_t)pspanpackage->pdest,
+				scratch, lcount);
 #endif
 		}
 
@@ -1122,14 +1206,11 @@ void D_PolysetFillSpans8 (spanpackage_t *pspanpackage)
 
 // FIXME: do z buffering
 
-	of_emit_prepare_framebuffer_for_cpu();
-
 	color = d_aflatcolor++;
 
 	while (1)
 	{
 		int		lcount;
-		byte	*lpdest;
 
 		lcount = pspanpackage->count;
 
@@ -1138,12 +1219,8 @@ void D_PolysetFillSpans8 (spanpackage_t *pspanpackage)
 
 		if (lcount)
 		{
-			lpdest = pspanpackage->pdest;
-
-			do
-			{
-				*lpdest++ = color;
-			} while (--lcount);
+			of_emit_clear_rect_addr((uint32_t)(uintptr_t)pspanpackage->pdest,
+				screenwidth, lcount, 1, (unsigned char)color);
 		}
 
 		pspanpackage++;
@@ -1515,7 +1592,8 @@ split:
 		d_pzbuffer[ofs] = new[5];
 		pix = skintable[new[3]>>16][new[2]>>16];
 //		pix = ((byte *)acolormap)[pix + (new[4] & 0xFF00)];
-		d_viewbuffer[ofs] = pix;
+		of_emit_clear_rect_addr((uint32_t)(uintptr_t)(d_viewbuffer + ofs),
+			screenwidth, 1, 1, (unsigned char)pix);
 	}
 
 // recursively continue

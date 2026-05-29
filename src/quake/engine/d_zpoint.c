@@ -23,6 +23,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "d_local.h"
 #include "of_emit.h"
 
+extern int pq_gpu_zwrite_pending;
+
 
 /*
 =====================
@@ -35,7 +37,11 @@ void D_DrawZPoint (void)
 	short	*pz;
 	int		izi;
 
-	of_emit_prepare_framebuffer_for_cpu();
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_prepare_framebuffer_for_cpu();
+		pq_gpu_zwrite_pending = 0;
+	}
 	
 	pz = d_pzbuffer + (d_zwidth * r_zpointdesc.v) + r_zpointdesc.u;
 	pdest = d_viewbuffer + d_scantable[r_zpointdesc.v] + r_zpointdesc.u;
@@ -44,6 +50,7 @@ void D_DrawZPoint (void)
 	if (*pz <= izi)
 	{
 		*pz = izi;
-		*pdest = r_zpointdesc.color;
+		of_emit_clear_rect_addr((uint32_t)(uintptr_t)pdest,
+			screenwidth, 1, 1, r_zpointdesc.color);
 	}
 }

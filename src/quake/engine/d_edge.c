@@ -97,36 +97,12 @@ D_DrawSolidSurface
 void D_DrawSolidSurface (surf_t *surf, int color)
 {
 	espan_t	*span;
-	byte	*pdest;
-	int		u, u2, pix;
-	
-	of_emit_prepare_framebuffer_for_cpu();
 
-	pix = (color<<24) | (color<<16) | (color<<8) | color;
 	for (span=surf->spans ; span ; span=span->pnext)
 	{
-		pdest = (byte *)d_viewbuffer + screenwidth*span->v;
-		u = span->u;
-		u2 = span->u + span->count - 1;
-		((byte *)pdest)[u] = pix;
-
-		if (u2 - u < 8)
-		{
-			for (u++ ; u <= u2 ; u++)
-				((byte *)pdest)[u] = pix;
-		}
-		else
-		{
-			for (u++ ; u & 3 ; u++)
-				((byte *)pdest)[u] = pix;
-
-			u2 -= 4;
-			for ( ; u <= u2 ; u+=4)
-				*(int *)((byte *)pdest + u) = pix;
-			u2 += 4;
-			for ( ; u <= u2 ; u++)
-				((byte *)pdest)[u] = pix;
-		}
+		of_emit_clear_rect_addr((uint32_t)(uintptr_t)
+			((byte *)d_viewbuffer + screenwidth * span->v + span->u),
+			screenwidth, span->count, 1, (unsigned char)color);
 	}
 }
 
@@ -364,11 +340,16 @@ PQ_HOT void D_DrawSurfaces (void)
 
 				if (profiling) prof_t = SYS_CYCLE_LO;
 #if D_GPU_WORLD_LIGHT
-				if ((int)pq_gpu_world_light.value)
+				int gpu_light_mode = (int)pq_gpu_world_light.value;
+				if (gpu_light_mode != 1)
+					gpu_light_mode = 0;
+
+				if (gpu_light_mode)
 				{
 					/* Optional raw-texture GPU lighting path.  Keep it
 					 * opt-in until the GPU perspective path is exact with
 					 * large absolute texture coordinates. */
+					pq_world_light_mode = gpu_light_mode;
 					pq_world_light = D_GpuLightSurface (pface, miplevel);
 					(void)pcurrentcache;
 				}
@@ -378,6 +359,7 @@ PQ_HOT void D_DrawSurfaces (void)
 					pcurrentcache = D_CacheSurface (pface, miplevel);
 					cacheblock = (pixel_t *)pcurrentcache->data;
 					cachewidth = pcurrentcache->width;
+					pq_world_light_mode = 0;
 					pq_world_light = 0;
 					pq_world_tex_w_mask = 0;
 					pq_world_tex_h_mask = 0;

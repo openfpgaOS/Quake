@@ -430,7 +430,133 @@ LOAD / SAVE GAME
 ===============================================================================
 */
 
-#define	SAVEGAME_VERSION	5
+#define	SAVEGAME_NAMESPACE_TAG	"game"
+#define	SAVEGAME_NAMESPACE_MAX	(MAX_QPATH + 16)
+
+static char host_savegame_namespace[SAVEGAME_NAMESPACE_MAX];
+static qboolean host_savegame_namespace_valid;
+
+static void Host_SavegameCRCBytes (unsigned short *crc, const void *data, int len)
+{
+	const byte *bytes = (const byte *)data;
+	int i;
+
+	for (i=0 ; i<len ; i++)
+		CRC_ProcessByte (crc, bytes[i]);
+}
+
+static void Host_SavegameGameDir (char *out, int out_size)
+{
+	char	*src;
+	int		i;
+
+	src = COM_SkipPath (com_gamedir);
+	if (!src || !src[0])
+		src = GAMENAME;
+
+	for (i=0 ; src[i] && i<out_size-1 ; i++)
+	{
+		unsigned char c = (unsigned char)src[i];
+		if (c <= 32 || c > 126 || c == ':' || c == '/' || c == '\\')
+			out[i] = '_';
+		else
+			out[i] = c;
+	}
+	out[i] = '\0';
+
+	if (!out[0])
+		strcpy (out, GAMENAME);
+}
+
+static unsigned short Host_SavegameProgsCRC (void)
+{
+	static qboolean crc_valid;
+	static unsigned short crc_value;
+	unsigned short crc;
+	FILE	*f;
+	int		len;
+	int		remaining;
+	byte	buffer[512];
+
+	if (crc_valid)
+		return crc_value;
+
+	len = COM_FOpenFile ("progs.dat", &f);
+	if (len < 0 || !f)
+	{
+		crc_value = 0;
+		crc_valid = true;
+		return crc_value;
+	}
+
+	CRC_Init (&crc);
+	remaining = len;
+	while (remaining > 0)
+	{
+		int want = remaining > (int)sizeof(buffer) ? (int)sizeof(buffer) : remaining;
+		int got = fread (buffer, 1, want, f);
+
+		if (got <= 0)
+			break;
+		Host_SavegameCRCBytes (&crc, buffer, got);
+		remaining -= got;
+	}
+	fclose (f);
+
+	crc_value = CRC_Value (crc);
+	crc_valid = true;
+	return crc_value;
+}
+
+static char *Host_SavegameNamespace (void)
+{
+	char	gamedir[MAX_QPATH];
+
+	if (host_savegame_namespace_valid)
+		return host_savegame_namespace;
+
+	Host_SavegameGameDir (gamedir, sizeof(gamedir));
+	sprintf (host_savegame_namespace, "%s:%04x",
+		gamedir,
+		(unsigned)Host_SavegameProgsCRC ());
+	host_savegame_namespace_valid = true;
+
+	return host_savegame_namespace;
+}
+
+static qboolean Host_SavegameNamespaceMatches (char *saved_namespace)
+{
+	char	*current;
+	int		len;
+
+	current = Host_SavegameNamespace ();
+	if (!Q_strcasecmp (saved_namespace, current))
+		return true;
+
+	/* Older builds also appended a pak fingerprint.  That made saves vanish
+	 * when content packaging changed, so accept those as long as the stable
+	 * game/progs prefix still matches. */
+	len = strlen (current);
+	if (!Q_strncasecmp (saved_namespace, current, len)
+		&& saved_namespace[len] == ':')
+		return true;
+
+	return false;
+}
+
+static qboolean Host_SavegameLineIsNumber (char *line)
+{
+	char	*end;
+
+	strtod (line, &end);
+	if (end == line)
+		return false;
+
+	while (*end == ' ' || *end == '\t' || *end == '\r')
+		end++;
+
+	return *end == '\n' || *end == '\0';
+}
 
 /*
 ===============
@@ -454,6 +580,114 @@ void Host_SavegameComment (char *text)
 		if (text[i] == ' ')
 			text[i] = '_';
 	text[SAVEGAME_COMMENT_LENGTH] = '\0';
+}
+
+void Host_WriteSavegameHeader (FILE *f, char *comment)
+{
+	fprintf (f, "%i\n", SAVEGAME_VERSION);
+	Host_SavegameComment (comment);
+	fprintf (f, "%s\n", comment);
+	fprintf (f, "%s %s\n", SAVEGAME_NAMESPACE_TAG, Host_SavegameNamespace ());
+}
+
+qboolean Host_ReadSavegameHeader (FILE *f, char *comment, qboolean *wrong_game)
+{
+	char	line[128];
+	char	saved_namespace[SAVEGAME_NAMESPACE_MAX];
+	char	*end;
+	char	*p;
+	long	namespace_pos;
+	long	version;
+	int		i;
+	int		len;
+
+	if (wrong_game)
+		*wrong_game = false;
+
+	if (!fgets (line, sizeof(line), f))
+		return false;
+
+	version = strtol (line, &end, 10);
+	if (end == line || version != SAVEGAME_VERSION)
+		return false;
+
+	while (*end == ' ' || *end == '\t' || *end == '\r')
+		end++;
+	if (*end != '\n' && *end != '\0')
+		return false;
+
+	if (!fgets (line, sizeof(line), f))
+		return false;
+
+	for (i=0 ; i<SAVEGAME_COMMENT_LENGTH ; i++)
+	{
+		unsigned char c = (unsigned char)line[i];
+
+		if (c == '\0' || c == '\n' || c == '\r')
+			return false;
+		if (c <= 32 || c > 126)
+			return false;
+
+		if (comment)
+			comment[i] = (c == '_') ? ' ' : c;
+	}
+
+	if (strncmp (line + 22, "kills:", 6))
+		return false;
+
+	if (line[SAVEGAME_COMMENT_LENGTH] != '\n'
+		&& line[SAVEGAME_COMMENT_LENGTH] != '\r')
+		return false;
+
+	if (comment)
+		comment[SAVEGAME_COMMENT_LENGTH] = '\0';
+
+	namespace_pos = ftell (f);
+	if (!fgets (line, sizeof(line), f))
+		return false;
+
+	p = line;
+	if (strncmp (p, SAVEGAME_NAMESPACE_TAG, strlen(SAVEGAME_NAMESPACE_TAG))
+		|| p[strlen(SAVEGAME_NAMESPACE_TAG)] != ' ')
+	{
+		/* Legacy saves have no namespace line.  Accept them only if the
+		 * next line looks like the first spawn parameter, and rewind so the
+		 * normal loader consumes it. */
+		if (!Host_SavegameLineIsNumber (line))
+			return false;
+		if (namespace_pos < 0 || fseek (f, namespace_pos, SEEK_SET) != 0)
+			return false;
+		return true;
+	}
+
+	p += strlen(SAVEGAME_NAMESPACE_TAG);
+	while (*p == ' ' || *p == '\t')
+		p++;
+
+	len = 0;
+	while (*p && *p != '\n' && *p != '\r' && *p != ' ' && *p != '\t')
+	{
+		if (len >= (int)sizeof(saved_namespace)-1)
+			return false;
+		saved_namespace[len++] = *p++;
+	}
+	saved_namespace[len] = '\0';
+	if (!saved_namespace[0])
+		return false;
+
+	while (*p == ' ' || *p == '\t' || *p == '\r')
+		p++;
+	if (*p != '\n' && *p != '\0')
+		return false;
+
+	if (!Host_SavegameNamespaceMatches (saved_namespace))
+	{
+		if (wrong_game)
+			*wrong_game = true;
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -522,9 +756,7 @@ void Host_Savegame_f (void)
 		return;
 	}
 	
-	fprintf (f, "%i\n", SAVEGAME_VERSION);
-	Host_SavegameComment (comment);
-	fprintf (f, "%s\n", comment);
+	Host_WriteSavegameHeader (f, comment);
 	for (i=0 ; i<NUM_SPAWN_PARMS ; i++)
 		fprintf (f, "%f\n", svs.clients->spawn_parms[i]);
 	fprintf (f, "%d\n", current_skill);
@@ -568,7 +800,7 @@ void Host_Loadgame_f (void)
 	int		i, r;
 	edict_t	*ent;
 	int		entnum;
-	int		version;
+	qboolean	wrong_game;
 	float			spawn_parms[NUM_SPAWN_PARMS];
 
 	if (cmd_source != src_command)
@@ -597,13 +829,14 @@ void Host_Loadgame_f (void)
 		goto load_fail;
 	}
 
-	fscanf (f, "%i\n", &version);
-	if (version != SAVEGAME_VERSION)
+	if (!Host_ReadSavegameHeader (f, str, &wrong_game))
 	{
-		Con_Printf ("Savegame is version %i, not %i\n", version, SAVEGAME_VERSION);
+		if (wrong_game)
+			Con_Printf ("Savegame is for another game or mod.\n");
+		else
+			Con_Printf ("Savegame has an invalid header.\n");
 		goto load_fail;
 	}
-	fscanf (f, "%s\n", str);
 	for (i=0 ; i<NUM_SPAWN_PARMS ; i++)
 		fscanf (f, "%f\n", &spawn_parms[i]);
 // this silliness is so we can load 1.06 save files, which have float skill values

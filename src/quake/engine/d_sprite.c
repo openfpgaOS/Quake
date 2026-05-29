@@ -38,6 +38,43 @@ static of_emit_param_span_record_t d_sprite_param_records[OF_EMIT_PARAM_SPAN_MAX
 extern cvar_t pq_gpu_zwrite;
 extern int pq_gpu_zwrite_pending;
 
+#define D_SPRITE_SCRATCH_ROWS 128
+
+static byte d_sprite_scratch_rows[D_SPRITE_SCRATCH_ROWS][MAXWIDTH]
+	__attribute__((aligned(64)));
+static int d_sprite_scratch_row_next;
+static uint16_t d_sprite_run_starts[MAXWIDTH];
+static uint16_t d_sprite_run_counts[MAXWIDTH];
+
+static byte *D_AllocSpriteScratchRow (void)
+{
+	if (d_sprite_scratch_row_next >= D_SPRITE_SCRATCH_ROWS)
+	{
+		of_emit_finish();
+		of_emit_texture_cache_flush();
+		d_sprite_scratch_row_next = 0;
+	}
+
+	return d_sprite_scratch_rows[d_sprite_scratch_row_next++];
+}
+
+static void D_EmitSpriteScratchSpan (uint32_t fb_addr, byte *scratch, int count)
+{
+	of_emit_span_t sp = {
+		.fb_addr   = fb_addr,
+		.tex_addr  = (uint32_t)(uintptr_t)scratch,
+		.s         = 0,
+		.t         = 0,
+		.sstep     = 0x10000,
+		.tstep     = 0,
+		.count     = (uint16_t)count,
+		.flags     = 0,
+		.fb_stride = 1,
+		.tex_width = (uint16_t)count,
+	};
+	of_emit_span(&sp);
+}
+
 static inline int32_t D_SpriteMad2I32(int32_t origin,
 	int32_t stepv, int v, int32_t stepu, int u)
 {
@@ -71,13 +108,7 @@ static int D_SpriteDrawSpans_ParamZ(sspan_t *pspan, byte *pbase)
 	if (total_records == 0)
 		return 1;
 
-	{
-		static byte *last_sprite_flushed = 0;
-		if (pbase != last_sprite_flushed) {
-			last_sprite_flushed = pbase;
-			of_emit_cache_clean(pbase, cachewidth * sprite_height);
-		}
-	}
+	of_emit_cache_clean_once(pbase, cachewidth * sprite_height);
 
 	const double sadjustd = (double)sadjust;
 	const double tadjustd = (double)tadjust;
@@ -190,16 +221,9 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 		 *
 		 * Flush the sprite frame's pixel data once per unique frame so
 		 * the GPU reads fresh bytes via AXI. Sprite frames are loaded once
-		 * per level and never modified, so the static-tracking is just to
-		 * amortise the syscall across many sprites of the same frame in
-		 * a single hot scene. */
-		{
-			static byte *last_sprite_flushed = 0;
-			if (pbase != last_sprite_flushed) {
-				last_sprite_flushed = pbase;
-				of_emit_cache_clean(pbase, cachewidth * sprite_height);
-			}
-		}
+		 * per level and never modified, so the clean-once registry
+		 * amortises the syscall across all sprites using that frame. */
+		of_emit_cache_clean_once(pbase, cachewidth * sprite_height);
 
 		const float   sadjustf   = (float)sadjust;
 		const float   tadjustf   = (float)tadjust;
@@ -244,17 +268,22 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 	}
 #endif
 
-	of_emit_prepare_framebuffer_for_cpu();
-	pq_gpu_zwrite_pending = 0;
+	if (pq_gpu_zwrite_pending)
+	{
+		of_emit_prepare_framebuffer_for_cpu();
+		pq_gpu_zwrite_pending = 0;
+	}
 
 	int			count, spancount, izistep;
 	int			izi;
-	byte		*pdest;
+	byte		*scratch;
 	fixed16_t	s, t, snext, tnext, sstep, tstep;
 	float		sdivz, tdivz, zi, z, du, dv, spancountminus1;
 	float		sdivz8stepu, tdivz8stepu, zi8stepu;
 	byte		btemp;
 	short		*pz;
+	uint32_t	fb_addr;
+	int			pixel, run_start, run_count, run;
 
 	sstep = 0;
 	tstep = 0;
@@ -268,13 +297,19 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 
 	do
 	{
-		pdest = (byte *)d_viewbuffer + (screenwidth * pspan->v) + pspan->u;
+		fb_addr = (uint32_t)(uintptr_t)
+			((byte *)d_viewbuffer + (screenwidth * pspan->v) + pspan->u);
 		pz = d_pzbuffer + (d_zwidth * pspan->v) + pspan->u;
 
 		count = pspan->count;
 
 		if (count <= 0)
 			goto NextSpan;
+
+		scratch = D_AllocSpriteScratchRow ();
+		pixel = 0;
+		run_start = -1;
+		run_count = 0;
 
 	// calculate the initial s/z, t/z, 1/z, s, and t and clamp
 		du = (float)pspan->u;
@@ -375,21 +410,53 @@ void D_SpriteDrawSpans (sspan_t *pspan)
 					if (*pz <= (izi >> 16))
 					{
 						*pz = izi >> 16;
-						*pdest = btemp;
+						scratch[pixel] = btemp;
+						if (run_start < 0)
+							run_start = pixel;
 					}
+				}
+				if ((btemp == 255 || *pz > (izi >> 16)) &&
+					run_start >= 0)
+				{
+					d_sprite_run_starts[run_count] = (uint16_t)run_start;
+					d_sprite_run_counts[run_count] =
+						(uint16_t)(pixel - run_start);
+					run_count++;
+					run_start = -1;
 				}
 
 				izi += izistep;
-				pdest++;
 				pz++;
 				s += sstep;
 				t += tstep;
+				pixel++;
 			} while (--spancount > 0);
 
 			s = snext;
 			t = tnext;
 
 		} while (count > 0);
+
+		if (run_start >= 0)
+		{
+			d_sprite_run_starts[run_count] = (uint16_t)run_start;
+			d_sprite_run_counts[run_count] =
+				(uint16_t)(pixel - run_start);
+			run_count++;
+		}
+
+		if (run_count)
+		{
+			of_emit_cache_clean(scratch, (uint32_t)pspan->count);
+			for (run=0 ; run<run_count ; run++)
+			{
+				int start = d_sprite_run_starts[run];
+				int span_count = d_sprite_run_counts[run];
+
+				D_EmitSpriteScratchSpan(fb_addr + start,
+					scratch + start, span_count);
+			}
+		}
 
 NextSpan:
 		pspan++;

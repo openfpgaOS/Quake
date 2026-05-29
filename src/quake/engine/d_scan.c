@@ -60,6 +60,7 @@ unsigned short pq_world_tex_w_mask;
 unsigned short pq_world_tex_h_mask;
 int pq_world_tex_s_offset;
 int pq_world_tex_t_offset;
+int pq_world_light_mode;
 
 unsigned char	*r_turb_pbase, *r_turb_pdest;
 fixed16_t		r_turb_s, r_turb_t, r_turb_sstep, r_turb_tstep;
@@ -74,11 +75,47 @@ extern cvar_t	pq_gpu_zwrite;
 extern cvar_t	pq_gpu_world_light;
 extern cvar_t	pq_gpu_persp;
 extern cvar_t	pq_gpu_param;
+extern cvar_t	pq_gpu_spanblit;
 
 int		pq_combined_z_active;  /* tells d_edge.c to skip D_DrawZSpans when 1 */
 int		pq_gpu_zwrite_pending; /* GPU wrote d_pzbuffer; CPU z readers need a retire barrier */
 
 static of_emit_param_span_record_t pq_param_span_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS];
+
+#define D_TURB_SCRATCH_ROWS 128
+
+static byte d_turb_scratch_rows[D_TURB_SCRATCH_ROWS][MAXWIDTH]
+	__attribute__((aligned(64)));
+static int d_turb_scratch_row_next;
+
+static byte *D_AllocTurbScratchRow (void)
+{
+	if (d_turb_scratch_row_next >= D_TURB_SCRATCH_ROWS)
+	{
+		of_emit_finish();
+		of_emit_texture_cache_flush();
+		d_turb_scratch_row_next = 0;
+	}
+
+	return d_turb_scratch_rows[d_turb_scratch_row_next++];
+}
+
+static void D_EmitTurbScratchSpan (uint32_t fb_addr, byte *scratch, int count)
+{
+	of_emit_span_t sp = {
+		.fb_addr   = fb_addr,
+		.tex_addr  = (uint32_t)(uintptr_t)scratch,
+		.s         = 0,
+		.t         = 0,
+		.sstep     = 0x10000,
+		.tstep     = 0,
+		.count     = (uint16_t)count,
+		.flags     = 0,
+		.fb_stride = 1,
+		.tex_width = (uint16_t)count,
+	};
+	of_emit_span(&sp);
+}
 
 void D_DrawTurbulent8Span (void);
 
@@ -88,6 +125,34 @@ static inline int32_t D_SpanMad2I32 (int32_t origin,
 	return (int32_t)((uint32_t)origin
 		+ (uint32_t)stepv * (uint32_t)v
 		+ (uint32_t)stepu * (uint32_t)u);
+}
+
+static inline int32_t D_I64ToI32Sat (int64_t value)
+{
+	if (value > (int64_t)INT32_MAX)
+		return INT32_MAX;
+	if (value < (int64_t)INT32_MIN)
+		return INT32_MIN;
+	return (int32_t)value;
+}
+
+static inline int64_t D_WrapAddI64 (int64_t a, int64_t b)
+{
+	return (int64_t)((uint64_t)a + (uint64_t)b);
+}
+
+static inline int64_t D_WrapMulI64 (int64_t a, int64_t b)
+{
+	return (int64_t)((uint64_t)a * (uint64_t)b);
+}
+
+static inline int64_t D_SpanMad2I64 (int64_t origin,
+	int64_t stepv, int v, int64_t stepu, int u)
+{
+	int64_t acc = origin;
+	acc = D_WrapAddI64(acc, D_WrapMulI64(stepv, (int64_t)v));
+	acc = D_WrapAddI64(acc, D_WrapMulI64(stepu, (int64_t)u));
+	return acc;
 }
 
 static inline int64_t D_ShrTrunc64 (int64_t value, unsigned shift)
@@ -144,21 +209,69 @@ static inline int64_t D_FloatToScaledI64 (float value, int scale)
 	return -(int64_t)mag;
 }
 
-static inline int32_t D_Q29FromQ45 (int64_t q45)
+static inline int64_t D_Q29FromQ45I64 (int64_t q45)
 {
-	return (int32_t)D_ShrTrunc64(q45, 16);
+	return D_ShrTrunc64(q45, 16);
 }
 
-static inline int32_t D_Q29Numerator (float divz, fixed16_t adjust,
+static inline int64_t D_Q29NumeratorI64 (float divz, fixed16_t adjust,
 	int64_t zi_q45)
 {
 	int32_t adj_hi = adjust >> 16;
 	uint32_t adj_lo = (uint32_t)adjust - ((uint32_t)adj_hi << 16);
 	int64_t acc = D_FloatToScaledI64(divz, 45);
 
-	acc += (int64_t)adj_hi * zi_q45;
-	acc += D_ShrTrunc64((int64_t)adj_lo * zi_q45, 16);
-	return D_Q29FromQ45(acc);
+	acc = D_WrapAddI64(acc, D_WrapMulI64((int64_t)adj_hi, zi_q45));
+	acc = D_WrapAddI64(acc,
+		D_ShrTrunc64(D_WrapMulI64((int64_t)adj_lo, zi_q45), 16));
+	return D_Q29FromQ45I64(acc);
+}
+
+static inline uint64_t D_I64AbsU64 (int64_t value)
+{
+	if (value >= 0)
+		return (uint64_t)value;
+	return (uint64_t)(-(value + 1)) + 1u;
+}
+
+static inline void D_Q29ShiftConsider (uint64_t *max_abs, int64_t value)
+{
+	uint64_t mag = D_I64AbsU64(value);
+
+	if (mag > *max_abs)
+		*max_abs = mag;
+}
+
+static inline unsigned D_Q29ShiftFromMaxAbs (uint64_t max_abs)
+{
+	unsigned shift = 0;
+
+	while (shift < 31 && (max_abs >> shift) > (uint64_t)INT32_MAX)
+		shift++;
+	return shift;
+}
+
+static inline unsigned D_ParamSurfaceQ29Shift (const int64_t origin[3],
+	const int64_t du[3], const int64_t dv[3], int max_u, int max_v)
+{
+	uint64_t max_abs = 0;
+
+	for (int i = 0; i < 3; i++) {
+		int64_t u_term = D_WrapMulI64(du[i], (int64_t)max_u);
+		int64_t v_term = D_WrapMulI64(dv[i], (int64_t)max_v);
+		int64_t corner_u = D_WrapAddI64(origin[i], u_term);
+		int64_t corner_v = D_WrapAddI64(origin[i], v_term);
+		int64_t corner_uv = D_WrapAddI64(corner_u, v_term);
+
+		D_Q29ShiftConsider(&max_abs, origin[i]);
+		D_Q29ShiftConsider(&max_abs, du[i]);
+		D_Q29ShiftConsider(&max_abs, dv[i]);
+		D_Q29ShiftConsider(&max_abs, corner_u);
+		D_Q29ShiftConsider(&max_abs, corner_v);
+		D_Q29ShiftConsider(&max_abs, corner_uv);
+	}
+
+	return D_Q29ShiftFromMaxAbs(max_abs);
 }
 
 static inline int32_t D_Q16FromQ45 (int64_t q45)
@@ -191,7 +304,8 @@ void D_WarpScreen (void)
 {
 	int		w, h;
 	int		u,v;
-	byte	*dest;
+	byte	*scratch;
+	uint32_t fb_addr;
 	int		*turb;
 	int		*col;
 	byte	**row;
@@ -220,20 +334,25 @@ void D_WarpScreen (void)
 	}
 
 	turb = intsintable + ((int)(cl.time*SPEED)&(CYCLE-1));
-	dest = vid.buffer + scr_vrect.y * vid.rowbytes + scr_vrect.x;
 
-	for (v=0 ; v<scr_vrect.height ; v++, dest += vid.rowbytes)
+	for (v=0 ; v<scr_vrect.height ; v++)
 	{
+		scratch = D_AllocTurbScratchRow ();
+		fb_addr = (uint32_t)(uintptr_t)(vid.buffer +
+			(scr_vrect.y + v) * vid.rowbytes + scr_vrect.x);
 		col = &column[turb[v]];
 		row = &rowptr[v];
 
 		for (u=0 ; u<scr_vrect.width ; u+=4)
 		{
-			dest[u+0] = row[turb[u+0]][col[u+0]];
-			dest[u+1] = row[turb[u+1]][col[u+1]];
-			dest[u+2] = row[turb[u+2]][col[u+2]];
-			dest[u+3] = row[turb[u+3]][col[u+3]];
+			scratch[u+0] = row[turb[u+0]][col[u+0]];
+			scratch[u+1] = row[turb[u+1]][col[u+1]];
+			scratch[u+2] = row[turb[u+2]][col[u+2]];
+			scratch[u+3] = row[turb[u+3]][col[u+3]];
 		}
+
+		of_emit_cache_clean(scratch, (uint32_t)scr_vrect.width);
+		D_EmitTurbScratchSpan(fb_addr, scratch, scr_vrect.width);
 	}
 }
 
@@ -266,17 +385,20 @@ void D_DrawTurbulent8Span (void)
 =============
 Turbulent8
 
-Water / lava surfaces — the GPU has no turb mode, so this stays CPU.
+Water / lava surfaces. The CPU still computes the turbulence samples, then
+submits the finished scanline through the GPU so framebuffer ownership stays
+on the command side.
 =============
 */
 void Turbulent8 (espan_t *pspan)
 {
 	int				count;
+	int				span_width;
 	fixed16_t		snext, tnext;
 	float			sdivz, tdivz, zi, z, du, dv, spancountminus1;
 	float			sdivz16stepu, tdivz16stepu, zi16stepu;
-
-	of_emit_prepare_framebuffer_for_cpu();
+	byte			*scratch;
+	uint32_t		fb_addr;
 
 	r_turb_turb = sintable + ((int)(cl.time*SPEED)&(CYCLE-1));
 
@@ -291,10 +413,16 @@ void Turbulent8 (espan_t *pspan)
 
 	do
 	{
-		r_turb_pdest = (unsigned char *)((byte *)d_viewbuffer +
+		fb_addr = (uint32_t)(uintptr_t)((byte *)d_viewbuffer +
 				(screenwidth * pspan->v) + pspan->u);
 
 		count = pspan->count;
+		span_width = count;
+		if (count <= 0)
+			goto NextSpan;
+
+		scratch = D_AllocTurbScratchRow ();
+		r_turb_pdest = scratch;
 
 	// calculate the initial s/z, t/z, 1/z, s, and t and clamp
 		du = (float)pspan->u;
@@ -371,6 +499,10 @@ void Turbulent8 (espan_t *pspan)
 
 		} while (count > 0);
 
+		of_emit_cache_clean(scratch, (uint32_t)span_width);
+		D_EmitTurbScratchSpan(fb_addr, scratch, span_width);
+
+NextSpan:
 	} while ((pspan = pspan->pnext) != NULL);
 }
 
@@ -848,7 +980,7 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 		pq_prof_spans8_calls_frame++;
 
 #if D_GPU_WORLD_LIGHT
-	const int gpu_world_light = (int)pq_gpu_world_light.value;
+	const int gpu_world_light = pq_world_light_mode;
 #else
 	const int gpu_world_light = 0;
 #endif
@@ -870,119 +1002,136 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 	if ((int)pq_gpu_persp.value &&
 	    (int)pq_gpu_param.value &&
 	    !gpu_world_light &&
-	    of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST)) {
+	    of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST) &&
+	    of_emit_supports(OF_EMIT_CAP_Q29_SCALE)) {
 		espan_t *span;
-		int base_u = 0, base_v = 0;
+		int base_u = 0, base_v = 0, max_u = 0, max_v = 0;
 		uint32_t total_records = 0;
 
-		const int64_t zi_org_q45 = D_FloatToScaledI64(d_ziorigin, 45);
-		const int64_t zi_stepv_q45 = D_FloatToScaledI64(d_zistepv, 45);
-		const int64_t zi_stepu_q45 = D_FloatToScaledI64(d_zistepu, 45);
-		const int32_t sdivz_org =
-			D_Q29Numerator(d_sdivzorigin, sadjust, zi_org_q45);
-		const int32_t tdivz_org =
-			D_Q29Numerator(d_tdivzorigin, tadjust, zi_org_q45);
-		const int32_t zi_org =
-			D_Q29FromQ45(zi_org_q45);
-		const int32_t sdivz_stepv =
-			D_Q29Numerator(d_sdivzstepv, sadjust, zi_stepv_q45);
-		const int32_t tdivz_stepv =
-			D_Q29Numerator(d_tdivzstepv, tadjust, zi_stepv_q45);
-		const int32_t zi_stepv =
-			D_Q29FromQ45(zi_stepv_q45);
-		const int32_t sdivz_stepu =
-			D_Q29Numerator(d_sdivzstepu, sadjust, zi_stepu_q45);
-		const int32_t tdivz_stepu =
-			D_Q29Numerator(d_tdivzstepu, tadjust, zi_stepu_q45);
-		const int32_t zi_stepu =
-			D_Q29FromQ45(zi_stepu_q45);
-		uint8_t flags = OF_EMIT_PERSP;
-		if (gpu_world_light)
-			flags |= OF_EMIT_COLORMAP;
-		const int gpu_zwrite =
-			(int)pq_gpu_zwrite.value &&
-			of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_Z) &&
-			d_pzbuffer != NULL && d_zwidth != 0 &&
-			(flags & (OF_EMIT_SKIP_ZERO | OF_EMIT_COLUMN)) == 0;
-
 		for (span = pspan; span != NULL; span = span->pnext) {
+			int last_u;
+
 			if (span->count <= 0)
 				continue;
-			if (total_records == 0 || span->u < base_u)
+			last_u = span->u + span->count - 1;
+			if (total_records == 0) {
 				base_u = span->u;
-			if (total_records == 0 || span->v < base_v)
 				base_v = span->v;
+				max_u = last_u;
+				max_v = span->v;
+			} else {
+				if (span->u < base_u)
+					base_u = span->u;
+				if (span->v < base_v)
+					base_v = span->v;
+				if (last_u > max_u)
+					max_u = last_u;
+				if (span->v > max_v)
+					max_v = span->v;
+			}
 			total_records++;
 		}
 
-		of_emit_param_span_list_t params;
-		memset(&params, 0, sizeof(params));
-		params.fb_base       = (uint32_t)(uintptr_t)
-			(d_viewbuffer + screenwidth * base_v + base_u);
-		params.fb_major_step = screenwidth;
-		params.fb_minor_step = 1;
-		params.tex_addr      = (uint32_t)(uintptr_t)pbase;
-		params.tex_width     = (uint16_t)cachewidth;
-		params.flags         = flags;
-		params.attr_mode     = OF_EMIT_PARAM_ATTR_PERSP_Q29;
-		params.span_axis     = OF_EMIT_PARAM_AXIS_X;
-		params.z_mode        = gpu_zwrite ? OF_EMIT_PARAM_Z_WRITE_ZI
-		                                  : OF_EMIT_PARAM_Z_NONE;
-		/* Keep record coordinates local to this surface batch.  This avoids
-		 * large absolute u/v products in the GPU's Q29 start calculation on
-		 * steep floors, while preserving the same projected planes. */
-		params.attr_origin[0] =
-			D_SpanMad2I32(sdivz_org, sdivz_stepv, base_v, sdivz_stepu, base_u);
-		params.attr_origin[1] =
-			D_SpanMad2I32(tdivz_org, tdivz_stepv, base_v, tdivz_stepu, base_u);
-		params.attr_origin[2] =
-			D_SpanMad2I32(zi_org, zi_stepv, base_v, zi_stepu, base_u);
-		params.attr_du[0] = sdivz_stepu;
-		params.attr_du[1] = tdivz_stepu;
-		params.attr_du[2] = zi_stepu;
-		params.attr_dv[0] = sdivz_stepv;
-		params.attr_dv[1] = tdivz_stepv;
-		params.attr_dv[2] = zi_stepv;
-		params.clamp_min[0] = 0;
-		params.clamp_max[0] = bbextents;
-		params.clamp_min[1] = 0;
-		params.clamp_max[1] = bbextentt;
-		if (gpu_zwrite) {
-			params.z_base = (uint32_t)(uintptr_t)
-				(d_pzbuffer + d_zwidth * base_v + base_u);
-			params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
-			params.z_minor_step = (int32_t)sizeof(short);
-		}
+		if (total_records != 0) {
+			const int64_t zi_org_q45 = D_FloatToScaledI64(d_ziorigin, 45);
+			const int64_t zi_stepv_q45 = D_FloatToScaledI64(d_zistepv, 45);
+			const int64_t zi_stepu_q45 = D_FloatToScaledI64(d_zistepu, 45);
+			const int64_t attr_du_q29[3] = {
+				D_Q29NumeratorI64(d_sdivzstepu, sadjust, zi_stepu_q45),
+				D_Q29NumeratorI64(d_tdivzstepu, tadjust, zi_stepu_q45),
+				D_Q29FromQ45I64(zi_stepu_q45),
+			};
+			const int64_t attr_dv_q29[3] = {
+				D_Q29NumeratorI64(d_sdivzstepv, sadjust, zi_stepv_q45),
+				D_Q29NumeratorI64(d_tdivzstepv, tadjust, zi_stepv_q45),
+				D_Q29FromQ45I64(zi_stepv_q45),
+			};
+			const int64_t attr_abs_origin_q29[3] = {
+				D_Q29NumeratorI64(d_sdivzorigin, sadjust, zi_org_q45),
+				D_Q29NumeratorI64(d_tdivzorigin, tadjust, zi_org_q45),
+				D_Q29FromQ45I64(zi_org_q45),
+			};
+			int64_t attr_origin_q29[3];
+			of_emit_param_span_list_t params;
+			unsigned q29_shift;
+			uint8_t flags = OF_EMIT_PERSP;
+			const int gpu_zwrite =
+				(int)pq_gpu_zwrite.value &&
+				of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_Z) &&
+				d_pzbuffer != NULL && d_zwidth != 0 &&
+				(flags & (OF_EMIT_SKIP_ZERO | OF_EMIT_COLUMN)) == 0;
 
-		uint32_t batch_count = 0;
-		uint32_t submitted_records = 0;
-		for (span = pspan; span != NULL; span = span->pnext) {
-			if (span->count > 0) {
-				of_emit_param_span_record_t *rec =
-					&pq_param_span_records[batch_count++];
-				rec->u = (uint16_t)(span->u - base_u);
-				rec->v = (uint16_t)(span->v - base_v);
-				rec->count = (uint16_t)span->count;
+			memset(&params, 0, sizeof(params));
+			params.fb_base       = (uint32_t)(uintptr_t)
+				(d_viewbuffer + screenwidth * base_v + base_u);
+			params.fb_major_step = screenwidth;
+			params.fb_minor_step = 1;
+			params.tex_addr      = (uint32_t)(uintptr_t)pbase;
+			params.tex_width     = (uint16_t)cachewidth;
+			params.flags         = flags;
+			params.attr_mode     = OF_EMIT_PARAM_ATTR_PERSP_Q29;
+			params.span_axis     = OF_EMIT_PARAM_AXIS_X;
+			params.z_mode        = gpu_zwrite ? OF_EMIT_PARAM_Z_WRITE_ZI
+			                                  : OF_EMIT_PARAM_Z_NONE;
 
-				if (batch_count == OF_EMIT_PARAM_SPAN_MAX_RECORDS) {
-					submitted_records += of_emit_param_span_list(
-						&params, pq_param_span_records, batch_count);
-					batch_count = 0;
+			/* Keep record coordinates local to this surface batch. */
+			for (int i = 0; i < 3; i++) {
+				attr_origin_q29[i] = D_SpanMad2I64(attr_abs_origin_q29[i],
+					attr_dv_q29[i], base_v, attr_du_q29[i], base_u);
+			}
+			q29_shift = D_ParamSurfaceQ29Shift(attr_origin_q29,
+				attr_du_q29, attr_dv_q29,
+				max_u - base_u, max_v - base_v);
+			params.q29_attr_shift = (uint8_t)q29_shift;
+			for (int i = 0; i < 3; i++) {
+				params.attr_origin[i] =
+					D_I64ToI32Sat(D_ShrTrunc64(attr_origin_q29[i], q29_shift));
+				params.attr_du[i] =
+					D_I64ToI32Sat(D_ShrTrunc64(attr_du_q29[i], q29_shift));
+				params.attr_dv[i] =
+					D_I64ToI32Sat(D_ShrTrunc64(attr_dv_q29[i], q29_shift));
+			}
+			params.clamp_min[0] = 0;
+			params.clamp_max[0] = bbextents;
+			params.clamp_min[1] = 0;
+			params.clamp_max[1] = bbextentt;
+			if (gpu_zwrite) {
+				params.z_base = (uint32_t)(uintptr_t)
+					(d_pzbuffer + d_zwidth * base_v + base_u);
+				params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
+				params.z_minor_step = (int32_t)sizeof(short);
+			}
+
+			uint32_t batch_count = 0;
+			uint32_t submitted_records = 0;
+			for (span = pspan; span != NULL; span = span->pnext) {
+				if (span->count > 0) {
+					of_emit_param_span_record_t *rec =
+						&pq_param_span_records[batch_count++];
+					rec->u = (uint16_t)(span->u - base_u);
+					rec->v = (uint16_t)(span->v - base_v);
+					rec->count = (uint16_t)span->count;
+
+					if (batch_count == OF_EMIT_PARAM_SPAN_MAX_RECORDS) {
+						submitted_records += of_emit_param_span_list(
+							&params, pq_param_span_records, batch_count);
+						batch_count = 0;
+					}
 				}
 			}
-		}
 
-		if (batch_count != 0) {
-			submitted_records += of_emit_param_span_list(
-				&params, pq_param_span_records, batch_count);
-		}
+			if (batch_count != 0) {
+				submitted_records += of_emit_param_span_list(
+					&params, pq_param_span_records, batch_count);
+			}
 
-		pq_combined_z_active = gpu_zwrite &&
-			total_records != 0 &&
-			submitted_records == total_records;
-		if (pq_combined_z_active)
-			pq_gpu_zwrite_pending = 1;
-		return;
+			pq_combined_z_active = gpu_zwrite &&
+				total_records != 0 &&
+				submitted_records == total_records;
+			if (pq_combined_z_active)
+				pq_gpu_zwrite_pending = 1;
+			return;
+		}
 	}
 
 	if ((int)pq_gpu_persp.value && of_emit_supports(OF_EMIT_CAP_PERSP)) {
@@ -1056,9 +1205,14 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 #endif /* D_USE_GPU_PERSP */
 
 	/* CPU-side perspective, affine per-16-pixel GPU spans. */
+	const int use_gpu_spanblit =
+		(int)pq_gpu_spanblit.value && of_emit_supports(OF_EMIT_CAP_SPAN);
 	const float sdivzNstepu = d_sdivzstepu * 16;
 	const float tdivzNstepu = d_tdivzstepu * 16;
 	const float ziNstepu    = d_zistepu    * 16;
+
+	if (!use_gpu_spanblit)
+		of_emit_prepare_framebuffer_for_cpu();
 
 	do {
 		unsigned char *pdest = d_viewbuffer + screenwidth*pspan->v + pspan->u;
@@ -1112,26 +1266,44 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 				}
 			}
 
-			of_emit_span_t sp = {
-				.fb_addr   = (uint32_t)(uintptr_t)pdest,
-				.tex_addr  = (uint32_t)(uintptr_t)pbase,
-				.s = s + tex_s_offset,
-				.t = t + tex_t_offset,
-				.sstep = sstep,
-				.tstep = tstep,
-				.count     = (uint16_t)spancount,
-				.flags     = 0,
-				.fb_stride = 1,
-				.tex_width = (uint16_t)cachewidth,
-			};
-			if (gpu_world_light) {
-				sp.flags = OF_EMIT_COLORMAP;
-				sp.light = pq_world_light;
-				sp.tex_w_mask = pq_world_tex_w_mask;
-				sp.tex_h_mask = pq_world_tex_h_mask;
+			if (use_gpu_spanblit) {
+				of_emit_span_t sp = {
+					.fb_addr   = (uint32_t)(uintptr_t)pdest,
+					.tex_addr  = (uint32_t)(uintptr_t)pbase,
+					.s = s + tex_s_offset,
+					.t = t + tex_t_offset,
+					.sstep = sstep,
+					.tstep = tstep,
+					.count     = (uint16_t)spancount,
+					.flags     = 0,
+					.fb_stride = 1,
+					.tex_width = (uint16_t)cachewidth,
+				};
+				if (gpu_world_light) {
+					sp.flags = OF_EMIT_COLORMAP;
+					sp.light = pq_world_light;
+					sp.tex_w_mask = pq_world_tex_w_mask;
+					sp.tex_h_mask = pq_world_tex_h_mask;
+				}
+				of_emit_span(&sp);
+				pdest += spancount;
+			} else if (gpu_world_light) {
+				byte *colormap = vid.colormap + ((int)pq_world_light << 8);
+				do {
+					*pdest++ = colormap[*(pbase +
+						(((s + tex_s_offset) >> 16) & pq_world_tex_w_mask) +
+						((((t + tex_t_offset) >> 16) & pq_world_tex_h_mask) *
+						 cachewidth))];
+					s += sstep;
+					t += tstep;
+				} while (--spancount > 0);
+			} else {
+				do {
+					*pdest++ = *(pbase + (s >> 16) + (t >> 16) * cachewidth);
+					s += sstep;
+					t += tstep;
+				} while (--spancount > 0);
 			}
-			of_emit_span(&sp);
-			pdest += spancount;
 			s = snext; t = tnext;
 		} while (count > 0);
 	} while ((pspan = pspan->pnext) != NULL);

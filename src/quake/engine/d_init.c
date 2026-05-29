@@ -31,6 +31,8 @@ cvar_t	pq_gpu_zwrite = {"pq_gpu_zwrite", "1"};
 cvar_t	pq_gpu_world_light = {"pq_gpu_world_light", "0"};
 cvar_t	pq_gpu_persp = {"pq_gpu_persp", "1"};
 cvar_t	pq_gpu_param = {"pq_gpu_param", "1"};
+cvar_t	pq_gpu_spanblit = {"pq_gpu_spanblit", "1"};
+cvar_t	pq_gpu_safe_spans = {"pq_gpu_safe_spans", "0"};
 
 surfcache_t		*d_initial_rover;
 qboolean		d_roverwrapped;
@@ -61,6 +63,8 @@ void D_Init (void)
 	Cvar_RegisterVariable (&pq_gpu_world_light);
 	Cvar_RegisterVariable (&pq_gpu_persp);
 	Cvar_RegisterVariable (&pq_gpu_param);
+	Cvar_RegisterVariable (&pq_gpu_spanblit);
+	Cvar_RegisterVariable (&pq_gpu_safe_spans);
 
 	r_drawpolys = false;
 	r_worldpolysbacktofront = false;

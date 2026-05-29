@@ -36,6 +36,10 @@ typedef struct sfx_s
 {
 	char 	name[MAX_QPATH];
 	cache_user_t	cache;
+	byte	*mixer_data;			// stable cached SDRAM copy for HW mixer
+	int		mixer_length;
+	int		mixer_loopstart;
+	int		mixer_speed;
 } sfx_t;
 
 // !!! if this is changed, it much be changed in asm_i386.h too !!!
@@ -122,6 +126,9 @@ int SNDDMA_GetDMAPos(void);
 
 // shutdown the DMA xfer.
 void SNDDMA_Shutdown(void);
+
+// clear any queued backend audio.
+void SNDDMA_ClearBuffer(void);
 
 // Timer interrupt-driven audio FIFO pump
 void Audio_TimerStart(void);

@@ -24,6 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "r_local.h"
+#include "of_emit.h"
 
 extern volatile unsigned int pq_dbg_stage;
 extern volatile unsigned int pq_dbg_info;
@@ -422,6 +423,7 @@ void Mod_LoadTextures (lump_t *l)
 			tx->offsets[j] = mt->offsets[j] + sizeof(texture_t) - sizeof(miptex_t);
 		// the pixels immediately follow the structures
 		memcpy ( tx+1, mt+1, pixels);
+		of_emit_cache_clean_forget (tx, (uint32_t)(sizeof(texture_t) + pixels));
 		
 		if (!Q_strncmp(mt->name,"sky",3))	
 			R_InitSky (tx);
@@ -1683,6 +1685,7 @@ void Mod_LoadAliasModel (model_t *mod, void *buffer)
 	if (!mod->cache.data)
 		return;
 	memcpy (mod->cache.data, pheader, total);
+	of_emit_cache_clean_forget (mod->cache.data, (uint32_t)total);
 
 	Hunk_FreeToLowMark (start);
 }
@@ -1812,9 +1815,11 @@ void Mod_LoadSpriteModel (model_t *mod, void *buffer)
 	msprite_t			*psprite;
 	int					numframes;
 	int					size;
+	int					start, end, total;
 	dspriteframetype_t	*pframetype;
 	
 	pin = (dsprite_t *)buffer;
+	start = Hunk_LowMark ();
 
 	version = LittleLong (pin->version);
 	if (version != SPRITE_VERSION)
@@ -1874,6 +1879,9 @@ void Mod_LoadSpriteModel (model_t *mod, void *buffer)
 	}
 
 	mod->type = mod_sprite;
+	end = Hunk_LowMark ();
+	total = end - start;
+	of_emit_cache_clean_forget (psprite, (uint32_t)total);
 }
 
 //=============================================================================

@@ -7,10 +7,9 @@
  * other engine file that needs to emit a span includes of_emit.h
  * instead, builds an of_emit_span_t locally, and calls of_emit_span().
  *
- * VID_Init brings up the GPU + palette + surface cache + z-buffer,
- * then binds the initial framebuffer. VID_Update drains pending GPU
- * spans, flips to the next back buffer, and re-binds for the next
- * frame.
+ * VID_Init brings up the GPU + palette + surface cache + z-buffer and
+ * caches the fixed triple-buffer addresses. VID_Update drains pending GPU
+ * spans and flips; draw commands carry absolute framebuffer addresses.
  */
 
 #include "quakedef.h"
@@ -29,11 +28,20 @@
 #include <string.h>
 
 extern viddef_t vid;
+extern byte *r_warpbuffer;
+extern cvar_t pq_gpu_safe_spans;
 
-#define BASEWIDTH     320
-#define BASEHEIGHT    240
+#define QUAKE_VIDEO_WIDTH  320
+#define QUAKE_VIDEO_HEIGHT 200
+#define ZBUFFER_MAX_WIDTH  320
+#define ZBUFFER_MAX_HEIGHT 240
+#define VIDEO_BUFFERS 3
 #define SURFCACHE_SIZE   (2 * 1024 * 1024)
 #define PQ_GPU_SPAN_BATCH_MAX 256
+
+#ifndef PQ_GPU_VALIDATE_DEST
+#define PQ_GPU_VALIDATE_DEST 0
+#endif
 
 _Static_assert(OF_HW_GPU_PERSP == (1u << 13),
                "OF_HW_GPU_PERSP must remain runtime caps bit 13");
@@ -51,6 +59,8 @@ _Static_assert(OF_HW_GPU_PARAM_SPAN_Z == (1u << 16),
                "OF_HW_GPU_PARAM_SPAN_Z must remain runtime caps bit 16");
 _Static_assert(OF_HW_GPU_PARAM_SPAN_ZTEST == (1u << 17),
                "OF_HW_GPU_PARAM_SPAN_ZTEST must remain runtime caps bit 17");
+_Static_assert(OF_HW_GPU_PARAM_SPAN_Q29_SCALE == (1u << 18),
+               "OF_HW_GPU_PARAM_SPAN_Q29_SCALE must remain runtime caps bit 18");
 _Static_assert(GPU_CMD_DRAW_PARAM_SPAN_LIST == 0x48,
                "param span-list opcode must match openfpgaOS");
 _Static_assert(OF_EMIT_PARAM_SPAN_MAX_RECORDS == OF_GPU_PARAM_SPAN_MAX_RECORDS,
@@ -137,6 +147,22 @@ static uint32_t of_emit_caps;
 static int     of_emit_ready;
 static int     of_emit_cpu_sync_needed;
 static of_gpu_debug_snapshot_t gpu_prof_start_snap;
+static uint8_t *vid_fb_raw[VIDEO_BUFFERS];
+static byte    *vid_fb_uncached[VIDEO_BUFFERS];
+static of_video_mode_t vid_mode;
+static uint32_t vid_frame_bytes;
+
+typedef struct of_emit_clean_once_s {
+    uintptr_t addr;
+    uint32_t size;
+} of_emit_clean_once_t;
+
+#define OF_EMIT_CLEAN_ONCE_SLOTS 512
+#define OF_EMIT_CLEAN_ONCE_HASH_SIZE 1024
+#define OF_EMIT_CLEAN_ONCE_HASH_MASK (OF_EMIT_CLEAN_ONCE_HASH_SIZE - 1u)
+static of_emit_clean_once_t of_emit_clean_once_slots[OF_EMIT_CLEAN_ONCE_SLOTS];
+static uint16_t of_emit_clean_once_hash[OF_EMIT_CLEAN_ONCE_HASH_SIZE];
+static uint32_t of_emit_clean_once_next;
 
 #if defined(OF_GPU_STALL_COUNT) && defined(OF_GPU_TEX_DBG_COUNTER_MASK)
 #define PQ_GPU_HAVE_HW_TEX_STALL_COUNTERS 1
@@ -147,9 +173,9 @@ static of_gpu_debug_snapshot_t gpu_prof_start_snap;
 /* Surface cache in BSS (cacheable SDRAM). 2 MB bank. */
 static byte surfcache_storage[SURFCACHE_SIZE] __attribute__((aligned(64)));
 
-/* Z-buffer: 320x240 × 2 bytes = 150 KB. Aligned so GPU DEPTH_WRITE
- * bursts land on cache-line boundaries. */
-static short zbuffer_storage[BASEWIDTH * BASEHEIGHT]
+/* Keep enough z storage for the old default 320x240 fallback as well as
+ * Quake's preferred 320x200 source mode. */
+static short zbuffer_storage[ZBUFFER_MAX_WIDTH * ZBUFFER_MAX_HEIGHT]
     __attribute__((aligned(64)));
 
 /* ---- of_emit_* API (the GPU owner's public surface) --------------- */
@@ -228,6 +254,197 @@ static int gpu_ranges_overlap(uint64_t a_lo, uint64_t a_hi,
 {
     return a_lo < b_hi && b_lo < a_hi;
 }
+
+static void vid_cache_framebuffers(void)
+{
+    for (int i = 0; i < VIDEO_BUFFERS; i++) {
+        uint8_t *fb = of_video_buffer_addr(i);
+        if (!fb)
+            Sys_Error("video_buffer_addr(%d) returned NULL\n", i);
+        vid_fb_raw[i] = fb;
+        vid_fb_uncached[i] = (byte *)of_uncached(fb);
+    }
+}
+
+static void vid_configure_mode(void)
+{
+    of_video_mode_t want = {
+        .width = QUAKE_VIDEO_WIDTH,
+        .height = QUAKE_VIDEO_HEIGHT,
+        .stride = 0,
+        .color_mode = OF_VIDEO_MODE_8BIT,
+        .reserved = 0,
+    };
+    of_video_mode_t mode;
+
+    if (of_video_check_mode(&want, &mode) == 0 &&
+        of_video_set_mode(&mode) == 0) {
+        of_video_get_mode(&mode);
+    } else {
+        of_video_get_mode(&mode);
+    }
+
+    if (mode.color_mode != OF_VIDEO_MODE_8BIT ||
+        mode.width == 0 || mode.height == 0 || mode.stride == 0) {
+        Sys_Error("Quake requires an 8-bit framebuffer mode\n");
+    }
+    if (mode.width > ZBUFFER_MAX_WIDTH || mode.height > ZBUFFER_MAX_HEIGHT) {
+        Sys_Error("video mode %ux%u exceeds Quake zbuffer storage\n",
+                  mode.width, mode.height);
+    }
+
+    vid_mode = mode;
+    vid.maxwarpwidth = vid.width = vid.conwidth = mode.width;
+    vid.maxwarpheight = vid.height = vid.conheight = mode.height;
+    vid.rowbytes = vid.conrowbytes = mode.stride;
+    vid_frame_bytes = (uint32_t)mode.stride * (uint32_t)mode.height;
+}
+
+static byte *vid_uncached_for_surface(uint8_t *fb)
+{
+    for (int i = 0; i < VIDEO_BUFFERS; i++) {
+        if (vid_fb_raw[i] == fb)
+            return vid_fb_uncached[i];
+    }
+
+    return (byte *)of_uncached(fb);
+}
+
+static void vid_set_buffer_index(int idx)
+{
+    if (idx < 0 || idx >= VIDEO_BUFFERS || !vid_fb_uncached[idx])
+        Sys_Error("invalid video draw buffer index %d\n", idx);
+
+    vid.buffer = vid.conbuffer = vid_fb_uncached[idx];
+}
+
+int VID_CurrentBufferIndex(void)
+{
+    if (draw_idx >= 0 && draw_idx < VIDEO_BUFFERS)
+        return draw_idx;
+
+    for (int i = 0; i < VIDEO_BUFFERS; i++) {
+        if (vid.buffer == vid_fb_uncached[i])
+            return i;
+    }
+
+    return -1;
+}
+
+#if PQ_GPU_VALIDATE_DEST
+static int gpu_range_inside(uint64_t lo, uint64_t hi,
+                            uintptr_t base, uint32_t size)
+{
+    uint64_t b = (uint64_t)base;
+    return lo >= b && hi <= b + (uint64_t)size;
+}
+
+static int gpu_dest_range_known(uint64_t lo, uint64_t hi)
+{
+    for (int i = 0; i < VIDEO_BUFFERS; i++) {
+        if (vid_fb_uncached[i] &&
+            gpu_range_inside(lo, hi, (uintptr_t)vid_fb_uncached[i],
+                             vid_frame_bytes))
+            return 1;
+    }
+
+    if (r_warpbuffer &&
+        gpu_range_inside(lo, hi, (uintptr_t)r_warpbuffer, 320u * 200u))
+        return 1;
+
+    return 0;
+}
+
+static void gpu_validate_dest_range(const char *what, uint64_t lo, uint64_t hi)
+{
+    static int reports;
+
+    if (gpu_dest_range_known(lo, hi))
+        return;
+
+    if (reports < 16) {
+        Sys_Printf("GPU %s destination out of range: %08x..%08x "
+                   "vid=%p draw=%d\n",
+                   what, (unsigned)lo, (unsigned)hi, vid.buffer, draw_idx);
+        reports++;
+    }
+}
+
+static void gpu_validate_span_dest(const of_emit_span_t *sp)
+{
+    uint64_t lo, hi;
+
+    gpu_span_range(sp, &lo, &hi);
+    gpu_validate_dest_range("span", lo, hi);
+}
+
+static void gpu_validate_rect_dest(uint32_t fb_addr, int fb_stride,
+                                   int w, int h)
+{
+    uint64_t first = fb_addr;
+    uint64_t last;
+
+    if (w <= 0 || h <= 0)
+        return;
+
+    last = first + (uint64_t)(h - 1) * (uint32_t)fb_stride +
+        (uint32_t)w;
+    gpu_validate_dest_range("rect", first, last);
+}
+
+static void gpu_validate_param_dest(const of_emit_param_span_list_t *params,
+                                    const of_emit_param_span_record_t *records,
+                                    uint32_t record_count)
+{
+    int32_t span_step;
+
+    if (!params || !records)
+        return;
+
+    span_step = (params->span_axis == OF_EMIT_PARAM_AXIS_Y) ?
+        params->fb_major_step : params->fb_minor_step;
+
+    for (uint32_t i = 0; i < record_count; i++) {
+        if (records[i].count == 0)
+            continue;
+
+        uint64_t first = (uint64_t)params->fb_base +
+            (uint64_t)records[i].v * (uint32_t)params->fb_major_step +
+            (uint64_t)records[i].u * (uint32_t)params->fb_minor_step;
+        int64_t last_addr = (int64_t)first +
+            (int64_t)span_step * (int64_t)(records[i].count - 1u);
+        uint64_t lo = first;
+        uint64_t hi = first + 1u;
+
+        if (last_addr < (int64_t)first) {
+            lo = (uint64_t)last_addr;
+            hi = first + 1u;
+        } else {
+            hi = (uint64_t)last_addr + 1u;
+        }
+
+        gpu_validate_dest_range("param", lo, hi);
+    }
+}
+#else
+static inline void gpu_validate_span_dest(const of_emit_span_t *sp)
+{
+    (void)sp;
+}
+
+static inline void gpu_validate_rect_dest(uint32_t fb_addr, int fb_stride,
+                                          int w, int h)
+{
+    (void)fb_addr; (void)fb_stride; (void)w; (void)h;
+}
+
+static inline void gpu_validate_param_dest(const of_emit_param_span_list_t *params,
+                                           const of_emit_param_span_record_t *records,
+                                           uint32_t record_count)
+{
+    (void)params; (void)records; (void)record_count;
+}
+#endif
 
 static int gpu_affine_can_append(const of_gpu_affine_span_group_t *group,
                                  int lanes,
@@ -661,6 +878,9 @@ void of_emit_init(void)
     if ((hw & (OF_HW_GPU_PARAM_SPAN_LIST | OF_HW_GPU_PARAM_SPAN_ZTEST)) ==
         (OF_HW_GPU_PARAM_SPAN_LIST | OF_HW_GPU_PARAM_SPAN_ZTEST))
         of_emit_caps |= OF_EMIT_CAP_PARAM_SPAN_ZTEST;
+    if ((hw & (OF_HW_GPU_PARAM_SPAN_LIST | OF_HW_GPU_PARAM_SPAN_Q29_SCALE)) ==
+        (OF_HW_GPU_PARAM_SPAN_LIST | OF_HW_GPU_PARAM_SPAN_Q29_SCALE))
+        of_emit_caps |= OF_EMIT_CAP_Q29_SCALE;
     of_emit_caps |= OF_EMIT_CAP_SPAN_BATCH;
 
     /* of_gpu_init resolves the MMIO base from caps before any GPU_CTRL
@@ -726,6 +946,12 @@ void of_emit_kick(void)
         of_gpu_kick();
 }
 
+void of_emit_texture_cache_flush(void)
+{
+    if (of_emit_ready)
+        GPU_TEX_FLUSH = 1;
+}
+
 void of_emit_cache_clean(const void *addr, uint32_t size)
 {
     uintptr_t start, end, a;
@@ -752,6 +978,106 @@ void of_emit_cache_clean(const void *addr, uint32_t size)
         sink ^= *p;
     }
     (void)sink;
+
+    /* This publishes CPU-written bytes to SDRAM.  GPU texture-cache
+     * invalidation is intentionally explicit at ordered frame/scratch
+     * reuse boundaries; writing GPU_TEX_FLUSH while texture fetches are
+     * in flight can stall the renderer. */
+}
+
+static int of_emit_clean_ranges_overlap(uintptr_t a_addr, uint32_t a_size,
+                                        uintptr_t b_addr, uint32_t b_size)
+{
+    uintptr_t a_end, b_end;
+
+    if (!a_addr || !a_size || !b_addr || !b_size)
+        return 0;
+
+    a_end = a_addr + (uintptr_t)a_size;
+    b_end = b_addr + (uintptr_t)b_size;
+    return a_addr < b_end && b_addr < a_end;
+}
+
+static uint32_t of_emit_clean_once_hash_key(uintptr_t addr, uint32_t size)
+{
+    uint32_t x = (uint32_t)(addr >> 6) ^ (uint32_t)(addr >> 17) ^
+                 (size * 2654435761u);
+
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    return x & OF_EMIT_CLEAN_ONCE_HASH_MASK;
+}
+
+static void of_emit_clean_once_unindex(uint32_t slot)
+{
+    of_emit_clean_once_t *entry;
+    uint32_t h;
+
+    if (slot >= OF_EMIT_CLEAN_ONCE_SLOTS)
+        return;
+
+    entry = &of_emit_clean_once_slots[slot];
+    if (!entry->addr || !entry->size)
+        return;
+
+    h = of_emit_clean_once_hash_key(entry->addr, entry->size);
+    if (of_emit_clean_once_hash[h] == slot + 1u)
+        of_emit_clean_once_hash[h] = 0;
+}
+
+void of_emit_cache_clean_forget(const void *addr, uint32_t size)
+{
+    uintptr_t a = (uintptr_t)addr;
+
+    if (!addr || !size)
+        return;
+
+    for (uint32_t i = 0; i < OF_EMIT_CLEAN_ONCE_SLOTS; i++) {
+        if (of_emit_clean_ranges_overlap(a, size,
+                of_emit_clean_once_slots[i].addr,
+                of_emit_clean_once_slots[i].size)) {
+            of_emit_clean_once_unindex(i);
+            of_emit_clean_once_slots[i].addr = 0;
+            of_emit_clean_once_slots[i].size = 0;
+        }
+    }
+}
+
+void of_emit_cache_clean_once(const void *addr, uint32_t size)
+{
+    uintptr_t a = (uintptr_t)addr;
+    uint32_t h, slot;
+
+    if (!addr || !size)
+        return;
+
+    h = of_emit_clean_once_hash_key(a, size);
+    slot = of_emit_clean_once_hash[h];
+    if (slot != 0) {
+        of_emit_clean_once_t *entry =
+            &of_emit_clean_once_slots[slot - 1u];
+        if (entry->addr == a && entry->size == size)
+            return;
+    }
+
+    /* Preserve the original registry semantics on rare hash collisions. */
+    for (uint32_t i = 0; i < OF_EMIT_CLEAN_ONCE_SLOTS; i++) {
+        if (of_emit_clean_once_slots[i].addr == a &&
+            of_emit_clean_once_slots[i].size == size) {
+            of_emit_clean_once_hash[h] = (uint16_t)(i + 1u);
+            return;
+        }
+    }
+
+    of_emit_cache_clean(addr, size);
+
+    of_emit_clean_once_unindex(of_emit_clean_once_next);
+    of_emit_clean_once_slots[of_emit_clean_once_next].addr = a;
+    of_emit_clean_once_slots[of_emit_clean_once_next].size = size;
+    of_emit_clean_once_hash[h] = (uint16_t)(of_emit_clean_once_next + 1u);
+    of_emit_clean_once_next =
+        (of_emit_clean_once_next + 1u) % OF_EMIT_CLEAN_ONCE_SLOTS;
 }
 
 void of_emit_clear(uint32_t flags, uint16_t color, uint16_t depth)
@@ -796,7 +1122,16 @@ void of_emit_span(const of_emit_span_t *sp)
 {
     if (!of_emit_supports(OF_EMIT_CAP_SPAN))
         return;
+    gpu_validate_span_dest(sp);
     of_emit_cpu_sync_needed = 1;
+
+    if ((int)pq_gpu_safe_spans.value) {
+        flush_span_batch();
+        span_buf[span_buf_count++] = *sp;
+        flush_span_batch();
+        return;
+    }
+
     span_buf[span_buf_count++] = *sp;
     if (span_buf_count >= PQ_GPU_SPAN_BATCH_MAX)
         flush_span_batch();
@@ -812,6 +1147,10 @@ int of_emit_param_span_list(const of_emit_param_span_list_t *params,
     if (!params || !records || record_count == 0)
         return 0;
     if (!of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST))
+        return 0;
+    if (params->attr_mode == OF_EMIT_PARAM_ATTR_PERSP_Q29 &&
+        params->q29_attr_shift != 0 &&
+        !of_emit_supports(OF_EMIT_CAP_Q29_SCALE))
         return 0;
     attr_is_persp = params->attr_mode == OF_EMIT_PARAM_ATTR_PERSP ||
                     params->attr_mode == OF_EMIT_PARAM_ATTR_PERSP_Q29;
@@ -835,10 +1174,11 @@ int of_emit_param_span_list(const of_emit_param_span_list_t *params,
         return 0;
     }
 
+    gpu_validate_param_dest(params, records, record_count);
     flush_span_batch();
 
     while (record_count != 0) {
-        uint32_t chunk = record_count;
+        uint32_t chunk = (int)pq_gpu_safe_spans.value ? 1u : record_count;
         if (chunk > OF_GPU_PARAM_SPAN_MAX_RECORDS)
             chunk = OF_GPU_PARAM_SPAN_MAX_RECORDS;
 
@@ -869,15 +1209,24 @@ int of_emit_param_span_list(const of_emit_param_span_list_t *params,
 void of_emit_clear_rect(int dst_x, int dst_y, int w, int h, unsigned char color)
 {
     if (w <= 0 || h <= 0) return;
-    /* of_gpu_clear_rect uses the SET_FB global stride, which already
-     * matches vid.rowbytes — no need to reissue SET_FB.  Span batch
-     * must drain first so the queued spans land before this clear
-     * (otherwise the clear would overwrite their pixels). */
     const uint32_t fb_addr = (uint32_t)(uintptr_t)
         (vid.buffer + (uint32_t)(dst_y * vid.rowbytes + dst_x));
+    gpu_validate_rect_dest(fb_addr, vid.rowbytes, w, h);
     flush_span_batch();
     of_emit_cpu_sync_needed = 1;
-    of_gpu_clear_rect(fb_addr, (uint16_t)w, (uint16_t)h, color);
+    of_gpu_clear_rect_strided(fb_addr, (uint16_t)w, (uint16_t)h,
+                              (uint16_t)vid.rowbytes, color);
+}
+
+void of_emit_clear_rect_addr(uint32_t fb_addr, int fb_stride,
+                             int w, int h, unsigned char color)
+{
+    if (w <= 0 || h <= 0) return;
+    gpu_validate_rect_dest(fb_addr, fb_stride, w, h);
+    flush_span_batch();
+    of_emit_cpu_sync_needed = 1;
+    of_gpu_clear_rect_strided(fb_addr, (uint16_t)w, (uint16_t)h,
+                              (uint16_t)fb_stride, color);
 }
 
 void of_emit_blit(int dst_x, int dst_y,
@@ -970,8 +1319,7 @@ void VID_Init(unsigned char *palette)
 {
     Sys_Printf("VID_Init: start\n");
 
-    vid.maxwarpwidth = vid.width = vid.conwidth = BASEWIDTH;
-    vid.maxwarpheight = vid.height = vid.conheight = BASEHEIGHT;
+    vid_configure_mode();
     vid.aspect = 1.0f;
     vid.numpages = 3;
     vid.colormap = host_colormap;
@@ -989,10 +1337,9 @@ void VID_Init(unsigned char *palette)
         vid.fullbright = (marker < 128) ? marker : (256 - marker);
     }
 
-    vid.buffer    = vid.conbuffer   = (byte *)of_uncached(of_video_surface());
-    vid.rowbytes  = vid.conrowbytes = BASEWIDTH;
-
     of_emit_init();
+    vid_cache_framebuffers();
+    vid.buffer = vid.conbuffer = vid_uncached_for_surface(of_video_surface());
 
     /* Use cached zbuffer only when no runtime GPU z path can read/write it.
      * If the GPU can touch d_pzbuffer, CPU access stays on the uncached alias
@@ -1005,13 +1352,16 @@ void VID_Init(unsigned char *palette)
 
     D_InitCaches(surfcache_storage, SURFCACHE_SIZE);
 
-    Sys_Printf("GPU caps: hw=%08x span=%d persp=%d param=%d pz=%d pzt=%d frag=%d alpha=%d flip=%d batch=%d zbuf=%s\n",
+    Sys_Printf("Video mode: %ux%u stride=%u\n",
+               vid_mode.width, vid_mode.height, vid_mode.stride);
+    Sys_Printf("GPU caps: hw=%08x span=%d persp=%d param=%d pz=%d pzt=%d q29s=%d frag=%d alpha=%d flip=%d batch=%d zbuf=%s\n",
                of_get_caps()->hw_features,
                of_emit_supports(OF_EMIT_CAP_SPAN),
                of_emit_supports(OF_EMIT_CAP_PERSP),
                of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST),
                of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_Z),
                of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_ZTEST),
+               of_emit_supports(OF_EMIT_CAP_Q29_SCALE),
                of_emit_supports(OF_EMIT_CAP_FRAGPIPE),
                of_emit_supports(OF_EMIT_CAP_ALPHA),
                of_emit_supports(OF_EMIT_CAP_FLIP),
@@ -1026,10 +1376,10 @@ void VID_Init(unsigned char *palette)
      * settled before optional CMD_FLIP handoff. */
     for (int b = 0; b < 3; b++) {
         uint8_t *fb = of_video_surface();
-        vid.buffer = vid.conbuffer = (byte *)of_uncached(fb);
-        of_emit_bind_fb((uint32_t)(uintptr_t)fb, BASEWIDTH,
+        vid.buffer = vid.conbuffer = vid_uncached_for_surface(fb);
+        of_emit_bind_fb((uint32_t)(uintptr_t)fb, vid.rowbytes,
                         (uint32_t)(uintptr_t)zbuffer_storage,
-                        BASEWIDTH * 2);
+                        vid.width * 2);
         of_emit_clear(OF_EMIT_CLEAR_COLOR, 0, 0);
         of_emit_finish();
         of_video_flip();
@@ -1039,20 +1389,17 @@ void VID_Init(unsigned char *palette)
     if (of_emit_supports(OF_EMIT_CAP_FLIP)) {
         /* Capture the kernel's current draw slot for CMD_FLIP. */
         draw_idx = of_video_acquire_next(-1, 0);
-        uint8_t *fb = of_video_buffer_addr(draw_idx);
-        if (!fb)
-            Sys_Error("video_acquire_next returned invalid draw buffer\n");
-        vid.buffer = vid.conbuffer = (byte *)of_uncached(fb);
-        of_emit_bind_fb((uint32_t)(uintptr_t)fb, BASEWIDTH,
+        vid_set_buffer_index(draw_idx);
+        of_emit_bind_fb((uint32_t)(uintptr_t)vid_fb_raw[draw_idx], vid.rowbytes,
                         (uint32_t)(uintptr_t)zbuffer_storage,
-                        BASEWIDTH * 2);
+                        vid.width * 2);
     } else {
         draw_idx = -1;
         uint8_t *fb = of_video_surface();
-        vid.buffer = vid.conbuffer = (byte *)of_uncached(fb);
-        of_emit_bind_fb((uint32_t)(uintptr_t)fb, BASEWIDTH,
+        vid.buffer = vid.conbuffer = vid_uncached_for_surface(fb);
+        of_emit_bind_fb((uint32_t)(uintptr_t)fb, vid.rowbytes,
                         (uint32_t)(uintptr_t)zbuffer_storage,
-                        BASEWIDTH * 2);
+                        vid.width * 2);
     }
 
     Sys_Printf("VID_Init: fullbright=%d buffer=%p draw_idx=%d\n",
@@ -1095,16 +1442,13 @@ void VID_Update(vrect_t *rects)
      * asking the kernel to flip, then render into the kernel's next
      * drawable surface. */
     of_emit_finish();
+    of_emit_texture_cache_flush();
 
     t0 = profiling ? SYS_CYCLE_LO : 0;
     of_video_flip();
     if (profiling) pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
 
-    uint8_t *new_fb = of_video_surface();
-    vid.buffer = vid.conbuffer = (byte *)of_uncached(new_fb);
-
-    of_emit_bind_fb((uint32_t)(uintptr_t)new_fb, BASEWIDTH,
-                    (uint32_t)(uintptr_t)zbuffer_storage, BASEWIDTH * 2);
+    vid.buffer = vid.conbuffer = vid_uncached_for_surface(of_video_surface());
     of_emit_kick();
 }
 
@@ -1127,18 +1471,13 @@ void VID_WaitSync(void)
         pq_prof_video_flip_cycles += SYS_CYCLE_LO - t0;
 
     of_emit_cpu_sync_needed = 0;
+    of_emit_texture_cache_flush();
     flip_present_pending = 1;
 
     pending_flip_idx = -1;
     pending_flip_token = 0;
 
-    uint8_t *new_fb = of_video_buffer_addr(draw_idx);
-    if (!new_fb)
-        Sys_Error("video_acquire_next returned invalid draw buffer\n");
-    vid.buffer = vid.conbuffer = (byte *)of_uncached(new_fb);
-
-    of_emit_bind_fb((uint32_t)(uintptr_t)new_fb, BASEWIDTH,
-                    (uint32_t)(uintptr_t)zbuffer_storage, BASEWIDTH * 2);
+    vid_set_buffer_index(draw_idx);
     of_emit_kick();
 }
 
@@ -1159,8 +1498,8 @@ static void direct_rect_clamp(int *x, int *y, int *w, int *h)
     if (*h > DIRECT_RECT_MAX_H) *h = DIRECT_RECT_MAX_H;
     if (*x < 0) *x = 0;
     if (*y < 0) *y = 0;
-    if (*x + *w > BASEWIDTH) *x = BASEWIDTH - *w;
-    if (*y + *h > BASEHEIGHT) *y = BASEHEIGHT - *h;
+    if (*x + *w > (int)vid.width) *x = (int)vid.width - *w;
+    if (*y + *h > (int)vid.height) *y = (int)vid.height - *h;
 }
 
 void D_BeginDirectRect(int x, int y, byte *pbitmap, int w, int h)
@@ -1177,11 +1516,11 @@ void D_BeginDirectRect(int x, int y, byte *pbitmap, int w, int h)
     of_emit_prepare_framebuffer_for_cpu();
 
     for (int b = 0; b < DIRECT_RECT_BUFFERS; b++) {
-        byte *fb = (byte *)of_uncached(of_video_buffer_addr(b));
+        byte *fb = vid_fb_uncached[b];
         if (!fb)
             continue;
         for (int row = 0; row < h; row++) {
-            byte *dst = fb + (y + row) * BASEWIDTH + x;
+            byte *dst = fb + (y + row) * vid.rowbytes + x;
             byte *save = direct_rect_save[b] + row * DIRECT_RECT_MAX_W;
             memcpy(save, dst, (size_t)w);
             memcpy(dst, pbitmap + row * src_w, (size_t)w);
@@ -1203,11 +1542,11 @@ void D_EndDirectRect(int x, int y, int w, int h)
         return;
 
     for (int b = 0; b < DIRECT_RECT_BUFFERS; b++) {
-        byte *fb = (byte *)of_uncached(of_video_buffer_addr(b));
+        byte *fb = vid_fb_uncached[b];
         if (!fb)
             continue;
         for (int row = 0; row < direct_rect_h; row++) {
-            byte *dst = fb + (direct_rect_y + row) * BASEWIDTH + direct_rect_x;
+            byte *dst = fb + (direct_rect_y + row) * vid.rowbytes + direct_rect_x;
             byte *save = direct_rect_save[b] + row * DIRECT_RECT_MAX_W;
             memcpy(dst, save, (size_t)direct_rect_w);
         }

@@ -112,7 +112,6 @@ Only called by R_DisplayTime
 void R_LineGraph (int x, int y, int h)
 {
 	int		i;
-	byte	*dest;
 	int		s;
 
 // FIXME: should be disabled on no-buffer adapters, or should be in the driver
@@ -120,24 +119,20 @@ void R_LineGraph (int x, int y, int h)
 	x += r_refdef.vrect.x;
 	y += r_refdef.vrect.y;
 	
-	dest = vid.buffer + vid.rowbytes*y + x;
-	
 	s = r_graphheight.value;
 	
 	if (h>s)
 		h = s;
-
-	of_emit_prepare_framebuffer_for_cpu();
 		
-	for (i=0 ; i<h ; i++, dest -= vid.rowbytes*2)
+	for (i=0 ; i<h ; i++)
 	{
-		dest[0] = 0xff;
-		*(dest-vid.rowbytes) = 0x30;
+		of_emit_clear_rect(x, y - i * 2, 1, 1, 0xff);
+		of_emit_clear_rect(x, y - i * 2 - 1, 1, 1, 0x30);
 	}
-	for ( ; i<s ; i++, dest -= vid.rowbytes*2)
+	for ( ; i<s ; i++)
 	{
-		dest[0] = 0x30;
-		*(dest-vid.rowbytes) = 0x30;
+		of_emit_clear_rect(x, y - i * 2, 1, 1, 0x30);
+		of_emit_clear_rect(x, y - i * 2 - 1, 1, 1, 0x30);
 	}
 }
 

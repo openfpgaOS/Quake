@@ -20,11 +20,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // snd_dma.c -- Quake sound engine for PocketQuake
 
 #include "quakedef.h"
+#include "of_caps.h"
+#include "of_mixer.h"
+
+#ifndef SND_USE_HW_MIXER
+#define SND_USE_HW_MIXER 1
+#endif
 
 void S_PaintChannels(int endtime);
 void SND_InitScaletable(void);
 void SNDDMA_Submit(void);
 void SNDDMA_FillRing(void);
+void SNDDMA_ClearBuffer(void);
 
 // ====================================================================
 // Globals
@@ -32,6 +39,14 @@ void SNDDMA_FillRing(void);
 
 channel_t   channels[MAX_CHANNELS];
 int         total_channels;
+
+#if SND_USE_HW_MIXER
+static of_mixer_handle_t channel_mixer_handles[MAX_CHANNELS];
+static int               channel_mixer_start_time[MAX_CHANNELS];
+static int               channel_mixer_start_pos[MAX_CHANNELS];
+static int               channel_mixer_length[MAX_CHANNELS];
+static double            hw_sound_sample_accum;
+#endif
 
 int         snd_blocked = 0;
 qboolean    snd_initialized = false;
@@ -46,6 +61,8 @@ vec3_t      listener_up;
 
 int         paintedtime __attribute__((section(".fastdata")));    // sample PAIRS — in BRAM for ISR access
 static int  soundtime;      // position in mono samples that hardware has played
+static int  buffers;
+static int  oldsamplepos;
 
 int         s_rawend;
 
@@ -73,6 +90,218 @@ static sfx_t *ambient_sfx[NUM_AMBIENTS];
 // Internal functions
 // ====================================================================
 
+#if SND_USE_HW_MIXER
+static int S_MixerClampVolume(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return v;
+}
+
+static qboolean S_MixerChannelLoops(int idx)
+{
+    return idx < NUM_AMBIENTS ||
+           idx >= NUM_AMBIENTS + MAX_DYNAMIC_CHANNELS;
+}
+
+static int S_MixerChannelPriority(int idx)
+{
+    if (idx >= NUM_AMBIENTS && idx < NUM_AMBIENTS + MAX_DYNAMIC_CHANNELS)
+        return 100;
+    if (idx < NUM_AMBIENTS)
+        return 20;
+    return 10;
+}
+
+static int S_MixerChannelGroup(int idx)
+{
+    if (idx >= NUM_AMBIENTS && idx < NUM_AMBIENTS + MAX_DYNAMIC_CHANNELS)
+        return OF_MIXER_GROUP_SFX;
+    return OF_MIXER_GROUP_AUX;
+}
+
+static void S_MixerResetTime(void)
+{
+    hw_sound_sample_accum = 0.0;
+    soundtime = 0;
+    paintedtime = 0;
+    buffers = 0;
+    oldsamplepos = 0;
+}
+
+static void S_MixerAdvanceTime(void)
+{
+    if (!shm)
+        return;
+    hw_sound_sample_accum += (double)host_frametime * (double)shm->speed;
+    soundtime = (int)hw_sound_sample_accum;
+    paintedtime = soundtime;
+}
+
+static void S_MixerStopChannel(int idx)
+{
+    if (idx < 0 || idx >= MAX_CHANNELS)
+        return;
+    if (channel_mixer_handles[idx] != OF_MIXER_HANDLE_INVALID) {
+        of_mixer_stop_h(channel_mixer_handles[idx]);
+        channel_mixer_handles[idx] = OF_MIXER_HANDLE_INVALID;
+    }
+    channel_mixer_start_time[idx] = 0;
+    channel_mixer_start_pos[idx] = 0;
+    channel_mixer_length[idx] = 0;
+}
+
+static void S_MixerStopAllChannels(void)
+{
+    for (int i = 0; i < MAX_CHANNELS; i++)
+        S_MixerStopChannel(i);
+}
+
+static const byte *S_MixerPCM(sfx_t *sfx, sfxcache_t *sc)
+{
+    if (sfx && sfx->mixer_data)
+        return sfx->mixer_data;
+    return sc ? sc->data : NULL;
+}
+
+static qboolean S_MixerStartChannel(int idx)
+{
+    channel_t *ch;
+    sfxcache_t *sc;
+    const byte *pcm;
+    of_mixer_handle_t handle;
+    uint32_t mixer_length;
+    uint32_t mixer_rate;
+    int mixer_loopstart;
+    int mixer_pos;
+
+    if (idx < 0 || idx >= MAX_CHANNELS)
+        return false;
+
+    ch = &channels[idx];
+    if (!ch->sfx)
+        return false;
+
+    sc = S_LoadSound(ch->sfx);
+    if (!sc)
+        return false;
+
+    pcm = S_MixerPCM(ch->sfx, sc);
+    if (!pcm)
+        return false;
+
+    mixer_length = ch->sfx->mixer_data ?
+        (uint32_t)ch->sfx->mixer_length : (uint32_t)sc->length;
+    mixer_rate = ch->sfx->mixer_data ?
+        (uint32_t)ch->sfx->mixer_speed : (uint32_t)sc->speed;
+    mixer_loopstart = ch->sfx->mixer_data ?
+        ch->sfx->mixer_loopstart : sc->loopstart;
+    if (mixer_length == 0 || mixer_rate == 0)
+        return false;
+
+    handle = of_mixer_alloc_for_group_h(S_MixerChannelGroup(idx),
+                                        pcm,
+                                        mixer_length,
+                                        mixer_rate,
+                                        S_MixerChannelPriority(idx),
+                                        0);
+    if (handle == OF_MIXER_HANDLE_INVALID)
+        return false;
+
+    channel_mixer_handles[idx] = handle;
+    channel_mixer_start_time[idx] = paintedtime;
+    channel_mixer_start_pos[idx] = ch->pos;
+    channel_mixer_length[idx] = sc->length;
+
+    if (S_MixerChannelLoops(idx) && mixer_loopstart >= 0)
+        of_mixer_set_loop_h(handle, mixer_loopstart, (int)mixer_length);
+
+    if (ch->pos > 0 && ch->pos < sc->length) {
+        mixer_pos = ch->sfx->mixer_data ?
+            (int)((long long)ch->pos * mixer_rate / shm->speed) : ch->pos;
+        if (mixer_pos < 0)
+            mixer_pos = 0;
+        if ((uint32_t)mixer_pos >= mixer_length)
+            mixer_pos = (int)mixer_length - 1;
+        of_mixer_set_position_h(handle, mixer_pos);
+    }
+
+    return true;
+}
+
+static void S_MixerUpdateChannelPos(int idx)
+{
+    channel_t *ch;
+    int pos;
+
+    if (idx < 0 || idx >= MAX_CHANNELS)
+        return;
+    if (S_MixerChannelLoops(idx) || channel_mixer_length[idx] <= 0)
+        return;
+
+    ch = &channels[idx];
+    pos = channel_mixer_start_pos[idx] +
+          (paintedtime - channel_mixer_start_time[idx]);
+    if (pos < 0)
+        pos = 0;
+    if (pos > channel_mixer_length[idx])
+        pos = channel_mixer_length[idx];
+    ch->pos = pos;
+}
+
+static void S_MixerApplyChannelVolume(int idx)
+{
+    channel_t *ch;
+
+    if (idx < 0 || idx >= MAX_CHANNELS)
+        return;
+    if (channel_mixer_handles[idx] == OF_MIXER_HANDLE_INVALID)
+        return;
+
+    ch = &channels[idx];
+    of_mixer_set_vol_lr_h(channel_mixer_handles[idx],
+                          S_MixerClampVolume(ch->leftvol),
+                          S_MixerClampVolume(ch->rightvol));
+}
+
+static void S_MixerSyncChannel(int idx)
+{
+    channel_t *ch;
+    int left, right;
+    qboolean looping;
+
+    if (idx < 0 || idx >= MAX_CHANNELS)
+        return;
+
+    ch = &channels[idx];
+    if (!ch->sfx) {
+        S_MixerStopChannel(idx);
+        return;
+    }
+
+    looping = S_MixerChannelLoops(idx);
+    S_MixerUpdateChannelPos(idx);
+    if (!looping && ch->end <= paintedtime) {
+        S_MixerStopChannel(idx);
+        ch->sfx = NULL;
+        return;
+    }
+
+    left = S_MixerClampVolume(ch->leftvol);
+    right = S_MixerClampVolume(ch->rightvol);
+    if (looping && left == 0 && right == 0) {
+        S_MixerStopChannel(idx);
+        return;
+    }
+
+    if (channel_mixer_handles[idx] == OF_MIXER_HANDLE_INVALID &&
+        !S_MixerStartChannel(idx))
+        return;
+
+    S_MixerApplyChannelVolume(idx);
+}
+#endif
+
 sfx_t *S_FindName(char *name)
 {
     int i;
@@ -94,6 +323,11 @@ sfx_t *S_FindName(char *name)
         Sys_Error("S_FindName: out of sfx_t");
 
     sfx = &known_sfx[num_sfx];
+    if (sfx->cache.data)
+        Cache_Free(&sfx->cache);
+    if (sfx->mixer_data)
+        free(sfx->mixer_data);
+    memset(sfx, 0, sizeof(*sfx));
     Q_strcpy(sfx->name, name);
     num_sfx++;
 
@@ -171,8 +405,12 @@ channel_t *SND_PickChannel(int entnum, int entchannel)
     if (first_to_die == -1)
         return NULL;
 
-    if (channels[first_to_die].sfx)
+    if (channels[first_to_die].sfx) {
+#if SND_USE_HW_MIXER
+        S_MixerStopChannel(first_to_die);
+#endif
         channels[first_to_die].sfx = NULL;
+    }
 
     return &channels[first_to_die];
 }
@@ -186,11 +424,29 @@ void S_Startup(void)
     if (!snd_initialized)
         return;
 
+#if SND_USE_HW_MIXER
+    if (!of_has_feature(OF_HW_MIXER)) {
+        Con_Printf("S_Startup: OF_HW_MIXER unavailable.\n");
+        sound_started = false;
+        return;
+    }
+#endif
+
     if (!SNDDMA_Init()) {
         Con_Printf("S_Startup: SNDDMA_Init failed.\n");
         sound_started = false;
         return;
     }
+
+#if SND_USE_HW_MIXER
+    of_mixer_init(OF_MIXER_MAX_VOICES, shm ? shm->speed : OF_MIXER_OUTPUT_RATE);
+    of_mixer_stop_all();
+    of_mixer_set_master_volume(255);
+    of_mixer_set_group_volume(OF_MIXER_GROUP_SFX, 255);
+    of_mixer_set_group_volume(OF_MIXER_GROUP_AUX, 255);
+    S_MixerStopAllChannels();
+    S_MixerResetTime();
+#endif
 
     sound_started = true;
 }
@@ -231,6 +487,10 @@ void S_Shutdown(void)
 {
     if (!sound_started)
         return;
+
+#if SND_USE_HW_MIXER
+    S_MixerStopAllChannels();
+#endif
 
     sound_started = false;
     snd_initialized = false;
@@ -340,15 +600,24 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin,
             break;
         }
     }
+
+#if SND_USE_HW_MIXER
+    ch_idx = (int)(target_chan - channels);
+    if (S_MixerStartChannel(ch_idx))
+        S_MixerApplyChannelVolume(ch_idx);
+#endif
 }
 
 void S_StopSound(int entnum, int entchannel)
 {
     int i;
 
-    for (i = 0; i < MAX_DYNAMIC_CHANNELS; i++) {
+    for (i = NUM_AMBIENTS; i < NUM_AMBIENTS + MAX_DYNAMIC_CHANNELS; i++) {
         if (channels[i].entnum == entnum &&
             channels[i].entchannel == entchannel) {
+#if SND_USE_HW_MIXER
+            S_MixerStopChannel(i);
+#endif
             channels[i].end = 0;
             channels[i].sfx = NULL;
             return;
@@ -362,6 +631,10 @@ void S_StopAllSounds(qboolean clear)
 
     if (!sound_started)
         return;
+
+#if SND_USE_HW_MIXER
+    S_MixerStopAllChannels();
+#endif
 
     total_channels = MAX_DYNAMIC_CHANNELS + NUM_AMBIENTS;
 
@@ -383,8 +656,14 @@ void S_ClearBuffer(void)
     if (!sound_started || !shm || !shm->buffer)
         return;
 
+#if SND_USE_HW_MIXER
+    S_MixerStopAllChannels();
+    S_MixerResetTime();
+#endif
+
     clear = 0; // 16-bit: silence is 0
     memset(shm->buffer, clear, shm->samples * shm->samplebits / 8);
+    SNDDMA_ClearBuffer();
 }
 
 void S_StaticSound(sfx_t *sfx, vec3_t origin, float vol, float attenuation)
@@ -441,8 +720,12 @@ static void S_UpdateAmbientSounds(void)
 
     l = Mod_PointInLeaf(listener_origin, cl.worldmodel);
     if (!l || !ambient_level.value) {
-        for (ambient_channel = 0; ambient_channel < NUM_AMBIENTS; ambient_channel++)
+        for (ambient_channel = 0; ambient_channel < NUM_AMBIENTS; ambient_channel++) {
+#if SND_USE_HW_MIXER
+            S_MixerStopChannel(ambient_channel);
+#endif
             channels[ambient_channel].sfx = NULL;
+        }
         return;
     }
 
@@ -472,9 +755,6 @@ static void S_UpdateAmbientSounds(void)
 // ====================================================================
 // GetSoundtime - derive playback position from hardware
 // ====================================================================
-
-static int buffers;
-static int oldsamplepos;
 
 static void GetSoundtime(void)
 {
@@ -515,6 +795,10 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
     VectorCopy(forward, listener_forward);
     VectorCopy(right, listener_right);
     VectorCopy(up, listener_up);
+
+#if SND_USE_HW_MIXER
+    S_MixerAdvanceTime();
+#endif
 
     // Update ambient sounds
     S_UpdateAmbientSounds();
@@ -560,6 +844,12 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
         }
     }
 
+#if SND_USE_HW_MIXER
+    for (i = 0; i < total_channels; i++)
+        S_MixerSyncChannel(i);
+    return;
+#endif
+
     // Anchor paintedtime to actual playback progress
     GetSoundtime();
 
@@ -584,6 +874,10 @@ void S_ExtraUpdate(void)
 {
     if (!sound_started)
         return;
+
+#if SND_USE_HW_MIXER
+    return;
+#endif
 
     if (audio_timer_active)
         SNDDMA_FillRing();

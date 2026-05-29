@@ -329,6 +329,8 @@ PQ_HOT byte D_GpuLightSurface (msurface_t *surface, int miplevel)
 	/* Raw mip texture, not a built cache block. */
 	cacheblock = (pixel_t *)((byte *)mt + mt->offsets[miplevel]);
 	cachewidth = mt->width >> miplevel;
+	of_emit_cache_clean_once (cacheblock,
+		(uint32_t)(cachewidth * (mt->height >> miplevel)));
 	pq_world_tex_w_mask = (uint16_t)(cachewidth - 1);
 	pq_world_tex_h_mask = (uint16_t)((mt->height >> miplevel) - 1);
 	pq_world_tex_s_offset = (surface->texturemins[0] * 65536) >> miplevel;

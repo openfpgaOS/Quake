@@ -1,10 +1,11 @@
 /*
  * snd_of.c -- Quake sound driver over the openfpgaOS SDK.
  *
- * Quake's software mixer (snd_mix.c) paints signed-16 interleaved
- * stereo samples into a 16 K-pair ring. SNDDMA_Submit is the per-frame
- * hook where we drain as much of that ring as will fit into the SDK
- * audio FIFO (1024-pair HW).
+ * With SND_USE_HW_MIXER enabled, Quake SFX play as hardware mixer voices
+ * and this file only provides the small dma_t compatibility buffer and
+ * clear hook the old sound code expects.  With the switch disabled,
+ * Quake's software mixer paints signed-16 interleaved stereo samples into
+ * a 16 K-pair ring and SNDDMA_Submit drains that ring to of_audio_write().
  *
  * A 1 kHz timer ISR was tried for frame-rate-independent drainage but
  * calling OF_SVC->audio_write / audio_get_free from interrupt context
@@ -23,12 +24,20 @@
 
 #include <string.h>
 
+#ifndef SND_USE_HW_MIXER
+#define SND_USE_HW_MIXER 1
+#endif
+
 #define SND_RATE            OF_AUDIO_RATE     /* 48000 */
 #define SND_CHANNELS        2
 #define SND_BITS            16
+#if SND_USE_HW_MIXER
+#define SND_BUFFER_SAMPLES  64
+#else
 /* 16 K stereo pairs ≈ 340 ms — engine has plenty of room to paint ahead
  * of whatever the FIFO can hold. Must be a power of two. */
 #define SND_BUFFER_SAMPLES  16384
+#endif
 
 /* Interleaved L,R s16 — shm->buffer points here. */
 static int16_t snd_buffer[SND_BUFFER_SAMPLES * SND_CHANNELS]
@@ -102,6 +111,13 @@ void SNDDMA_Submit(void)
 }
 
 void SNDDMA_Shutdown(void) { }
+
+void SNDDMA_ClearBuffer(void)
+{
+    submit_src_pos = paintedtime;
+    memset(snd_buffer, 0, sizeof(snd_buffer));
+    of_audio_init();
+}
 
 /* The engine calls SNDDMA_FillRing from inside R_EdgeDrawing
  * (r_main.c:1512, :1540) — that's two extra drain points per frame
