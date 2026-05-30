@@ -25,10 +25,21 @@
 void Host_Init(quakeparms_t *parms);
 void Host_Frame(float time);
 void Sys_Printf(char *fmt, ...);
+void Sys_InitQuakeConfig(void);
 
-/* Static args — Quake used a sysreg to select game mode; we
- * default to base id1 and let a config file override. */
-static char *quake_argv[] = { "quake", NULL };
+static char *quake_argv_base[]     = { "quake", NULL };
+
+static void Quake_SetArgs(quakeparms_t *parms, int argc, char **argv)
+{
+    if (argc > 0 && argv) {
+        parms->argc = argc;
+        parms->argv = argv;
+        return;
+    }
+
+    parms->argc = 1;
+    parms->argv = quake_argv_base;
+}
 
 int main(int argc, char **argv)
 {
@@ -45,8 +56,8 @@ int main(int argc, char **argv)
     memset(&parms, 0, sizeof(parms));
     parms.basedir = ".";
     parms.cachedir = NULL;
-    parms.argc = argc > 0 ? argc : 1;
-    parms.argv = argc > 0 ? argv : quake_argv;
+    Quake_SetArgs(&parms, argc, argv);
+    Sys_InitQuakeConfig();
 
     parms.membase = malloc(QUAKE_HEAP_SIZE);
     if (!parms.membase) {

@@ -1,0 +1,25 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "hipnotic.ini" },
+            { "id": 3, "filename": "quake.elf" },
+            { "id": 4, "filename": "pak0.pak" },
+            { "id": 5, "filename": "PAK1.PAK" },
+            { "id": 6, "filename": "HIPNOTIC/PAK0.PAK" },
+            { "id": 8, "filename": "hipnotic.cfg" },
+            { "id": 10, "filename": "s0.sav" },
+            { "id": 11, "filename": "s1.sav" },
+            { "id": 12, "filename": "s2.sav" },
+            { "id": 13, "filename": "s3.sav" },
+            { "id": 14, "filename": "s4.sav" },
+            { "id": 15, "filename": "s5.sav" },
+            { "id": 16, "filename": "s6.sav" },
+            { "id": 17, "filename": "s7.sav" },
+            { "id": 18, "filename": "s8.sav" },
+            { "id": 19, "filename": "s9.sav" }
+        ]
+    }
+}

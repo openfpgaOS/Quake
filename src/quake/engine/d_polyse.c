@@ -43,15 +43,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #ifndef D_USE_GPU_ALIAS_NOZ
 #define D_USE_GPU_ALIAS_NOZ 1
 #endif
-#ifndef D_USE_GPU_ALIAS_ZTEST
-#define D_USE_GPU_ALIAS_ZTEST 1
-#endif
-/* The OS advertises generic param-span z-test, but current hardware only
- * behaves correctly for perspective/Q29 attrs. Alias spans are affine, so keep
- * the attempted direct z-test path off until there is an affine-z contract. */
-#ifndef D_USE_GPU_ALIAS_AFFINE_ZTEST
-#define D_USE_GPU_ALIAS_AFFINE_ZTEST 0
-#endif
+/* There is no GPU affine z-test: the hardware param-span z-path only behaves
+ * correctly for perspective/Q29 attrs, and alias spans are affine. The
+ * attempted direct affine z-test offload (D_PolysetDrawSpans8_ParamZ and its
+ * helpers) was removed; world-alias z-testing stays on the CPU, which blits
+ * each finished scratch row to the framebuffer through the GPU. */
 
 /* Triangle path bisection toggles — kept around in case future
  * gateware regressions need re-testing. Defaults are ON; flip to 0
@@ -196,9 +192,6 @@ int pq_noz_mode;
 extern cvar_t pq_gpu_zwrite;
 extern int pq_gpu_zwrite_pending;
 
-#if D_USE_GPU_ALIAS_ZTEST && D_USE_GPU_ALIAS_AFFINE_ZTEST
-static of_emit_param_span_record_t d_alias_param_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS];
-#endif
 
 #if	!id386
 
@@ -675,188 +668,6 @@ static void FloorDivModInt(int numer, int denom, int *quotient, int *rem)
 	*rem = r;
 }
 
-#if D_USE_GPU_ALIAS_ZTEST && D_USE_GPU_ALIAS_AFFINE_ZTEST
-static int D_PolysetSpanCoords(const spanpackage_t *span, int *u, int *v)
-{
-	int ofs = (byte *)span->pdest - d_viewbuffer;
-	if (ofs < 0)
-		return 0;
-	*v = ofs / screenwidth;
-	*u = ofs - *v * screenwidth;
-	return *u >= 0 && *v >= 0;
-}
-
-static int D_PolysetSpanTexST(const spanpackage_t *span, int32_t *s, int32_t *t)
-{
-	byte *skin = (byte *)r_affinetridesc.pskin;
-	int width = r_affinetridesc.skinwidth;
-	int height = r_affinetridesc.skinheight;
-	int ofs;
-
-	if (!skin || width <= 0 || height <= 0)
-		return 0;
-
-	ofs = span->ptex - skin;
-	if (ofs < 0 || ofs >= width * height)
-		return 0;
-
-	*s = ((int32_t)(ofs % width) << 16) | (span->sfrac & 0xffff);
-	*t = ((int32_t)(ofs / width) << 16) | (span->tfrac & 0xffff);
-	return 1;
-}
-
-static int32_t D_PolysetRebaseI32(int32_t value, int32_t stepu, int du,
-                                  int32_t stepv, int dv)
-{
-	return (int32_t)((uint32_t)value
-		- (uint32_t)stepu * (uint32_t)du
-		- (uint32_t)stepv * (uint32_t)dv);
-}
-
-static int D_PolysetDrawSpans8_ParamZ(spanpackage_t *pspanpackage)
-{
-	spanpackage_t *p, *first = NULL;
-	int err, asp;
-	int base_u = 0, base_v = 0;
-	int first_u = 0, first_v = 0;
-	uint32_t total_records = 0;
-
-	if (!(int)pq_gpu_zwrite.value ||
-	    !of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_ZTEST) ||
-	    d_pzbuffer == NULL || d_zwidth == 0)
-		return 0;
-
-	err = errorterm;
-	asp = d_aspancount;
-	for (p = pspanpackage; p->count != -999999; p++) {
-		int lcount = asp - p->count;
-		int u, v;
-		int32_t s_tmp, t_tmp;
-
-		err += erroradjustup;
-		if (err >= 0) {
-			asp += d_countextrastep;
-			err -= erroradjustdown;
-		} else {
-			asp += ubasestep;
-		}
-
-		if (lcount <= 0)
-			continue;
-		if (!D_PolysetSpanCoords(p, &u, &v))
-			return 0;
-		if (!D_PolysetSpanTexST(p, &s_tmp, &t_tmp))
-			return 0;
-
-		if (total_records == 0 || u < base_u)
-			base_u = u;
-		if (total_records == 0 || v < base_v)
-			base_v = v;
-		if (first == NULL) {
-			first = p;
-			first_u = u;
-			first_v = v;
-		}
-		total_records++;
-	}
-
-	if (total_records == 0) {
-		errorterm = err;
-		d_aspancount = asp;
-		return 1;
-	}
-
-	int32_t first_s, first_t;
-	if (!D_PolysetSpanTexST(first, &first_s, &first_t))
-		return 0;
-
-	const int du0 = first_u - base_u;
-	const int dv0 = first_v - base_v;
-	const int32_t z_stepu = r_zistepx >> 15;
-	const int32_t z_stepv = r_zistepy >> 15;
-
-	of_emit_param_span_list_t params;
-	memset(&params, 0, sizeof(params));
-	params.fb_base = (uint32_t)(uintptr_t)
-		(d_viewbuffer + screenwidth * base_v + base_u);
-	params.fb_major_step = screenwidth;
-	params.fb_minor_step = 1;
-	params.tex_addr = (uint32_t)(uintptr_t)r_affinetridesc.pskin;
-	params.tex_width = (uint16_t)r_affinetridesc.skinwidth;
-	params.flags = OF_EMIT_COLORMAP;
-	params.attr_mode = OF_EMIT_PARAM_ATTR_AFFINE;
-	params.span_axis = OF_EMIT_PARAM_AXIS_X;
-	params.z_mode = OF_EMIT_PARAM_Z_TEST_WRITE;
-	params.attr_origin[0] =
-		D_PolysetRebaseI32(first_s, r_sstepx, du0, r_sstepy, dv0);
-	params.attr_origin[1] =
-		D_PolysetRebaseI32(first_t, r_tstepx, du0, r_tstepy, dv0);
-	params.attr_origin[2] =
-		D_PolysetRebaseI32(first->zi >> 15, z_stepu, du0, z_stepv, dv0);
-	params.attr_du[0] = r_sstepx;
-	params.attr_du[1] = r_tstepx;
-	params.attr_du[2] = z_stepu;
-	params.attr_dv[0] = r_sstepy;
-	params.attr_dv[1] = r_tstepy;
-	params.attr_dv[2] = z_stepv;
-	params.light_origin =
-		D_PolysetRebaseI32(first->light << 8, r_lstepx << 8, du0,
-		                   r_lstepy << 8, dv0);
-	params.light_du = r_lstepx << 8;
-	params.light_dv = r_lstepy << 8;
-	params.clamp_min[0] = 0;
-	params.clamp_max[0] = (r_affinetridesc.skinwidth - 1) << 16;
-	params.clamp_min[1] = 0;
-	params.clamp_max[1] = (r_affinetridesc.skinheight - 1) << 16;
-	params.z_base = (uint32_t)(uintptr_t)
-		(d_pzbuffer + d_zwidth * base_v + base_u);
-	params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
-	params.z_minor_step = (int32_t)sizeof(short);
-
-	err = errorterm;
-	asp = d_aspancount;
-	uint32_t batch_count = 0;
-	uint32_t submitted = 0;
-	for (p = pspanpackage; p->count != -999999; p++) {
-		int lcount = asp - p->count;
-
-		err += erroradjustup;
-		if (err >= 0) {
-			asp += d_countextrastep;
-			err -= erroradjustdown;
-		} else {
-			asp += ubasestep;
-		}
-
-		if (lcount > 0) {
-			int u, v;
-			D_PolysetSpanCoords(p, &u, &v);
-			of_emit_param_span_record_t *rec =
-				&d_alias_param_records[batch_count++];
-			rec->u = (uint16_t)(u - base_u);
-			rec->v = (uint16_t)(v - base_v);
-			rec->count = (uint16_t)lcount;
-			if (batch_count == OF_EMIT_PARAM_SPAN_MAX_RECORDS) {
-				submitted += of_emit_param_span_list(
-					&params, d_alias_param_records, batch_count);
-				batch_count = 0;
-			}
-		}
-	}
-	if (batch_count != 0) {
-		submitted += of_emit_param_span_list(
-			&params, d_alias_param_records, batch_count);
-	}
-
-	if (submitted != total_records)
-		return 0;
-
-	errorterm = err;
-	d_aspancount = asp;
-	pq_gpu_zwrite_pending = 1;
-	return 1;
-}
-#endif
 
 
 /*
@@ -991,12 +802,6 @@ PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 {
 	int		lcount;
 
-#if D_USE_GPU_ALIAS_ZTEST
-#if D_USE_GPU_ALIAS_AFFINE_ZTEST
-	if (D_PolysetDrawSpans8_ParamZ(pspanpackage))
-		return;
-#endif
-#endif
 
 #if D_USE_GPU_ALIAS != 1
 	if (pq_gpu_zwrite_pending)

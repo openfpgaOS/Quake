@@ -188,21 +188,34 @@ void R_BuildLightMap (void)
 		return;
 	}
 
-// clear to ambient
-	for (i=0 ; i<size ; i++)
-		blocklights[i] = r_refdef.ambientlight<<8;
+// clear to ambient, fusing the first active lightmap into the init sweep so a
+// single-style surface makes two passes over blocklights[] instead of three
+	if (!lightmap || surf->styles[0] == 255)
+	{
+		unsigned	amb = r_refdef.ambientlight<<8;
+		for (i=0 ; i<size ; i++)
+			blocklights[i] = amb;
+	}
+	else
+	{
+		unsigned	amb = r_refdef.ambientlight<<8;
 
+	// first lightmap fused with the ambient clear
+		scale = r_drawsurf.lightadj[0];		// 8.8 fraction
+		for (i=0 ; i<size ; i++)
+			blocklights[i] = amb + lightmap[i] * scale;
+		lightmap += size;	// skip to next lightmap
 
-// add all the lightmaps
-	if (lightmap)
-		for (maps = 0 ; maps < MAXLIGHTMAPS && surf->styles[maps] != 255 ;
+	// add the remaining lightmaps
+		for (maps = 1 ; maps < MAXLIGHTMAPS && surf->styles[maps] != 255 ;
 			 maps++)
 		{
-			scale = r_drawsurf.lightadj[maps];	// 8.8 fraction		
+			scale = r_drawsurf.lightadj[maps];	// 8.8 fraction
 			for (i=0 ; i<size ; i++)
 				blocklights[i] += lightmap[i] * scale;
 			lightmap += size;	// skip to next lightmap
 		}
+	}
 
 // add all the dynamic lights
 	if (r_dynamic.value && surf->dlightframe == r_framecount)

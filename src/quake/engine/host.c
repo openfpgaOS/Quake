@@ -266,24 +266,29 @@ void Host_InitLocal (void)
 ===============
 Host_WriteConfiguration
 
-Writes key bindings and archived cvars to config.cfg
+Writes key bindings and archived cvars to the current instance config.
 ===============
 */
+void Sys_QuakeConfigPath(char *out, int out_size);
+
 void Host_WriteConfiguration (void)
 {
 	FILE	*f;
+	char	config_path[MAX_OSPATH];
 
 // dedicated servers initialize the host but don't parse and set the
-// config.cfg cvars
+// instance config cvars
 	if (host_initialized & !isDedicated)
 	{
-		f = fopen (va("%s/config.cfg",com_gamedir), "w");
+		Sys_QuakeConfigPath(config_path, sizeof(config_path));
+		f = fopen (config_path, "w");
 		if (!f)
 		{
-			Con_Printf ("Couldn't write config.cfg.\n");
+			Con_Printf ("Couldn't write %s.\n", config_path);
 			return;
 		}
 		
+		fprintf (f, "// Quake 3.0 config\n");
 		Key_WriteBindings (f);
 		Cvar_WriteVariables (f);
 

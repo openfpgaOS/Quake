@@ -26,6 +26,13 @@ qboolean isDedicated = false;
 volatile unsigned int pq_dbg_stage;
 volatile unsigned int pq_dbg_info;
 
+#define QUAKE_CONFIG_SECTION "quake"
+#define QUAKE_DEFAULT_CONFIG "quake.cfg"
+#define QUAKE_CONFIG_MARKER "// Quake 3.0 config"
+
+static char sys_quake_config_name[MAX_OSPATH] = QUAKE_DEFAULT_CONFIG;
+static int sys_quake_ini_present;
+
 /* Resolve the "data file" part of a path for SDK fopen. Quake emits
  * paths like "./id1/pak0.pak" or "quake/id1/pak0.pak" based on
  * com_basedir; the SDK's filename mapping is by bare filename. Strip
@@ -34,6 +41,231 @@ static const char *basename_of(const char *path)
 {
     const char *p = strrchr(path, '/');
     return p ? p + 1 : path;
+}
+
+static int ascii_tolower(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+static int ascii_strcasecmp(const char *a, const char *b)
+{
+    while (*a && *b) {
+        int d = ascii_tolower((unsigned char)*a) -
+                ascii_tolower((unsigned char)*b);
+        if (d)
+            return d;
+        a++;
+        b++;
+    }
+    return ascii_tolower((unsigned char)*a) -
+           ascii_tolower((unsigned char)*b);
+}
+
+static int Sys_ConfigSectionPresent(void)
+{
+    uint32_t cursor = 0;
+    char key[64];
+    char value[MAX_OSPATH];
+
+    return of_config_next(QUAKE_CONFIG_SECTION, &cursor,
+                          key, sizeof(key),
+                          value, sizeof(value)) == 0;
+}
+
+void Sys_InitQuakeConfig(void)
+{
+    char value[MAX_OSPATH];
+
+    snprintf(sys_quake_config_name, sizeof(sys_quake_config_name),
+             "%s", QUAKE_DEFAULT_CONFIG);
+    sys_quake_ini_present = 0;
+
+    if (of_config_get(QUAKE_CONFIG_SECTION, "CONFIG",
+                      value, sizeof(value)) == 0) {
+        sys_quake_ini_present = 1;
+        if (value[0]) {
+            snprintf(sys_quake_config_name, sizeof(sys_quake_config_name),
+                     "%s", value);
+        }
+        return;
+    }
+
+    sys_quake_ini_present = Sys_ConfigSectionPresent();
+}
+
+void Sys_QuakeConfigPath(char *out, int out_size)
+{
+    snprintf(out, (size_t)out_size, "%s", sys_quake_config_name);
+}
+
+static const char *Sys_MapConfigName(const char *path)
+{
+    const char *name = basename_of(path);
+    if (!ascii_strcasecmp(name, "config.cfg"))
+        return sys_quake_config_name;
+    return name;
+}
+
+static int Sys_IsConfigPath(const char *path)
+{
+    return !ascii_strcasecmp(basename_of(path), "config.cfg");
+}
+
+static int Sys_TextContains(const char *text, const char *needle)
+{
+    return strstr(text, needle) != NULL;
+}
+
+static int Sys_ConfigBufferLooksQuake(const unsigned char *buf, size_t len)
+{
+    char text[1025];
+    size_t n = len;
+    static const char *bad_tokens[] = {
+        "mouse_sensitivity",
+        "sfx_volume",
+        "music_volume",
+        "show_messages",
+        "screenblocks",
+        "detaillevel",
+        "frame_interpolation",
+        "refresh_mode",
+        "snd_samplerate",
+        "snd_musicdevice",
+        "video_driver",
+        "window_position",
+        "fullscreen",
+        "aspect_ratio_correct",
+        "smooth_pixel_scaling",
+        "integer_scaling",
+        "show_endoom",
+        "png_screenshots",
+        "autoload_path",
+        "music_pack_path",
+        "vanilla_savegame_limit",
+        "vanilla_demo_limit",
+        "player_name",
+        "grabmouse",
+        "joystick_",
+        "mouseb_",
+        "joyb_",
+        "key_",
+        "use_mouse",
+        "use_joystick",
+        "snd_",
+        "key_menu_",
+        "key_map_",
+        "key_weapon",
+        "key_multi_"
+    };
+    static const char *quake_tokens[] = {
+        QUAKE_CONFIG_MARKER,
+        "bind \"",
+        "_cl_name",
+        "_cl_color",
+        "sensitivity",
+        "m_pitch",
+        "m_yaw",
+        "m_forward",
+        "m_side",
+        "lookspring",
+        "lookstrafe",
+        "volume",
+        "bgmvolume",
+        "viewsize",
+        "gamma",
+        "crosshair",
+        "sv_",
+        "savedgamecfg",
+        "saved1",
+        "fraglimit",
+        "timelimit",
+        "teamplay",
+        "noexit"
+    };
+
+    if (n > sizeof(text) - 1)
+        n = sizeof(text) - 1;
+    if (n == 0)
+        return 0;
+
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = buf[i];
+        if (c == 0 || c == 0xff) {
+            n = i;
+            break;
+        }
+        if (c < ' ' && c != '\n' && c != '\r' && c != '\t')
+            return 0;
+        if (c >= 0x80)
+            return 0;
+        text[i] = (char)c;
+    }
+    text[n] = '\0';
+
+    if (n == 0)
+        return 0;
+
+    for (size_t i = 0; i < sizeof(bad_tokens) / sizeof(bad_tokens[0]); i++)
+        if (Sys_TextContains(text, bad_tokens[i]))
+            return 0;
+
+    for (size_t i = 0; i < sizeof(quake_tokens) / sizeof(quake_tokens[0]); i++)
+        if (Sys_TextContains(text, quake_tokens[i]))
+            return 1;
+
+    return 0;
+}
+
+static int Sys_ConfigFileLooksQuake(FILE *f)
+{
+    unsigned char buf[1024];
+    long pos = ftell(f);
+    size_t n;
+    int ok;
+
+    if (pos < 0)
+        pos = 0;
+    fseek(f, 0, SEEK_SET);
+    n = fread(buf, 1, sizeof(buf), f);
+    ok = Sys_ConfigBufferLooksQuake(buf, n);
+    fseek(f, pos, SEEK_SET);
+
+    return ok;
+}
+
+static int Sys_ResetConfigFile(const char *name)
+{
+    FILE *f = fopen(name, "wb");
+
+    if (!f)
+        return 0;
+
+    fprintf(f, "%s\n", QUAKE_CONFIG_MARKER);
+    fclose(f);
+    return 1;
+}
+
+int Sys_QuakePackPath(char *dir, int pak_index, char *out, int out_size)
+{
+    const char *game = basename_of(dir);
+    char key[64];
+    int rc;
+
+    if (!sys_quake_ini_present)
+        return 0;
+    if (!out || out_size <= 0)
+        return -1;
+
+    if (snprintf(key, sizeof(key), "PAK_%s_%d", game, pak_index) >=
+        (int)sizeof(key))
+        return -1;
+
+    rc = of_config_get(QUAKE_CONFIG_SECTION, key, out, (uint32_t)out_size);
+    if (rc == 0 && out[0])
+        return 1;
+
+    return -1;
 }
 
 /* ---------------- File I/O ------------------------------------------ */
@@ -62,9 +294,16 @@ int filelength(FILE *f)
 int Sys_FileOpenRead(char *path, int *hndl)
 {
     int i = findhandle();
-    const char *name = basename_of(path);
+    int mapped_config = Sys_IsConfigPath(path);
+    const char *name = Sys_MapConfigName(path);
     FILE *f = fopen(name, "rb");
-    if (!f) f = fopen(path, "rb");
+    if (!f && !mapped_config) f = fopen(path, "rb");
+    if (f && mapped_config && !Sys_ConfigFileLooksQuake(f)) {
+        fclose(f);
+        f = NULL;
+        if (Sys_ResetConfigFile(name))
+            f = fopen(name, "rb");
+    }
     if (!f) {
         *hndl = -1;
         return -1;
@@ -112,37 +351,26 @@ int Sys_FileWrite(int handle, void *data, int count)
 
 int Sys_FileTime(char *path)
 {
-    const char *name = basename_of(path);
+    int mapped_config = Sys_IsConfigPath(path);
+    const char *name = Sys_MapConfigName(path);
     FILE *f = fopen(name, "rb");
-    if (!f) f = fopen(path, "rb");
-    if (f) { fclose(f); return 1; }
+    if (!f && !mapped_config) f = fopen(path, "rb");
+    if (f) {
+        int ok = !mapped_config || Sys_ConfigFileLooksQuake(f);
+        fclose(f);
+        if (!ok)
+            ok = Sys_ResetConfigFile(name);
+        return ok ? 1 : -1;
+    }
     return -1;
 }
 
 void Sys_mkdir(char *path) { (void)path; }
 
 /* ---------------- Save games ---------------------------------------- *
- * The SDK exposes up to 10 persistent save slots as `save:N`. We map
- * Quake's `save/s0.sav`..`save/s9.sav` strings onto them. Quake also
- * writes `config.cfg`; persist that into save:0 with a leading tag so
- * we don't collide with game saves — actually easier: use save:9 as a
- * config slot (Quake only uses 10 game slots by default). */
-
-static int save_slot_from_path(const char *path)
-{
-    /* Accepted forms: ".../s0.sav" .. ".../s9.sav". */
-    const char *p = strrchr(path, '/');
-    p = p ? p + 1 : path;
-    if (p[0] == 's' && p[1] >= '0' && p[1] <= '9' &&
-        strcmp(p + 2, ".sav") == 0) {
-        return p[1] - '0';
-    }
-    return -1;
-}
-
-/* Chocolate-doom-style save: open "save:N" via the SDK's fopen. These
- * override the Quake file handle path for save reads/writes so the
- * engine's host_cmd.c still calls Sys_FileOpenRead and friends. */
+ * Save files and Quake configs are resolved by openfpgaOS filename bindings from
+ * the APF instance file: s0.sav..s9.sav map to save data slots 10..19, while
+ * the current instance's cfg file maps to the pre-save nonvolatile config slot 8. */
 
 /* ---------------- Time ---------------------------------------------- */
 

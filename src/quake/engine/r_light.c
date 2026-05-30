@@ -80,8 +80,17 @@ PQ_HOT void R_MarkLights (dlight_t *light, int bit, mnode_t *node)
 		return;
 
 	splitplane = node->plane;
-	dist = DotProduct (light->origin, splitplane->normal) - splitplane->dist;
-	
+	// Axial planes (the majority of world planes) reduce the split distance to
+	// a single subtract instead of a 3-component DotProduct; bit-identical for
+	// axial normals, and mirrors the fast path in R_RecursiveWorldNode.
+	switch (splitplane->type)
+	{
+	case PLANE_X:	dist = light->origin[0] - splitplane->dist;	break;
+	case PLANE_Y:	dist = light->origin[1] - splitplane->dist;	break;
+	case PLANE_Z:	dist = light->origin[2] - splitplane->dist;	break;
+	default:	dist = DotProduct (light->origin, splitplane->normal) - splitplane->dist;	break;
+	}
+
 	if (dist > light->radius)
 	{
 		R_MarkLights (light, bit, node->children[0]);

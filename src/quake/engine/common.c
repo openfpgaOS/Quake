@@ -42,6 +42,12 @@ qboolean		msg_suppress_1 = 0;
 
 void COM_InitFilesystem (void);
 
+#ifdef QUAKE_OPENFPGA
+/* Returns 1 for an ini-mapped PAK path, 0 to use the vanilla filesystem
+ * fallback, and -1 when the ini layout explicitly has no PAK for this slot. */
+int Sys_QuakePackPath(char *dir, int pak_index, char *out, int out_size);
+#endif
+
 // if a packfile directory differs from this, it is assumed to be hacked
 #define PAK0_COUNT              339
 #define PAK0_CRC                32981
@@ -1729,7 +1735,13 @@ void COM_AddGameDirectory (char *dir)
 //
 	for (i=0 ; i < 10 ; i++)
 	{
-		sprintf (pakfile, "%s/pak%i.pak", dir, i);
+#ifdef QUAKE_OPENFPGA
+		int mapped_pak = Sys_QuakePackPath(dir, i, pakfile, sizeof(pakfile));
+		if (mapped_pak < 0)
+			continue;
+		if (!mapped_pak)
+#endif
+			sprintf (pakfile, "%s/pak%i.pak", dir, i);
 		pak = COM_LoadPackFile (pakfile);
 		if (!pak)
 			continue;
