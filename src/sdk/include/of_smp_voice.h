@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_smp_voice.h -- Software voice engine for sample-based MIDI synthesis.
  *
@@ -57,6 +63,12 @@ typedef struct {
     lfo_state_t mod_lfo;
     lfo_state_t vib_lfo;
     uint32_t base_rate_fp16; /* base 16.16 playback rate (no bend/LFO) */
+    /* Cached L/R pan multipliers (Q0.PAN_SHIFT).  Recomputed at note-on and
+     * when CC10 changes for this channel, so the per-tick volume path is two
+     * multiplies + shift with no divide.  One side is always full-scale
+     * (1<<PAN_SHIFT); the other carries the equal-volume pan attenuation. */
+    int32_t pan_mul_l;
+    int32_t pan_mul_r;
     uint32_t age;
     /* Countdown of smp_voice_tick calls until the underlying non-looping
      * sample has played to its natural end.  0 = not tracked (looping
@@ -117,10 +129,6 @@ typedef struct {
     uint32_t pump_interval_min_us;   /* best-case gap (UINT32_MAX if no data) */
     uint32_t pump_burst_count;       /* pumps where >1 ticks fired */
     uint32_t pump_budget_exceeded;   /* pumps where tick_budget==0 at end */
-
-    /* Retired SVF diagnostic; kept in the stats struct for source
-     * compatibility and currently remains 0. */
-    uint16_t cutoff_delta_max;
 } smp_tick_stats_t;
 
 void smp_voice_tick_get_stats(smp_tick_stats_t *out);
@@ -145,12 +153,6 @@ void smp_voice_update_chorus_send(int midi_ch, int send_0_127);
 void smp_voice_all_off(int midi_ch);
 void smp_voice_all_off_global(void);
 void smp_voice_set_master_volume(int vol);
-
-/* AWE-backend redirect (retired).  Preserved as ABI no-ops so existing
- * SDK apps that enable/query the AWE path still link; the CPU-side SW
- * voice engine is the only backend now. */
-void smp_voice_enable_awe_backend(int on);
-int  smp_voice_awe_backend_enabled(void);
 
 #ifdef __cplusplus
 }

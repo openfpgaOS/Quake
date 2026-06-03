@@ -7,8 +7,8 @@
             "description": "Quake on openfpgaOS",
             "author": "ThinkElastic",
             "url": "",
-            "version": "1.0.0",
-            "date_release": "2026-05-28"
+            "version": "1.0.2",
+            "date_release": "2026-06-03"
         },
         "framework": {
             "target_product": "Analogue Pocket",

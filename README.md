@@ -2,7 +2,7 @@
 
 Quake 3.0 is an openfpgaOS-based Analogue Pocket core for id Software's Quake engine. It runs the Quake executable from `quake.elf`, with each game or expansion instance selecting its command line, config file, and PAK slot map through an ini file.
 
-The core is versioned as `1.0.0` in `dist/quake/Cores/ThinkElastic.quake/core.json`.
+The core is versioned as `1.0.2` in `dist/quake/Cores/ThinkElastic.quake/core.json`.
 
 ## Installation
 

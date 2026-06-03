@@ -1728,7 +1728,7 @@ void M_Quit_Draw (void)
 
 #ifdef _WIN32
 	M_DrawTextBox (0, 0, 38, 23);
-	M_PrintWhite (16, 12,  "  Quake version 1.09 by id Software\n\n");
+	M_PrintWhite (16, 12,  "  Quake 3.0 1.0.2 by id Software\n\n");
 	M_PrintWhite (16, 28,  "Programming        Art \n");
 	M_Print (16, 36,  " John Carmack       Adrian Carmack\n");
 	M_Print (16, 44,  " Michael Abrash     Kevin Cloud\n");

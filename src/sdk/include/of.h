@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of.h -- openfpgaOS Application API
  *
@@ -61,7 +67,6 @@ extern "C" {
 #include "of_net.h"
 #include "of_analogizer.h"
 #include "of_terminal.h"
-#include "of_tile.h"
 #include "of_cache.h"
 #include "of_interact.h"
 #include "of_mixer.h"

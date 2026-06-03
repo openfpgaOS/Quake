@@ -1126,7 +1126,7 @@ static void PQ_Prof_DrawTerminal(void)
 
 	/* Header */
 	term_setpos(row++, 0);
-	term_puts("---- Quake " QUAKE_CORE_VERSION " Profiler ----");
+	term_puts("---- " QUAKE_CORE_DISPLAY_VERSION " Profiler ----");
 
 	/* Column header */
 	term_setpos(row++, 0);

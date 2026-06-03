@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_services.h -- openfpgaOS OS Services Table
  *
@@ -23,7 +29,7 @@ extern "C" {
 #include <stddef.h>
 
 #define OF_SVC_MAGIC    0x4F535643  /* 'OSVC' */
-#define OF_SVC_VERSION  1
+#define OF_SVC_VERSION  2   /* v2: retired AWE coprocessor slots removed */
 
 /* Forward declare input state struct */
 struct of_input_state;
@@ -69,11 +75,6 @@ typedef struct of_video_caps {
     uint32_t color_mode_mask;
 } of_video_caps_t;
 #endif
-
-/* Forward declare AWE per-voice config -- full definition in of_awe.h.
- * Kept opaque here so this header doesn't pull the AWE-specific types
- * into every TU that just wants the services table. */
-struct awe_voice_t;
 
 struct of_services_table {
     uint32_t magic;
@@ -171,7 +172,6 @@ struct of_services_table {
     void      (*mixer_set_group)(int voice, int group);
     void      (*mixer_set_group_volume)(int group, int volume);
     void      (*mixer_set_master_volume)(int volume);
-    void      (*mixer_set_filter)(int voice, int cutoff_q016, int q, int enable);
     int       (*audio_stream_open)(int sample_rate);
     int       (*audio_stream_write)(const int16_t *samples, int count);
     int       (*audio_stream_ready)(void);
@@ -192,48 +192,6 @@ struct of_services_table {
      *    SDRAM buffer directly. Older firmware leaves these as NULL/0. */
     const void *smp_bank_preload_base;
     uint32_t    smp_bank_preload_size;
-
-    /* -- AWE coprocessor (RETIRED — slots kept for ABI stability) --
-     *    The AWE fabric coprocessor was removed; all of these slots are
-     *    wired to no-op stubs in services_table.c so SDK apps built
-     *    against the old ABI still link.  They silently do nothing.
-     *    Do NOT call these from new code; use the mixer + smp_voice
-     *    paths instead.  See of_awe.h for matching app-side stubs. */
-    void      (*awe_voice_load)(int voice, const struct awe_voice_t *v);
-    void      (*awe_voice_trigger)(int voice);
-    void      (*awe_voice_release)(int voice);
-    void      (*awe_voice_stop)(int voice);
-    void      (*awe_channel_set_volume)(int ch, int vol_0_127);
-    void      (*awe_channel_set_expression)(int ch, int expr_0_127);
-    void      (*awe_channel_set_pan)(int ch, int pan_0_127);
-    void      (*awe_channel_set_bend)(int ch, int bend_signed_8192);
-    void      (*awe_channel_set_mod)(int ch, int mod_0_127);
-    void      (*awe_channel_set_sustain)(int ch, int on_off);
-    void      (*awe_channel_set_brightness)(int ch, int br_0_127);
-    void      (*awe_channel_set_resonance)(int ch, int q_0_127);
-    void      (*awe_channel_set_reverb_send)(int ch, int send_0_255);
-    void      (*awe_channel_set_chorus_send)(int ch, int send_0_255);
-    void      (*awe_set_master_volume)(int vol_0_255);
-    void      (*awe_set_bend_range)(int cents);
-    uint64_t  (*awe_active_mask)(void);
-
-    /* Retired — returns 0. */
-    uint32_t  (*awe_tick_count)(void);
-
-    /* Retired — no-op. */
-    void      (*awe_set_hw_envelope)(int enabled);
-
-    /* Retired — no-op. */
-    void      (*awe_set_reverb_level)(int level);
-    void      (*awe_set_reverb_feedback)(int feedback);
-
-    /* Retired — no-op. */
-    void      (*awe_set_chorus_level)(int level);
-    void      (*awe_set_chorus_rate)(int rate);
-    void      (*awe_set_chorus_depth)(int depth);
-
-    /* Retired — no-op. */
-    void      (*awe_ramp1_trigger)(int voice, int stage, uint32_t rate);
 
     /* -- Mixer group-aware allocation (append-only, ABI-stable) --
      *    Atomic alloc-and-tag entry; lets callers that know which
@@ -315,10 +273,6 @@ struct of_services_table {
                                        int vol_l,
                                        int vol_r);
     void      (*mixer_set_vol_rate_h)(uint64_t handle, int rate);
-    void      (*mixer_set_filter_h)(uint64_t handle,
-                                    int cutoff_q016,
-                                    int q,
-                                    int enable);
     uint32_t  (*mixer_poll_ended_h)(uint64_t *out_handles,
                                     uint32_t max_handles);
 
@@ -358,6 +312,15 @@ struct of_services_table {
     int       (*config_next)(const char *section, uint32_t *cursor,
                              char *key_out, uint32_t key_len,
                              char *value_out, uint32_t value_len);
+
+    /* -- File I/O idle hook (append-only) --
+     * Hook invoked repeatedly from the blocking file-read DMA wait
+     * (file_wait_complete) so the app can keep latency-critical work running
+     * while a synchronous SD read is in flight -- e.g. feeding the audio ring
+     * from an already-decoded buffer so music does not stall during SD access.
+     * The hook MUST NOT issue a blocking file read (nested invocation is
+     * suppressed by the kernel). Pass NULL to clear. */
+    void      (*file_set_idle_hook)(void (*hook)(void));
 };
 
 #ifndef OF_PC
