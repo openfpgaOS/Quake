@@ -1,21 +1,40 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
- * openfpgaOS MIDI Demo Application
+ * mididemo — General-MIDI playback via the SoundFont-driven sample synth
  *
- * MODE 1 (default): plays a MIDI file from slot:3
- * MODE 2 (DPad UP):  diagnostic — plays Guitar/Bass/Snare on loop
- *                    so you can listen and verify each instrument
+ * Canonical example of:
+ *   - Loading a SoundFont bank with of_smp_bank_load (or reusing the
+ *     kernel's auto-loaded preload buffer when one is exposed via
+ *     OF_SVC->smp_bank_preload_base)
+ *   - Driving the CPU MIDI voice engine with of_smp_voice_*: note_on,
+ *     note_off, channel CC updates (volume, expression, pan, bend),
+ *     and the 1 kHz logical envelope tick dispatched by the timer ISR
+ *   - of_midi_play() to spool a SMF file through the synth — the
+ *     parser runs in main(), but the actual mixer slot ops happen
+ *     inside the timer ISR via of_midi_pump (see project memory
+ *     `midi_isr_pump`)
+ *   - smp_voice_tick_get_stats() for live voice-load diagnostics
+ *
+ * Modes:
+ *   Default          play the MIDI file at slot:4
+ *   D-pad UP toggle  diagnostic instrument loop — sustained notes for
+ *                    every program so you can audit each preset
  *
  * Controls:
- *   START   = play/pause
- *   SELECT  = restart
- *   DPad UP = toggle diagnostic mode (guitar/bass/snare)
- *   L1/R1   = volume down/up
+ *   START      play / pause
+ *   SELECT     restart
+ *   D-pad UP   diagnostic mode toggle
+ *   L1 / R1    master volume down / up
  */
 
 #include "of.h"
 #include "of_smp_bank.h"
 #include "of_smp_voice.h"
-#include "of_awe.h"
 #include <time.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -188,10 +207,10 @@ static void raw_play_inst(int idx, int note) {
            note, bank, program, n);
 
     for (int i = 0; i < n; i++) {
-        const int16_t *sample_ptr = (const int16_t *)(sbase + zones[i]->sample_offset);
+        const uint8_t *sample_ptr = sbase + zones[i]->sample_offset;
         uint32_t sample_count = zones[i]->sample_length;
         uint32_t sample_bytes = sample_count * sizeof(int16_t);
-        const int16_t *play_ptr = sample_ptr;
+        const uint8_t *play_ptr = sample_ptr;
 
         if (raw_use_copy) {
             int16_t *copy_buf = raw_copy_buf_get(i);
@@ -200,10 +219,10 @@ static void raw_play_inst(int idx, int note) {
                 continue;
             }
             memcpy(copy_buf, sample_ptr, sample_bytes);
-            play_ptr = copy_buf;
+            play_ptr = (const uint8_t *)copy_buf;
         }
 
-        int v = of_mixer_play((const uint8_t *)play_ptr,
+        int v = of_mixer_play(play_ptr,
                               sample_count,
                               hdr->sample_rate,
                               0, 220);
@@ -222,75 +241,9 @@ static void raw_play_inst(int idx, int note) {
 }
 
 
-/* AWE smoke-test — Phase 1 validated.  Mirrors raw_play_inst's API
- * but routes the note-on through AWE's register file + NOTE_ON FSM
- * instead of of_mixer_play.  Uses voice 47 so it doesn't collide with
- * the SW voice allocator (SMP_MAX_VOICES = 28, of_mixer allocator
- * skips scratch voice 31). */
-#define AWE_TEST_VOICE  31  /* last slot now that AWE_MAX_VOICES = 32 */
-
-static void awe_play_inst(int idx, int note) {
-    const ofsf_zone_t *zones[1];
-    const ofsf_header_t *hdr = of_smp_bank_get();
-    const uint8_t *sbase = (const uint8_t *)of_smp_bank_sample_base();
-    int bank = (diag_inst[idx].channel == 9) ? 128 : 0;
-    int program = (diag_inst[idx].program >= 0) ? diag_inst[idx].program : 0;
-
-    if (note < 0) note = 0;
-    if (note > 127) note = 127;
-    if (!hdr || !sbase) return;
-
-    int n = of_smp_zone_lookup(bank, program, note, 100, zones, 1);
-    if (n == 0) {
-        printf("\033[12;2H AWE: no zone for note=%d                    ", note);
-        return;
-    }
-    const ofsf_zone_t *z = zones[0];
-
-    of_awe_voice_stop(AWE_TEST_VOICE);
-
-    awe_voice_t v;
-    memset(&v, 0, sizeof(v));
-    v.base            = sbase + z->sample_offset;
-    v.length          = z->sample_length;
-    v.loop_start      = z->loop_start;
-    v.loop_end        = z->loop_end;
-    v.loop_mode       = z->loop_mode;
-    v.interp_mode     = AWE_INTERP_LINEAR;
-    v.fmt16           = 1;
-    v.midi_channel    = (uint8_t)diag_inst[idx].channel;
-    v.voice_base_vol  = 200;
-    v.pan_base        = z->pan;
-    v.base_rate       = (uint32_t)(((uint64_t)hdr->sample_rate << 16) / 48000u);
-    v.initial_fc      = z->initial_fc;
-    v.initial_q       = z->initial_q;
-
-    /* Phase 3 DAHDSR — pass the OFSF-v3 baked params through so AWE's
-     * ramp0 FSM produces the same envelope shape the SW path does. */
-    v.vol_delay_ticks   = z->vol_delay_ticks;
-    v.vol_attack_rate   = z->vol_attack_rate;
-    v.vol_hold_ticks    = z->vol_hold_ticks;
-    v.vol_decay_rate    = z->vol_decay_rate;
-    v.vol_sustain_level = z->vol_sustain_level;
-    v.vol_release_ticks = z->vol_release_ticks;
-
-    of_awe_set_hw_envelope(1);   /* flip global flag on */
-    of_awe_voice_load(AWE_TEST_VOICE, &v);
-    of_awe_voice_trigger(AWE_TEST_VOICE);
-
-    printf("\033[12;2H AWE: v%d note=%d len=%u loop=%u  active=%llx tick=%u ",
-           AWE_TEST_VOICE, note, (unsigned)z->sample_length,
-           (unsigned)z->loop_mode,
-           (unsigned long long)of_awe_active_mask(),
-           (unsigned)of_awe_tick_count());
-}
-
 __attribute__((unused))
 static int load_midi_file(void) {
-    /* Demo loads the MIDI file from data slot 3; filename-based access
-     * (e.g. fopen("music.mid")) requires SDK plumbing of_file_get_name
-     * from the OS, which is not wired up yet. */
-    FILE *f = fopen("slot:3", "rb");
+    FILE *f = fopen("music.mid", "rb");
     if (!f) return -1;
 
     size_t n = fread(midi_buf, 1, MIDI_MAX_SIZE, f);
@@ -308,12 +261,11 @@ static int load_midi_file(void) {
 }
 
 /* Mode: 0 = MIDI file player, 1 = instrument diagnostic,
- *       2 = raw sample (direct mixer), 3 = AWE smoke-test (Phase 1) */
+ *       2 = raw sample (direct mixer) */
 #define MODE_PLAY  0
 #define MODE_DIAG  1
 #define MODE_RAW   2
-#define MODE_AWE   3
-#define MODE_COUNT 4
+#define MODE_COUNT 3
 
 int main(void) {
     printf("\033[2J\033[H");
@@ -323,7 +275,7 @@ int main(void) {
     build_all_diag();
 
     /* Initialize mixer — required by the sample-based MIDI backend */
-    of_mixer_init(48, OF_MIXER_OUTPUT_RATE);
+    of_mixer_init(OF_MIXER_MAX_VOICES, OF_MIXER_OUTPUT_RATE);
     of_mixer_set_master_volume(255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, 255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_SFX, 255);
@@ -339,12 +291,12 @@ int main(void) {
     printf(" Bank loaded (%.1f KB)\n",
            bhdr->sample_data_size / 1024.0f);
 
-    /* Try to load MIDI file from data slot 3 */
+    /* Try to load the MIDI file (music.mid) by filename */
     int have_midi = (load_midi_file() == 0);
     if (have_midi)
         printf(" MIDI file: %u bytes\n", (unsigned)midi_len);
     else
-        printf(" No MIDI file in slot 3\n");
+        printf(" No MIDI file found\n");
 
     printf(" %u diagnostic instruments\n", (unsigned)DIAG_INST_COUNT);
 
@@ -379,32 +331,9 @@ int main(void) {
             idx = 0;
             raw_octave = 0;
 
-            /* Cycle: play → diag → raw → awe (skip play if no file) */
+            /* Cycle through playback, diagnostic, and raw mixer modes. */
             mode = (mode + 1) % MODE_COUNT;
             if (mode == MODE_PLAY && !have_midi) mode = MODE_DIAG;
-            if (mode == MODE_AWE) of_awe_voice_stop(AWE_TEST_VOICE);
-
-            /* MODE_PLAY now routes the MIDI file through the AWE
-             * coprocessor via the smp_voice AWE backend.  Any other
-             * mode falls back to SW mixing to keep diag/raw/awe-solo
-             * behaviour unchanged. */
-            smp_voice_enable_awe_backend(mode == MODE_PLAY ? 1 : 0);
-
-            /* Phase 6 global effect buses — only on in MODE_PLAY since
-             * they mix into the master output unconditionally. */
-            if (mode == MODE_PLAY) {
-                of_awe_set_reverb_level   (80);   /* wet mix ~30 % */
-                of_awe_set_reverb_feedback(140);  /* moderate tail   */
-                of_awe_set_chorus_level   (48);   /* subtle chorus   */
-                of_awe_set_chorus_rate    (60);   /* slow LFO ~0.05 Hz */
-                of_awe_set_chorus_depth   (12);   /* ±12 sample swing */
-            } else {
-                of_awe_set_reverb_level   (0);
-                of_awe_set_reverb_feedback(0);
-                of_awe_set_chorus_level   (0);
-                of_awe_set_chorus_rate    (0);
-                of_awe_set_chorus_depth   (0);
-            }
 
 enter_mode:
             printf("\033[10;2H                                       ");
@@ -424,9 +353,6 @@ enter_mode:
             } else if (mode == MODE_RAW) {
                 printf("\033[10;2H MODE: Raw Sample Playback");
                 raw_play_inst(idx, diag_inst[idx].note);
-            } else {
-                printf("\033[10;2H MODE: AWE Coprocessor (Phase 1)");
-                awe_play_inst(idx, diag_inst[idx].note);
             }
             printf("\033[11;2H >>> %-30s",
                    mode == MODE_PLAY ? "Playing MIDI file" : diag_inst[idx].name);
@@ -525,40 +451,12 @@ enter_mode:
 
             if (replay)
                 raw_play_inst(idx, diag_inst[idx].note + raw_octave * 12);
-        } else if (mode == MODE_AWE) {
-            int change = -1;
-            int replay = 0;
-
-            if (state.buttons_pressed & OF_BTN_RIGHT)
-                change = (idx + 1) % (int)DIAG_INST_COUNT;
-            if (state.buttons_pressed & OF_BTN_LEFT)
-                change = (idx + (int)DIAG_INST_COUNT - 1) % (int)DIAG_INST_COUNT;
-            if (state.buttons_pressed & OF_BTN_A)
-                replay = 1;
-            if (state.buttons_pressed & OF_BTN_X) {
-                if (raw_octave > -2) raw_octave--;
-                replay = 1;
-            }
-            if (state.buttons_pressed & OF_BTN_Y) {
-                if (raw_octave < 2) raw_octave++;
-                replay = 1;
-            }
-
-            if (change >= 0) {
-                idx = change;
-                raw_octave = 0;
-                replay = 1;
-                printf("\033[11;2H >>> %-30s", diag_inst[idx].name);
-            }
-
-            if (replay)
-                awe_play_inst(idx, diag_inst[idx].note + raw_octave * 12);
         }
 
         /* Tick-cost probe: print stats every ~1 s.
-         * Budget is 2000 us (100 Hz tick rate).
+         * Budget is 2000 us per MIDI pump callback.
          *
-         * of_midi_pump() is now driven by the machine-timer ISR at 100 Hz
+         * of_midi_pump() is now driven by the machine-timer ISR at 50 Hz
          * (installed by of_midi_play), so printf stalls on the main thread
          * no longer starve the mixer.  We must NOT call of_midi_pump() from
          * here — doing so would race the ISR on M/voice state. */
@@ -588,27 +486,18 @@ enter_mode:
                                  of_midi_get_program(ch));
             }
             printf("\033[19;2H ch(v/prg): %-80s", chbuf);
-            /* A/B/C instrumentation — MMIO + pump-interval + cutoff-delta.
+            /* Instrumentation — MMIO write counts + pump intervals.
              * mmio: how many HW writes actually fired in the last second
              *   (after the cache-skip guards).  Saturation shows up here.
              * pump: intervals between of_midi_pump() calls; "brst" counts
              *   pumps that fired >1 tick (ticks bursting) and "over"
-             *   counts pumps that blew the tick_budget (catch-up dropped).
-             * dFC: max single-tick cutoff jump in Q0.16 (0..65535); big
-             *   numbers → bigger SVF transients / audible zipper. */
+             *   counts pumps that blew the tick_budget (catch-up dropped). */
             unsigned pmin = (s.pump_interval_min_us == 0xFFFFFFFFu)
                               ? 0u : s.pump_interval_min_us;
-            /* Phase 2: sample AWE's 1 kHz tick counter once per probe
-             * interval.  At 1 s cadence the delta should be ~1000. */
-            static uint32_t last_awe_tick;
-            uint32_t awe_tick = of_awe_tick_count();
-            uint32_t awe_dt   = awe_tick - last_awe_tick;
-            last_awe_tick = awe_tick;
-            printf("\033[20;2H mmio: filt=%5u rate=%5u vol=%5u  awe_tick=%u (+%u) ",
+            printf("\033[20;2H mmio: filt=%5u rate=%5u vol=%5u           ",
                    (unsigned)s.filter_writes,
                    (unsigned)s.rate_writes,
-                   (unsigned)s.vol_writes,
-                   (unsigned)awe_tick, (unsigned)awe_dt);
+                   (unsigned)s.vol_writes);
             printf("\033[21;2H pump: n=%5u int=%u..%uus brst=%u over=%u      ",
                    (unsigned)s.pump_count,
                    pmin, (unsigned)s.pump_interval_max_us,

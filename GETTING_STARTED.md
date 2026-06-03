@@ -5,8 +5,8 @@ Build games for the Analogue Pocket in C or C++. Five minutes from clone to runn
 ## 1. Clone
 
 ```bash
-git clone https://github.com/ThinkElastic/openfpgaOS-SDK.git
-cd openfpgaOS-SDK
+git clone https://github.com/openfpgaOS/openfgpaSDK.git
+cd openfgpaSDK
 ```
 
 ## 2. Setup
@@ -77,7 +77,7 @@ Same code, runs in a window on your computer. Useful for quick iteration.
 After `make core`, your app directory looks like:
 
 ```
-openfpgaOS-SDK/
+openfgpaSDK/
 ├── src/
 │   ├── mygame/              ← YOUR code
 │   │   ├── Makefile
@@ -85,10 +85,9 @@ openfpgaOS-SDK/
 │   │   └── instance.json    ← your app's data slot mapping
 │   ├── sdk/                 ← SDK (don't edit)
 │   │   ├── include/         ← openfpgaOS API (of.h, of_video.h, ...)
-│   │   ├── libc/            ← C standard library
+│   │   ├── musl/            ← bundled musl C library + linker script
 │   │   ├── platforms/       ← platform templates & copy scripts
 │   │   │   └── pocket/      ← Analogue Pocket target
-│   │   └── crt/             ← startup code & linker script
 │   └── apps/                ← bundled demo apps (reference code)
 ├── dist/sdk/                ← SDK core configs (SDK-owned, auto-deployed)
 ├── runtime/                 ← FPGA bitstream, OS binary, loader
@@ -145,6 +144,7 @@ To add data files (up to 4), add entries for slots 3-6:
 ```
 
 Place the data files in your app directory alongside `main.c`. They get copied to the SD card automatically.
+Slot 7 is reserved for an optional `.ofsf` SoundFont bank. Slot 8 is SDK/system shared config; do not use it for app data or saves.
 
 ## Writing your app
 
@@ -179,7 +179,7 @@ Add more `.c` or `.cpp` files — they're picked up automatically.
 ## What's available
 
 - **Video:** 320x240, 6 color modes (8/4/2-bit indexed, RGB565/555/RGBA5551), double-buffered
-- **Audio:** 48 kHz stereo PCM, 18-channel OPL3 FM synthesis, MIDI playback, PCM mixer
+- **Audio:** 48 kHz stereo PCM, 32-voice hardware PCM mixer, sample-based MIDI playback
 - **Input:** D-pad, face buttons, shoulders, triggers, analog sticks, 2 players
 - **Files:** Standard `fopen`/`fread`/`fwrite` with 4 data slots
 - **Saves:** 10 persistent save slots (256 KB each)
@@ -213,5 +213,5 @@ Core configs, runtime binaries, and SDK headers update automatically. Your app's
 ## Next steps
 
 - Browse `src/apps/` for example code (raytracer, Celeste, MIDI player, ...)
-- Run `make demos` from the repo root to build all demo apps
+- Run `make` from `src/apps/` to build all demo apps
 - See [README.md](README.md) for the full API reference, UART development, and advanced topics

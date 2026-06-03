@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * test_midi.c — of_midi engine tests (MD.xx)
  *
@@ -547,7 +553,7 @@ static uint32_t build_guitar_bass_snare_midi(uint8_t *out) {
     return hlen + append_mtrk(out + hlen, track, t);
 }
 
-/* Build a Format 1 MIDI with many tracks (Duke3D MIDIs use 8-16 tracks). */
+/* Build a Format 1 MIDI with many tracks. */
 static uint32_t build_many_tracks_midi(uint8_t *out) {
     int hlen = sizeof(mthd_fmt1);
     for (int i = 0; i < hlen; i++) out[i] = mthd_fmt1[i];
@@ -696,7 +702,7 @@ void test_midi(void) {
         ASSERT("MD.11 reject", rc != OF_MIDI_OK);
     }
 
-    /* MD.13: rapid play/stop cycles (simulates Duke3D level transitions) */
+    /* MD.13: rapid play/stop cycles */
     {
         uint32_t len = build_simple_midi(midi_buf, 1);
         for (int cycle = 0; cycle < 5; cycle++) {
@@ -739,8 +745,7 @@ md13_done:;
         ASSERT("MD.17b ended", !of_midi_playing());
     }
 
-    /* MD.18: control change events (volume, pan, expression).
-     * Duke3D MIDIs use CC7 for channel volume balancing. */
+    /* MD.18: control change events (volume, pan, expression). */
     {
         uint32_t len = build_cc_midi(midi_buf);
         rc = of_midi_play(midi_buf, len, 0);
@@ -760,8 +765,7 @@ md13_done:;
         ASSERT("MD.19b ended", !of_midi_playing());
     }
 
-    /* MD.20: 16-channel polyphony — all GM channels playing at once.
-     * Duke3D MIDIs use up to 16 channels. */
+    /* MD.20: 16-channel polyphony — all GM channels playing at once. */
     {
         uint32_t len = build_16ch_midi(midi_buf);
         rc = of_midi_play(midi_buf, len, 0);
@@ -843,7 +847,7 @@ md13_done:;
         ASSERT("MD.28b ended", !of_midi_playing());
     }
 
-    /* MD.29: Format 1 with 8 tracks (Duke3D MIDIs are typically 8-16 tracks). */
+    /* MD.29: Format 1 with 8 tracks. */
     {
         uint32_t len = build_many_tracks_midi(midi_buf);
         rc = of_midi_play(midi_buf, len, 0);
@@ -950,13 +954,13 @@ md13_done:;
  *
  * Tests the sample-based MIDI backend: bank loading, zone lookup,
  * mixer voice allocation, and audible playback via hardware mixer.
- * Requires bank.ofsf in data slot 4.
+ * Requires bank.ofsf in data slot 7 (the reserved Sound Bank slot).
  * ================================================================ */
 
 void test_midi_smp(void) {
     section_start("MIDI Smp");
 
-    of_mixer_init(48, OF_MIXER_OUTPUT_RATE);
+    of_mixer_init(OF_MIXER_MAX_VOICES, OF_MIXER_OUTPUT_RATE);
     of_mixer_set_master_volume(255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, 255);
 

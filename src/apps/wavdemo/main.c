@@ -1,12 +1,27 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
- * openfpgaOS WAV Player Demo
+ * wavdemo — load a PCM WAV and play it through the hardware mixer
  *
- * Loads a WAV file from data slot 3 into CRAM1, plays it through
- * the 32-voice hardware mixer. Progress bar updated via timer interrupt.
+ * Canonical example of:
+ *   - Reading a binary file via fopen("slot:N", "rb") + fread
+ *   - of_mixer_alloc_samples for grabbing space from the SDRAM sample
+ *     pool that the HW mixer reads via its own AXI master
+ *   - of_mixer_play / of_mixer_stop on a single voice
+ *   - of_timer_set_callback for a 30 Hz progress-bar update — the ISR
+ *     just sets a `volatile` dirty flag; the redraw runs in main()
+ *     so we never call printf from interrupt context
+ *
+ * The WAV must be 8 or 16-bit PCM, mono or stereo (stereo gets folded
+ * to mono on load — the mixer voice channel is mono-source plus pan).
  *
  * Controls:
- *   START  = play/pause
- *   SELECT = restart
+ *   START   play / pause
+ *   SELECT  restart from the beginning
  */
 
 #include "of.h"
@@ -15,13 +30,18 @@
 #include <stdio.h>
 #include <string.h>
 
-#define WAV_SLOT_ID     3
 #define MAX_WAV_SIZE    (4 * 1024 * 1024)
 
-/* WAV loaded into SDRAM first, then converted to CRAM1 */
+/* WAV file lives in BSS; large but fine — BSS is in SDRAM and
+ * zero-initialised at app start.  Kept aligned(4) so the WAV header
+ * 32-bit reads (fmt/sample_rate/byte_rate) hit aligned addresses on
+ * any compiler. */
 static uint8_t wav_buf[MAX_WAV_SIZE] __attribute__((aligned(4)));
 
-/* Sample buffer (allocated from kernel CRAM1 pool) */
+/* Sample data lives in the kernel-managed sample pool (SDRAM @
+ * OF_TARGET_SAMPLE_BASE).  The HW mixer reads this region via its
+ * own AXI master, bypassing the CPU D-cache, so the of_mixer_*
+ * helpers handle the cache-flush dance internally. */
 static int16_t *sample_buf;
 
 /* Playback state (accessed from ISR) */
@@ -48,6 +68,9 @@ typedef struct {
 
 static uint16_t read16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+static int16_t read_s16(const uint8_t *p) {
+    return (int16_t)read16(p);
 }
 static uint32_t read32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -116,9 +139,11 @@ int main(void) {
     printf("  WAV Player Demo\n\n");
     printf("  Loading WAV file...\n");
 
-    /* Loads from data slot 3; filename-based fopen requires SDK plumbing
-     * of_file_get_name from the OS, which is not wired up yet. */
-    FILE *f = fopen("slot:3", "rb");
+    /* This app's instance.json maps slot:4 to the WAV file.  We use
+     * the literal `slot:4` path here for portability — apps that want
+     * filename-based opens can use of_file_slot_register(4, "song.wav")
+     * before fopen("song.wav", "rb"). */
+    FILE *f = fopen("slot:4", "rb");
     if (!f) {
         printf("  Error: cannot open WAV\n");
         while (1) usleep(100 * 1000);
@@ -161,8 +186,10 @@ int main(void) {
     for (uint32_t i = 0; i < total_samples; i++) {
         int16_t s;
         if (wav.bits_per_sample == 16) {
-            const int16_t *pcm = (const int16_t *)(wav.data + i * wav.block_align);
-            s = (wav.channels >= 2) ? (int16_t)(((int32_t)pcm[0] + pcm[1]) >> 1) : pcm[0];
+            const uint8_t *pcm = wav.data + i * wav.block_align;
+            int16_t l = read_s16(pcm);
+            int16_t r = (wav.channels >= 2) ? read_s16(pcm + 2) : l;
+            s = (wav.channels >= 2) ? (int16_t)(((int32_t)l + r) >> 1) : l;
         } else {
             const uint8_t *pcm = wav.data + i * wav.block_align;
             s = (wav.channels >= 2)
@@ -172,15 +199,18 @@ int main(void) {
         sample_buf[i] = s;
     }
 
-    /* Verify CRAM1 data integrity */
+    /* Verify the conversion landed correctly in the sample pool —
+     * cheap sanity check that the SDRAM writeback path is clean. */
     puts("  Verifying...");
     uint32_t errors = 0;
     uint32_t first_err = 0;
     for (uint32_t i = 0; i < total_samples; i++) {
         int16_t exp;
         if (wav.bits_per_sample == 16) {
-            const int16_t *pcm = (const int16_t *)(wav.data + i * wav.block_align);
-            exp = (wav.channels >= 2) ? (int16_t)(((int32_t)pcm[0] + pcm[1]) >> 1) : pcm[0];
+            const uint8_t *pcm = wav.data + i * wav.block_align;
+            int16_t l = read_s16(pcm);
+            int16_t r = (wav.channels >= 2) ? read_s16(pcm + 2) : l;
+            exp = (wav.channels >= 2) ? (int16_t)(((int32_t)l + r) >> 1) : l;
         } else {
             const uint8_t *pcm = wav.data + i * wav.block_align;
             exp = (wav.channels >= 2)

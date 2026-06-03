@@ -1,3 +1,9 @@
+#------------------------------------------------------------------------------
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileType: SOURCE
+# SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+#------------------------------------------------------------------------------
+
 # openfpgaOS SDK — SDK apps
 #
 # This Makefile drives the "SDK app" build path: every app under
@@ -52,7 +58,8 @@ release:
 	@for app in $(APPS); do \
 		[ -f "$(SDK_ROOT)/.obj/sdk/$$app/app.elf" ] && \
 			cp "$(SDK_ROOT)/.obj/sdk/$$app/app.elf" "$(BUILD)/Assets/$(PLATFORM)/common/$$app.elf"; \
-		for f in $$app/*.mid $$app/*.mod $$app/*.wav $$app/*.dat $$app/*.png; do \
+		for f in $$app/*.mid $$app/*.mod $$app/*.wav $$app/*.dat $$app/*.png \
+		         $$app/*.bin $$app/*.cfg $$app/*.iso; do \
 			[ -f "$$f" ] && cp "$$f" "$(BUILD)/Assets/$(PLATFORM)/common/"; \
 		done; \
 	done 2>/dev/null; true

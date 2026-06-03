@@ -1,13 +1,34 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
- * moddemo — Minimal 4-channel MOD player for openfpgaOS
+ * moddemo — minimal 4-channel ProTracker MOD player
  *
- * All mixing in FPGA hardware. CPU only:
- *   1. Parses MOD header, uploads 8-bit samples to CRAM1
- *   2. Reads pattern data and updates voice registers at tick rate
- *   3. Computes effects (portamento, volume slide, arpeggio) in software
+ * Canonical example of:
+ *   - Mapping a tracker channel to a *pinned* hardware mixer voice via
+ *     of_mixer_play (note-on) + of_mixer_retrigger (subsequent notes).
+ *     Stop+play would let the allocator re-pick the slot and channels
+ *     would steal each other — see project memory `mod_voice_pinning`.
+ *   - Uploading 8-bit signed samples to the SDRAM sample pool with
+ *     of_mixer_alloc_samples (the kernel handles the cache flush so
+ *     the HW mixer's AXI master sees committed bytes)
+ *   - Per-voice rate updates with of_mixer_set_rate_raw (Q16.16) on
+ *     the tracker's tick boundary — no per-sample CPU mixing
  *
- * Loads MOD files from data slots 3 and 4.
- * Press A to switch songs, B to skip to next pattern.
+ * The CPU runs the tracker engine (period table, effect column,
+ * volume slides, arpeggios) at ~50 Hz; everything per-sample is the
+ * HW mixer's job.  This is what makes a MOD demo cheap on Pocket.
+ *
+ * Slot map (per instance.json):
+ *   slot:4  primary MOD file
+ *   slot:5  alternate MOD file (A button switches)
+ *
+ * Controls:
+ *   A   switch between slot:4 and slot:5
+ *   B   skip to next pattern in the song
  */
 
 #include "of.h"
@@ -16,6 +37,14 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+
+static void mod_idle_wait(void) {
+#ifdef OF_PC
+    usleep(1000);
+#else
+    __asm__ volatile("wfi");
+#endif
+}
 
 /* ======================================================================
  * MOD format structures
@@ -50,7 +79,7 @@ typedef struct {
     uint8_t      order[MOD_MAX_PATTERNS];
     int          num_patterns;
     uint8_t     *pattern_data;  /* raw pattern bytes */
-    int8_t      *sample_data[MOD_NUM_SAMPLES]; /* pointers into CRAM1 */
+    int8_t      *sample_data[MOD_NUM_SAMPLES]; /* pointers into SDRAM sample pool */
 } mod_file_t;
 
 /* ======================================================================
@@ -66,13 +95,6 @@ static const uint16_t period_table[36] = {
 /* Convert Amiga period to playback rate in Hz.
  * Amiga base clock = 7093789.2 Hz (PAL), period is clock divider. */
 #define AMIGA_CLOCK 7093789
-
-/* Amiga-style low-pass: the A500 output stage rolled off around 7 kHz
- * (LED filter off).  SVF cutoff is Q0.16 where 65535 = Nyquist (24 kHz).
- * 7 kHz → 7000/24000 × 65536 ≈ 19115.  A touch of resonance (Q ≈ 20)
- * adds a slight presence bump at the cutoff. */
-#define MOD_LPF_CUTOFF  35000
-#define MOD_LPF_Q       80
 
 /* Pre-computed 16.16 fixed-point rates for each period */
 static uint32_t period_to_rate_fp16(uint16_t period) {
@@ -201,7 +223,7 @@ static int parse_mod(mod_file_t *m, const uint8_t *data, uint32_t len) {
     /* Sample data follows patterns */
     uint32_t sample_offset = 1084 + m->num_patterns * MOD_ROWS_PER_PAT * MOD_NUM_CHANNELS * 4;
 
-    /* Upload samples to CRAM1, converting 8-bit signed → 16-bit signed.
+    /* Upload samples to the SDRAM mixer pool, converting 8-bit signed to 16-bit signed.
      * The hardware mixer expects 16-bit samples via of_mixer_play. */
     for (int i = 0; i < MOD_NUM_SAMPLES; i++) {
         uint32_t slen = m->samples[i].length;
@@ -217,7 +239,7 @@ static int parse_mod(mod_file_t *m, const uint8_t *data, uint32_t len) {
         /* Allocate 2 bytes per sample (16-bit) */
         int16_t *cram = (int16_t *)of_mixer_alloc_samples(slen * 2);
         if (!cram) {
-            printf("CRAM1 full at sample %d\n", i + 1);
+            printf("sample pool full at sample %d\n", i + 1);
             m->sample_data[i] = NULL;
             continue;
         }
@@ -261,10 +283,8 @@ static int playing = 1;
 static int pattern_break = 0;     /* set by effect 0xD/0xB to prevent double-break */
 static int pattern_delay = 0;     /* EEx: extra row repeats remaining */
 
-/* Pre-allocate one mixer voice per MOD channel — just like the Amiga
- * Paula chip, which had 4 fixed DMA channels.  Voices are never freed
- * or reallocated, so there is zero risk of voice stealing. */
-/* Trigger (or retrigger) the current sample on a channel */
+/* channels[ch].voice is hard-pinned to `ch` (Paula-style); we always
+ * retrigger that slot, never alloc, so channels can't steal each other. */
 static void trigger_note(channel_t *c, uint16_t period, int sample_offset) {
     c->period = period;
     c->rate_fp16 = period_to_rate_fp16(period);
@@ -277,19 +297,19 @@ static void trigger_note(channel_t *c, uint16_t period, int sample_offset) {
         int offset_bytes = sample_offset * 256;  /* 9xx: offset in 256-byte units, ×2 for 16-bit */
         if (offset_bytes >= (int)s->length) offset_bytes = 0;
 
-        if (c->voice >= 0)
-            of_mixer_stop(c->voice);
-        c->voice = of_mixer_play((const uint8_t *)mod->sample_data[si] + offset_bytes * 2,
-                                 s->length - offset_bytes,
-                                 AMIGA_CLOCK / (period * 2), 0, vol);
+        const uint8_t *pcm = (const uint8_t *)mod->sample_data[si] + offset_bytes * 2;
+        uint32_t scnt = s->length - offset_bytes;
+        uint32_t srate = AMIGA_CLOCK / (period * 2);
 
-        if (c->voice >= 0) {
-            if (s->loop_length > 2) {
-                int ls = s->loop_start - offset_bytes;
-                if (ls < 0) ls = 0;
-                of_mixer_set_loop(c->voice, ls, ls + (int)s->loop_length);
-            }
-            of_mixer_set_filter(c->voice, MOD_LPF_CUTOFF, MOD_LPF_Q, 1);
+        of_mixer_retrigger(c->voice, pcm, scnt, srate, vol);
+
+        if (s->loop_length > 2) {
+            int ls = s->loop_start - offset_bytes;
+            if (ls < 0) ls = 0;
+            of_mixer_set_loop(c->voice, ls, ls + (int)s->loop_length);
+        } else {
+            /* Slot may have looped on the previous sample — clear the bit. */
+            of_mixer_set_loop(c->voice, -1, 0);
         }
     }
 }
@@ -579,8 +599,22 @@ static void update_hardware(void) {
 
 static volatile int tick_pending = 0;
 
+/* The kernel pins of_timer_set_callback at a 1 kHz HW tick regardless
+ * of the requested hz, so divide down here to the MOD tick rate. */
+static volatile uint32_t tick_accum_ms = 0;
+static volatile uint32_t tick_period_ms = 20;  /* BPM 125 → 50 Hz → 20 ms */
+
 static void mod_timer_tick(void) {
-    tick_pending = 1;
+    if (++tick_accum_ms >= tick_period_ms) {
+        tick_accum_ms = 0;
+        tick_pending = 1;
+    }
+}
+
+static inline void set_mod_rate_from_bpm(int bpm_val) {
+    uint32_t ms = (bpm_val > 0) ? (uint32_t)(2500 / bpm_val) : 20u;
+    if (ms == 0) ms = 1;
+    tick_period_ms = ms;
 }
 
 static void process_tick(void) {
@@ -669,10 +703,11 @@ static void run_effect_test(int idx) {
     if (!mod || !mod->sample_data[0]) return;
     const effect_test_t *t = &effect_tests[idx];
 
-    /* Reset channel 0 */
+    /* Reset channel 0 but keep its pinned voice slot so retrigger has
+     * a valid target. */
     channel_t *c = &channels[0];
     memset(c, 0, sizeof(*c));
-    c->voice = -1;
+    c->voice = 0;
     c->pan = 128;
     c->sample_idx = 1;
 
@@ -765,8 +800,8 @@ static void run_effect_test(int idx) {
         }
     }
 
-    if (c->voice >= 0) of_mixer_stop(c->voice);
-    c->voice = -1;
+    of_mixer_stop(c->voice);
+    /* The SELECT-toggle handler will restore channel state on return. */
 }
 
 /* ======================================================================
@@ -780,8 +815,8 @@ int main(void) {
     /* Initialize mixer */
     of_mixer_init(32, OF_MIXER_OUTPUT_RATE);
 
-    /* Load MOD files from slots 3 and 4 */
-    static const char *slot_names[] = { "slot:3", "slot:4" };
+    /* Load MOD files from slots 4 and 5 */
+    static const char *slot_names[] = { "slot:4", "slot:5" };
     static uint8_t *file_bufs[MAX_SONGS];
     (void)file_bufs;  /* kept alive so pattern_data pointers remain valid */
 
@@ -811,7 +846,7 @@ int main(void) {
     }
 
     if (num_songs == 0) {
-        printf("No valid MOD files found in slots 3-4.\n");
+        printf("No valid MOD files found in slots 4-5.\n");
         for (;;) usleep(100000);
     }
 
@@ -819,17 +854,21 @@ int main(void) {
     cur_song = 0;
     mod = &songs[cur_song];
 
-    /* Initialize channels */
+    /* Initialize channels — pin each MOD channel to a fixed mixer
+     * voice slot (0..3) for the lifetime of the app.  Voices are
+     * activated in-place via of_mixer_retrigger, never reallocated. */
     for (int i = 0; i < MOD_NUM_CHANNELS; i++) {
-        channels[i].voice = -1;
+        channels[i].voice = i;
         channels[i].pan = default_pan[i];
         channels[i].volume = 0;
     }
 
-    /* Start tick timer: MOD tick rate = BPM * 2 / 5 */
-    int tick_hz = (bpm * 2) / 5;
-    printf("Tick rate: %d Hz (BPM=%d, speed=%d)\n", tick_hz, bpm, ticks_per_row);
-    of_timer_set_callback(mod_timer_tick, tick_hz);
+    /* MOD tick rate = BPM * 2 / 5.  HW timer is pinned at 1 kHz;
+     * mod_timer_tick divides down to tick_period_ms. */
+    set_mod_rate_from_bpm(bpm);
+    printf("Tick rate: %d Hz (BPM=%d, speed=%d)\n",
+           (bpm * 2) / 5, bpm, ticks_per_row);
+    of_timer_set_callback(mod_timer_tick, 1000);
 
     printf("\nA=next song B=next pattern SELECT=effects\n\n");
 
@@ -868,70 +907,59 @@ int main(void) {
         printf("HW test done\n");
     }
 
-    int mode = 0;  /* 0=play, 1=effect diag */
+    int mode = 0;  /* 0 = play, 1 = effect diag */
     int diag_idx = 0;
 
-    /* Display loop */
-    int display_counter = 0;
+    /* Main loop.  On target, sleep with wfi between timer ISRs so MIE stays
+     * on; usleep would ECALL into a kernel busy-wait with MIE cleared and
+     * silently drop most of the 1 kHz timer fires. */
+    int display_throttle = 0;
     for (;;) {
-        /* Process pending tick from timer ISR (play mode only) */
         if (mode == 0 && tick_pending) {
             tick_pending = 0;
             process_tick();
-
-            /* Update timer rate if BPM changed */
-            int new_hz = (bpm * 2) / 5;
-            if (new_hz != tick_hz) {
-                tick_hz = new_hz;
-                of_timer_set_callback(mod_timer_tick, tick_hz);
-            }
+            set_mod_rate_from_bpm(bpm);  /* Fxx may have changed bpm */
         }
 
-        /* Poll input and update display at ~30 Hz (not every tick) */
-        display_counter++;
-        if (display_counter >= 2) {
-            display_counter = 0;
+        /* Poll input + status print at ~10 Hz.  Each printf is a heavy
+         * ECALL (synchronous UART/FB writes run with MIE off), so keep
+         * them infrequent to avoid losing timer ISRs. */
+        display_throttle++;
+        if (display_throttle >= 100) {
+            display_throttle = 0;
 
             of_input_poll();
 
-            /* SELECT toggles between play and effect diagnostic mode */
             if (of_btn_pressed(OF_BTN_SELECT)) {
                 of_mixer_stop_all();
-                for (int i = 0; i < MOD_NUM_CHANNELS; i++)
-                    channels[i].voice = -1;
+                for (int i = 0; i < MOD_NUM_CHANNELS; i++) {
+                    channels[i].voice = i;
+                    channels[i].pan = default_pan[i];
+                    channels[i].volume = 0;
+                }
                 mode = !mode;
                 if (mode == 0) {
-                    current_order = 0;
-                    current_row = 0;
-                    current_tick = 0;
+                    current_order = current_row = current_tick = 0;
                     ticks_per_row = 6;
                     bpm = 125;
-                    tick_hz = (bpm * 2) / 5;
-                    of_timer_set_callback(mod_timer_tick, tick_hz);
+                    set_mod_rate_from_bpm(bpm);
                 }
                 printf("\r\033[K %s\n", mode ? "EFFECT DIAGNOSTICS" : "PLAY MODE");
             }
 
             if (mode == 0) {
-                /* Play mode controls */
                 if (of_btn_pressed(OF_BTN_A) && num_songs > 1) {
                     of_mixer_stop_all();
-                    for (int i = 0; i < MOD_NUM_CHANNELS; i++)
-                        channels[i].voice = -1;
                     cur_song = (cur_song + 1) % num_songs;
                     mod = &songs[cur_song];
-                    current_order = 0;
-                    current_row = 0;
-                    current_tick = 0;
+                    current_order = current_row = current_tick = 0;
                     ticks_per_row = 6;
                     bpm = 125;
-                    tick_hz = (bpm * 2) / 5;
-                    of_timer_set_callback(mod_timer_tick, tick_hz);
+                    set_mod_rate_from_bpm(bpm);
                     printf("\r\033[K>>> Song %d: %s\n", cur_song + 1, mod->title);
                 }
                 if (of_btn_pressed(OF_BTN_B)) {
-                    current_row = 0;
-                    current_tick = 0;
+                    current_row = current_tick = 0;
                     current_order++;
                     if (current_order >= mod->song_length)
                         current_order = 0;
@@ -940,7 +968,6 @@ int main(void) {
                        cur_song + 1, current_order, mod->order[current_order],
                        current_row, ticks_per_row, bpm);
             } else {
-                /* Effect diagnostic controls */
                 int changed = -1;
                 if (of_btn_pressed(OF_BTN_RIGHT))
                     changed = (diag_idx + 1) % (int)NUM_EFFECT_TESTS;
@@ -961,7 +988,6 @@ int main(void) {
             }
         }
 
-        /* Sleep until next tick (~20ms at 50Hz default) */
-        usleep(5000);
+        mod_idle_wait();
     }
 }
