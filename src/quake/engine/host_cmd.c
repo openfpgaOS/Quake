@@ -691,6 +691,18 @@ qboolean Host_ReadSavegameHeader (FILE *f, char *comment, qboolean *wrong_game)
 }
 
 
+
+/* Map a console save name to a bound slot: accepts "sN" or "sN.sav",
+ * N = 0..9 — the only persistable save files on this platform. */
+static int Host_SaveSlotForName (const char *arg)
+{
+	if ((arg[0] == 's' || arg[0] == 'S') &&
+		arg[1] >= '0' && arg[1] <= '9' &&
+		(arg[2] == '\0' || !Q_strcasecmp ((char *)arg + 2, ".sav")))
+		return arg[1] - '0';
+	return -1;
+}
+
 /*
 ===============
 Host_Savegame_f
@@ -745,11 +757,18 @@ void Host_Savegame_f (void)
 		}
 	}
 
-	sprintf (name, "%s/%s", com_gamedir, Cmd_Argv(1));
-	COM_DefaultExtension (name, ".sav");
-	
-	Con_Printf ("Saving game to %s...\n", name);
-	f = fopen (name, "w");
+	{
+		int slot = Host_SaveSlotForName (Cmd_Argv(1));
+		if (slot < 0)
+		{
+			Con_Printf ("Saves use slots s0..s9 on this platform.\n");
+			return;
+		}
+		sprintf (name, "s%i.sav", slot);
+		Con_Printf ("Saving game to %s...\n", name);
+		CDAudio_PostponeResume (1000);	/* keep the slot bridge quiet for the write */
+		f = Sys_OpenSaveSlot (slot, "w");
+	}
 	if (!f)
 	{
 		Con_Printf ("ERROR: couldn't open.\n");
@@ -781,6 +800,9 @@ void Host_Savegame_f (void)
 		fflush (f);
 	}
 	fclose (f);
+	/* fclose returns before the kernel/SD writeback necessarily settles;
+	 * don't let the music streamer touch the bridge until it has. */
+	CDAudio_PostponeResume (2000);
 	Con_Printf ("done.\n");
 }
 
@@ -814,15 +836,22 @@ void Host_Loadgame_f (void)
 
 	cls.demonum = -1;		// stop demo loop in case this fails
 
-	sprintf (name, "%s/%s", com_gamedir, Cmd_Argv(1));
-	COM_DefaultExtension (name, ".sav");
-	
 // we can't call SCR_BeginLoadingPlaque, because too much stack space has
 // been used.  The menu calls it before stuffing loadgame command
 //	SCR_BeginLoadingPlaque ();
 
-	Con_Printf ("Loading game from %s...\n", name);
-	f = fopen (name, "r");
+	{
+		int slot = Host_SaveSlotForName (Cmd_Argv(1));
+		if (slot < 0)
+		{
+			Con_Printf ("Saves use slots s0..s9 on this platform.\n");
+			goto load_fail;
+		}
+		sprintf (name, "s%i.sav", slot);
+		Con_Printf ("Loading game from %s...\n", name);
+		CDAudio_PostponeResume (1000);	/* keep the slot bridge quiet for the read */
+		f = Sys_OpenSaveSlot (slot, "r");
+	}
 	if (!f)
 	{
 		Con_Printf ("ERROR: couldn't open.\n");
@@ -963,6 +992,7 @@ void SaveGamestate()
 	sprintf (name, "%s/%s.gip", com_gamedir, sv.name);
 	
 	Con_Printf ("Saving game to %s...\n", name);
+	CDAudio_DrainAsync ();	/* free the slot bridge before a blocking open */
 	f = fopen (name, "w");
 	if (!f)
 	{
@@ -1019,6 +1049,7 @@ int LoadGamestate(char *level, char *startspot)
 	sprintf (name, "%s/%s.gip", com_gamedir, level);
 	
 	Con_Printf ("Loading game from %s...\n", name);
+	CDAudio_DrainAsync ();	/* free the slot bridge before a blocking open */
 	f = fopen (name, "r");
 	if (!f)
 	{

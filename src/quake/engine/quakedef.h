@@ -24,7 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define	QUAKE_GAME			// as opposed to utilities
 
 #define	VERSION				1.09
-#define	QUAKE_CORE_VERSION	"1.0.2"
+#define	QUAKE_CORE_VERSION	"1.0.3"
 #define	QUAKE_CORE_DISPLAY_VERSION	"Quake 3.0 " QUAKE_CORE_VERSION
 #define	GLQUAKE_VERSION		1.00
 #define	D3DQUAKE_VERSION	0.01

@@ -27,6 +27,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 float           surfscale;
 qboolean        r_cache_thrash;         // set if surface cache is thrashing
 
+/* [surf] trace: rebuild time + count, accumulated only on the miss path */
+extern cvar_t   host_speeds;
+extern float    r_t_surfcache;
+extern int      r_c_surfmiss;
+
 int                                     sc_size;
 surfcache_t                     *sc_rover, *sc_base;
 
@@ -376,6 +381,9 @@ PQ_FASTTEXT surfcache_t *D_CacheSurface (msurface_t *surface, int miplevel)
 			&& cache->lightadj[3] == r_drawsurf.lightadj[3] )
 		return cache;
 
+	/* miss path — rebuild the lit surface block ([surf] cache bucket) */
+	float _ts = host_speeds.value ? Sys_FloatTime () : 0;
+
 //
 // determine shape of surface
 //
@@ -435,6 +443,12 @@ PQ_FASTTEXT surfcache_t *D_CacheSurface (msurface_t *surface, int miplevel)
 	                   r_drawsurf.surfwidth * r_drawsurf.surfheight);
 	cache->gpu_dirty = 0;
 #endif
+
+	if (host_speeds.value)
+	{
+		r_t_surfcache += Sys_FloatTime () - _ts;
+		r_c_surfmiss++;
+	}
 
 	return surface->cachespots[miplevel];
 }

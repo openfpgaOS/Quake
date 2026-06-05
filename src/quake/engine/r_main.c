@@ -25,23 +25,21 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "of_emit.h"
 #include "sysreg_stub.h"
 
-/* Legacy Pocket MMIO that held the terminal-vs-framebuffer toggle.
- * Route writes to a dead sink; the SDK exposes the real toggle via
- * of_video_set_display_mode which VID_Shutdown already calls. */
-static unsigned int _of_display_mode_sink;
-#define SYS_DISPLAY_MODE _of_display_mode_sink
-
 //define	PASSAGES
 
 void		*colormap;
 vec3_t		viewlightvec;
 alight_t	r_viewlighting = {128, 192, viewlightvec};
-float		r_time1;
 int			r_numallocatededges;
 qboolean	r_drawpolys;
 qboolean	r_drawculledpolys;
 qboolean	r_worldpolysbacktofront;
-qboolean	r_recursiveaffinetriangles = false;
+/* Distant alias models (trivial_accept == 3) render via recursive vertex
+ * subdivision instead of the full gradient/edge-walk rasterizer — stock
+ * WinQuake behaviour.  This was disabled while the subdiv path emitted one
+ * GPU ring command per pixel; now that it does direct uncached FB stores
+ * it skips ~300 cycles of per-triangle setup for tiny far-away triangles. */
+qboolean	r_recursiveaffinetriangles = true;
 int			r_pixbytes = 1;
 float		r_aliasuvscale = 1.0f;
 int			r_outofsurfaces;
@@ -119,192 +117,11 @@ float		r_aliastransition, r_resfudge;
 
 int		d_lightstylevalue[256];	// 8.8 fraction of base light value
 
-float	dp_time1, dp_time2, db_time1, db_time2, rw_time1, rw_time2;
-float	se_time1, se_time2, de_time1, de_time2, dv_time1, dv_time2;
-
 void R_MarkLeaves (void);
 
-extern unsigned int pq_prof_spans8_cycles_frame;
-extern unsigned int pq_prof_spans8_calls_frame;
-extern unsigned int pq_prof_zspans_cycles_frame;
-extern unsigned int pq_prof_zspans_calls_frame;
-/* R_ScanEdges sub-profiling (from r_edge.c) */
-extern unsigned int pq_prof_se_insert_cycles;
-extern unsigned int pq_prof_se_generate_cycles;
-extern unsigned int pq_prof_se_step_cycles;
-extern unsigned int pq_prof_se_draw_cycles;
-extern unsigned int pq_prof_se_remove_cycles;   /* per-scanline R_RemoveEdges_Array */
-extern unsigned int pq_prof_se_final_cycles;    /* post-loop final-scan flush */
-/* GPU-utilisation probe (from vid_of.c) */
-extern unsigned int pq_prof_gpu_wait_cycles;    /* of_emit_finish blocking time */
-extern unsigned int pq_prof_video_flip_cycles;  /* of_video_flip duration */
-extern unsigned int pq_gpu_batch_flushes_frame;
-extern unsigned int pq_gpu_batch_spans_frame;
-extern unsigned int pq_gpu_batch_words_frame;
-extern unsigned int pq_gpu_cmd_dma_flushes_frame;
-extern unsigned int pq_gpu_dma_waits_frame;
-extern unsigned int pq_gpu_dma_spin_iters_frame;
-extern unsigned int pq_gpu_ring_waits_frame;
-extern unsigned int pq_gpu_ring_spin_iters_frame;
-extern unsigned int pq_gpu_min_ring_free_frame;
-extern unsigned int pq_gpu_ring_free_frame;
-extern unsigned int pq_gpu_status_frame;
-extern unsigned int pq_gpu_rdptr_frame;
-extern unsigned int pq_gpu_wrptr_frame;
-extern unsigned int pq_gpu_fence_frame;
-extern unsigned int pq_gpu_tex_req_frame;
-extern unsigned int pq_gpu_tex_miss_frame;
-extern unsigned int pq_gpu_stall_total_frame;
-extern unsigned int pq_gpu_param_zwrite_spans_frame;
-extern unsigned int pq_gpu_param_ztest_spans_frame;
-extern unsigned int pq_prof_aet_peak;
-extern unsigned int pq_prof_aet_peak_scanline;
-extern unsigned int pq_prof_aet_total_edges;
-extern unsigned int pq_prof_aet_step_max;
-extern unsigned int pq_prof_hw_spans_total;
-extern unsigned int pq_prof_hw_spans_linked;
-extern unsigned int pq_dbg_hw_nspans;
-extern unsigned int pq_dbg_hw_raw[3];
-extern unsigned int pq_dbg_hw_edges;
-extern unsigned int pq_dbg_hw_first_edge;
-extern unsigned int pq_dbg_hw_state;
-extern unsigned int pq_dbg_hw_edges_reg;
 extern int pq_gpu_zwrite_pending;
-/* D_DrawSurfaces sub-profiling (from d_edge.c) */
-extern unsigned int pq_prof_ds_calcgrad_cycles;
-extern unsigned int pq_prof_ds_cachesurf_cycles;
-extern unsigned int pq_prof_ds_sky_cycles;
-/* R_RecursiveWorldNode sub-profiling (from r_bsp.c) */
-extern unsigned int pq_prof_rw_renderface_cycles;
-static unsigned int pq_prof_alias_cycles_frame;
-static unsigned int pq_prof_edge_cycles_frame;
-static unsigned int pq_prof_frame_counter;
-
-/* Mode 2: per-frame cycle counters for additional functions */
-static unsigned int pq_prof_total_cycles_frame;
-static unsigned int pq_prof_zfill_wait_cycles_frame;
-static unsigned int pq_prof_entities_cycles_frame;
-static unsigned int pq_prof_viewmodel_cycles_frame;
-static unsigned int pq_prof_renderworld_cycles_frame;
-static unsigned int pq_prof_scanedges_cycles_frame;
-static unsigned int pq_prof_bentities_cycles_frame;
-
-/* Mode 2: 64-frame accumulators */
-static unsigned int pq_prof_total_accum;
-static unsigned int pq_prof_zfill_wait_accum;
-static unsigned int pq_prof_edge_accum;
-static unsigned int pq_prof_entities_accum;
-static unsigned int pq_prof_viewmodel_accum;
-static unsigned int pq_prof_spans8_accum;
-static unsigned int pq_prof_zspans_accum;
-static unsigned int pq_prof_alias_accum;
-static unsigned int pq_prof_spans8_calls_accum;
-static unsigned int pq_prof_zspans_calls_accum;
-static unsigned int pq_prof_renderworld_accum;
-static unsigned int pq_prof_scanedges_accum;
-static unsigned int pq_prof_bentities_accum;
-static unsigned int pq_prof_se_insert_accum;
-static unsigned int pq_prof_se_generate_accum;
-static unsigned int pq_prof_se_step_accum;
-static unsigned int pq_prof_se_draw_accum;
-static unsigned int pq_prof_se_remove_accum;
-static unsigned int pq_prof_se_final_accum;
-static unsigned int pq_prof_gpu_wait_accum;
-static unsigned int pq_prof_video_flip_accum;
-static unsigned int pq_prof_frame_gap_accum;
-/* FrameGap = wall-clock time between successive R_RenderView_ entries
- * minus Total.  Captures any blocking that happens outside the render
- * window (page flip, audio fill, host loop overhead, etc.). */
-static unsigned int pq_prof_frame_gap_cycles_frame;
-static unsigned int pq_prev_frame_end_cycles;
-static unsigned int pq_prof_aet_peak_accum;
-static unsigned int pq_prof_aet_peak_scanline_accum;
-static unsigned int pq_prof_aet_total_accum;
-static unsigned int pq_prof_aet_step_max_accum;
-static unsigned int pq_prof_hw_spans_total_accum;
-static unsigned int pq_prof_hw_spans_linked_accum;
-static unsigned int pq_prof_ds_calcgrad_accum;
-static unsigned int pq_prof_ds_cachesurf_accum;
-static unsigned int pq_prof_ds_sky_accum;
-static unsigned int pq_prof_rw_renderface_accum;
-
-/* Mode 2: averaged values (updated every 64 frames) */
-static unsigned int pq_prof_avg_total;
-static unsigned int pq_prof_avg_zfill_wait;
-static unsigned int pq_prof_avg_edge;
-static unsigned int pq_prof_avg_entities;
-static unsigned int pq_prof_avg_viewmodel;
-static unsigned int pq_prof_avg_spans8;
-static unsigned int pq_prof_avg_zspans;
-static unsigned int pq_prof_avg_alias;
-static unsigned int pq_prof_avg_spans8_calls;
-static unsigned int pq_prof_avg_zspans_calls;
-static unsigned int pq_prof_avg_renderworld;
-static unsigned int pq_prof_avg_scanedges;
-static unsigned int pq_prof_avg_bentities;
-static unsigned int pq_prof_avg_se_insert;
-static unsigned int pq_prof_avg_se_generate;
-static unsigned int pq_prof_avg_se_step;
-static unsigned int pq_prof_avg_se_remove;
-static unsigned int pq_prof_avg_se_final;
-static unsigned int pq_prof_avg_gpu_wait;
-static unsigned int pq_prof_avg_video_flip;
-static unsigned int pq_prof_avg_frame_gap;
-static unsigned int pq_prof_avg_se_draw;
-static unsigned int pq_prof_avg_aet_peak;
-static unsigned int pq_prof_avg_aet_peak_scanline;
-static unsigned int pq_prof_avg_aet_total;
-static unsigned int pq_prof_avg_aet_step_max;
-static unsigned int pq_prof_avg_hw_spans_total;
-static unsigned int pq_prof_avg_hw_spans_linked;
-static unsigned int pq_prof_avg_ds_calcgrad;
-static unsigned int pq_prof_avg_ds_cachesurf;
-static unsigned int pq_prof_avg_ds_sky;
-static unsigned int pq_prof_avg_rw_renderface;
-
-/* openfpgaOS GPU command-path counters: 64-frame accumulators. */
-static unsigned int pq_gpu_batch_flushes_accum;
-static unsigned int pq_gpu_batch_spans_accum;
-static unsigned int pq_gpu_batch_words_accum;
-static unsigned int pq_gpu_cmd_dma_flushes_accum;
-static unsigned int pq_gpu_dma_waits_accum;
-static unsigned int pq_gpu_dma_spin_iters_accum;
-static unsigned int pq_gpu_ring_waits_accum;
-static unsigned int pq_gpu_ring_spin_iters_accum;
-static unsigned int pq_gpu_min_ring_free_accum;
-static unsigned int pq_gpu_ring_free_accum;
-static unsigned int pq_gpu_status_or_accum;
-static unsigned int pq_gpu_tex_req_accum;
-static unsigned int pq_gpu_tex_miss_accum;
-static unsigned int pq_gpu_stall_total_accum;
-static unsigned int pq_gpu_param_zwrite_spans_accum;
-static unsigned int pq_gpu_param_ztest_spans_accum;
-
-/* openfpgaOS GPU command-path counters: averaged values. */
-static unsigned int pq_gpu_avg_batch_flushes;
-static unsigned int pq_gpu_avg_batch_spans;
-static unsigned int pq_gpu_avg_batch_words;
-static unsigned int pq_gpu_avg_cmd_dma_flushes;
-static unsigned int pq_gpu_avg_dma_waits;
-static unsigned int pq_gpu_avg_dma_spin_iters;
-static unsigned int pq_gpu_avg_ring_waits;
-static unsigned int pq_gpu_avg_ring_spin_iters;
-static unsigned int pq_gpu_avg_min_ring_free;
-static unsigned int pq_gpu_avg_ring_free;
-static unsigned int pq_gpu_avg_status_or;
-static unsigned int pq_gpu_avg_tex_req;
-static unsigned int pq_gpu_avg_tex_miss;
-static unsigned int pq_gpu_avg_stall_total;
-static unsigned int pq_gpu_avg_param_zwrite_spans;
-static unsigned int pq_gpu_avg_param_ztest_spans;
-
-/* Mode tracking for display mode transitions */
-static int pq_prof_prev_mode;
 
 cvar_t	r_draworder = {"r_draworder","0"};
-cvar_t	r_speeds = {"r_speeds","0"};
-cvar_t	r_timegraph = {"r_timegraph","0"};
-cvar_t	r_graphheight = {"r_graphheight","10"};
 cvar_t	r_clearcolor = {"r_clearcolor","2"};
 cvar_t	r_fastsky = {"r_fastsky","0"};
 cvar_t	r_flatwater = {"r_flatwater","0"};
@@ -318,8 +135,6 @@ cvar_t	r_hwspan = {"r_hwspan","1"};
 cvar_t	r_hwzspan = {"r_hwzspan","1"};
 cvar_t	r_hwspan_queue = {"r_hwspan_queue","1"};
 cvar_t	r_gpuworld = {"r_gpuworld","1"};
-cvar_t	r_aliasstats = {"r_polymodelstats","0"};
-cvar_t	r_dspeeds = {"r_dspeeds","0"};
 cvar_t	r_drawflat = {"r_drawflat", "0"};
 cvar_t	r_cullsize = {"r_cullsize", "2"};
 cvar_t	r_ambient = {"r_ambient", "0"};
@@ -331,7 +146,6 @@ cvar_t	r_maxedges = {"r_maxedges", "0"};
 cvar_t	r_numedges = {"r_numedges", "0"};
 cvar_t	r_aliastransbase = {"r_aliastransbase", "200"};
 cvar_t	r_aliastransadj = {"r_aliastransadj", "100"};
-cvar_t	pq_cycleprof = {"pq_cycleprof", "0"};
 
 extern cvar_t	scr_fov;
 
@@ -394,9 +208,6 @@ void R_Init (void)
 	Cmd_AddCommand ("pointfile", R_ReadPointFile_f);	
 
 	Cvar_RegisterVariable (&r_draworder);
-	Cvar_RegisterVariable (&r_speeds);
-	Cvar_RegisterVariable (&r_timegraph);
-	Cvar_RegisterVariable (&r_graphheight);
 	Cvar_RegisterVariable (&r_drawflat);
 	Cvar_RegisterVariable (&r_cullsize);
 	Cvar_RegisterVariable (&r_ambient);
@@ -413,8 +224,6 @@ void R_Init (void)
 	Cvar_RegisterVariable (&r_hwzspan);
 	Cvar_RegisterVariable (&r_hwspan_queue);
 	Cvar_RegisterVariable (&r_gpuworld);
-	Cvar_RegisterVariable (&r_aliasstats);
-	Cvar_RegisterVariable (&r_dspeeds);
 	Cvar_RegisterVariable (&r_reportsurfout);
 	Cvar_RegisterVariable (&r_maxsurfs);
 	Cvar_RegisterVariable (&r_numsurfs);
@@ -423,7 +232,6 @@ void R_Init (void)
 	Cvar_RegisterVariable (&r_numedges);
 	Cvar_RegisterVariable (&r_aliastransbase);
 	Cvar_RegisterVariable (&r_aliastransadj);
-	Cvar_RegisterVariable (&pq_cycleprof);
 
 	Cvar_SetValue ("r_maxedges", (float)NUMSTACKEDGES);
 	Cvar_SetValue ("r_maxsurfs", (float)NUMSTACKSURFACES);
@@ -812,13 +620,7 @@ PQ_HOT void R_DrawEntitiesOnList (void)
 				if (lighting.ambientlight + lighting.shadelight > 192)
 					lighting.shadelight = 192 - lighting.ambientlight;
 
-				if (pq_cycleprof.value) {
-					unsigned int prof_start = SYS_CYCLE_LO;
-					R_AliasDrawModel (&lighting);
-					pq_prof_alias_cycles_frame += (SYS_CYCLE_LO - prof_start);
-				} else {
-					R_AliasDrawModel (&lighting);
-				}
+				R_AliasDrawModel (&lighting);
 			}
 
 			break;
@@ -1105,167 +907,6 @@ void R_DrawBEntitiesOnList (void)
 
 /*
 ================
-PQ_Prof_DrawTerminal
-================
-*/
-/* Percentage x10 (one decimal place), avoiding 64-bit overflow.
-   Returns (part * 1000) / total. */
-static unsigned int pct10(unsigned int part, unsigned int total)
-{
-	if (total == 0) return 0;
-	return (unsigned int)(((unsigned long long)part * 1000) / total);
-}
-
-static void PQ_Prof_DrawTerminal(void)
-{
-	char line[48];
-	int row = 0;
-	unsigned int p;
-
-	term_clear();
-
-	/* Header */
-	term_setpos(row++, 0);
-	term_puts("---- " QUAKE_CORE_DISPLAY_VERSION " Profiler ----");
-
-	/* Column header */
-	term_setpos(row++, 0);
-	term_puts("Function       Cycles   ms    %");
-
-	/* Total frame */
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "Total      %10u %5u.%u",
-		pq_prof_avg_total,
-		pq_prof_avg_total / 105000,
-		(pq_prof_avg_total / 10500) % 10);
-	term_puts(line);
-
-	/* Helper macro: print a profiler row with percentage */
-#define PROF_ROW(label, val) do { \
-	p = pct10(val, pq_prof_avg_total); \
-	term_setpos(row++, 0); \
-	snprintf(line, sizeof(line), "%-10s %10u %5u.%u %2u.%u", \
-		label, (val), (val) / 105000, ((val) / 10500) % 10, \
-		p / 10, p % 10); \
-	term_puts(line); \
-} while(0)
-
-	PROF_ROW("EdgeDraw",   pq_prof_avg_edge);
-	PROF_ROW(" RndWorld",  pq_prof_avg_renderworld);
-	PROF_ROW("  RndFace",  pq_prof_avg_rw_renderface);
-	PROF_ROW(" ScanEdge",  pq_prof_avg_scanedges);
-	PROF_ROW("  Insert",   pq_prof_avg_se_insert);
-	PROF_ROW("  GenSpan",  pq_prof_avg_se_generate);
-	PROF_ROW("  StepU",    pq_prof_avg_se_step);
-	PROF_ROW("  Remove",   pq_prof_avg_se_remove);
-	PROF_ROW("  DrwSurf",  pq_prof_avg_se_draw);
-	PROF_ROW("   CalcGrd", pq_prof_avg_ds_calcgrad);
-	PROF_ROW("   CachSrf", pq_prof_avg_ds_cachesurf);
-	PROF_ROW("   Spans8",  pq_prof_avg_spans8);
-	PROF_ROW("   ZSpans",  pq_prof_avg_zspans);
-	PROF_ROW("   Sky",     pq_prof_avg_ds_sky);
-	PROF_ROW("  Final",    pq_prof_avg_se_final);
-	{
-		/* SE.Other = ScanEdge total - sum of all named inner buckets.
-		 * Now that Final is bracketed, this should be small —
-		 * captures only outer-loop bookkeeping (AET-peak tracking,
-		 * surfaces[1].spanstate writes, etc.). */
-		unsigned int se_named = pq_prof_avg_se_insert
-		                      + pq_prof_avg_se_generate
-		                      + pq_prof_avg_se_step
-		                      + pq_prof_avg_se_remove
-		                      + pq_prof_avg_se_draw
-		                      + pq_prof_avg_se_final;
-		unsigned int se_other = (pq_prof_avg_scanedges > se_named)
-		                      ? pq_prof_avg_scanedges - se_named : 0;
-		PROF_ROW("  SE.Other", se_other);
-	}
-	PROF_ROW(" BEntiti",   pq_prof_avg_bentities);
-	PROF_ROW("Alias",      pq_prof_avg_alias);
-	PROF_ROW("Entities",   pq_prof_avg_entities);
-	PROF_ROW("ViewModel",  pq_prof_avg_viewmodel);
-	PROF_ROW("Z-clr wt",   pq_prof_avg_zfill_wait);
-	PROF_ROW("GPU wait",   pq_prof_avg_gpu_wait);
-	PROF_ROW("VidFlip",    pq_prof_avg_video_flip);
-	PROF_ROW("FrameGap",   pq_prof_avg_frame_gap);
-
-	/* Other/overhead */
-	unsigned int accounted = pq_prof_avg_edge + pq_prof_avg_entities +
-		pq_prof_avg_viewmodel + pq_prof_avg_zfill_wait;
-	unsigned int other = (pq_prof_avg_total > accounted) ?
-		pq_prof_avg_total - accounted : 0;
-	PROF_ROW("Other",      other);
-#undef PROF_ROW
-
-	/* AET stats + overflow + leaf0 check */
-	term_setpos(row++, 0);
-	{
-		int leaf0 = (r_viewleaf == cl.worldmodel->leafs) ? 1 : 0;
-		snprintf(line, sizeof(line), "AET:%u/%u fc:%d S:%u Z:%u L0:%d",
-			pq_prof_avg_aet_peak,
-			pq_prof_avg_aet_total,
-			c_faceclip,
-			pq_prof_avg_spans8_calls,
-			pq_prof_avg_zspans_calls,
-			leaf0);
-		term_puts(line);
-	}
-
-	/* openfpgaOS GPU command path. */
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "Batch:%u/%u W:%u",
-		pq_gpu_avg_batch_flushes,
-		pq_gpu_avg_batch_spans,
-		pq_gpu_avg_batch_words);
-	term_puts(line);
-
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "Wait D:%u/%u R:%u/%u",
-		pq_gpu_avg_dma_waits,
-		pq_gpu_avg_dma_spin_iters,
-		pq_gpu_avg_ring_waits,
-		pq_gpu_avg_ring_spin_iters);
-	term_puts(line);
-
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "Ring free:%u/%u st:%08x",
-		pq_gpu_avg_min_ring_free,
-		pq_gpu_avg_ring_free,
-		pq_gpu_avg_status_or);
-	term_puts(line);
-
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "Tex req/miss:%u/%u",
-		pq_gpu_avg_tex_req,
-		pq_gpu_avg_tex_miss);
-	term_puts(line);
-
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "CmdDMA:%u stall:%u",
-		pq_gpu_avg_cmd_dma_flushes,
-		pq_gpu_avg_stall_total);
-	term_puts(line);
-
-	term_setpos(row++, 0);
-	snprintf(line, sizeof(line), "ParamZ W:%u T:%u",
-		pq_gpu_avg_param_zwrite_spans,
-		pq_gpu_avg_param_ztest_spans);
-	term_puts(line);
-
-	/* FPS estimate */
-	unsigned int total_ms = pq_prof_avg_total / 105000;
-	term_setpos(row++, 0);
-	if (total_ms > 0)
-		snprintf(line, sizeof(line), "~%u FPS (%u.%u ms)",
-			1000 / total_ms, total_ms,
-			(pq_prof_avg_total / 10500) % 10);
-	else
-		snprintf(line, sizeof(line), "~999+ FPS");
-	term_puts(line);
-}
-
-/*
-================
 R_EdgeDrawing
 ================
 */
@@ -1276,11 +917,34 @@ static edge_t pq_ledge_scratch[NUMSTACKEDGES +
 static surf_t pq_lsurf_scratch[NUMSTACKSURFACES +
                                ((CACHE_SIZE - 1) / sizeof(surf_t)) + 1];
 
+/* world-render sub-phase timings (seconds), filled when host_speeds is set
+ * and read by the host.c per-second trace (the single render trace). */
+float r_t_setup = 0, r_t_edges = 0, r_t_alias = 0, r_t_view = 0, r_t_part = 0, r_t_warp = 0;
+float r_t_rworld = 0, r_t_bent = 0, r_t_scan = 0, r_t_surf = 0;  /* surf += from r_edge.c */
+/* [surf] sub-split.  Only the rare paths are bracketed (cache rebuilds,
+ * CPU z-fills, sky, water) so the per-surface cache-hit path stays free
+ * of timer ecalls; host.c derives emit = surf - cache - z - sky - turb. */
+float r_t_surfcache = 0;	/* D_CacheSurface miss path += from d_surf.c */
+float r_t_surfz = 0;		/* D_DrawZSpans += from d_edge.c */
+float r_t_surfsky = 0;		/* D_DrawSkyScans8 += from d_edge.c */
+float r_t_surfturb = 0;		/* Turbulent8 += from d_edge.c */
+int r_c_surfmiss = 0;		/* surface-cache rebuilds this frame */
+static float r_prof_t0;   /* R_RenderView_ phase timer */
+static float r_prof_t1;   /* R_EdgeDrawing phase timer (nested under 'edges') */
+extern cvar_t host_speeds;
+#define R_PROF (host_speeds.value != 0)
+
 PQ_HOT void R_EdgeDrawing (void)
 {
-	extern volatile unsigned int pq_dbg_stage;
-	unsigned int prof_sub;
-	int profiling = (int)pq_cycleprof.value;
+	if (R_PROF) {
+		/* D_DrawSurfaces and its callees accumulate into these */
+		r_t_surf = 0;
+		r_t_surfcache = 0;
+		r_t_surfz = 0;
+		r_t_surfsky = 0;
+		r_t_surfturb = 0;
+		r_c_surfmiss = 0;
+	}
 
 	if (auxedges)
 	{
@@ -1302,10 +966,8 @@ PQ_HOT void R_EdgeDrawing (void)
 		surfaces--;
 		R_SurfacePatch ();
 	}
-	pq_dbg_stage = 0x3250;
 
 	R_BeginEdgeFrame ();
-	pq_dbg_stage = 0x3251;
 
 	extern int r_gpu_world_direct_active;
 #if D_GPU_WORLD_DIRECT
@@ -1318,36 +980,18 @@ PQ_HOT void R_EdgeDrawing (void)
 	r_gpu_world_direct_active = 0;
 #endif
 
-	if (r_dspeeds.value)
-	{
-		rw_time1 = Sys_FloatTime ();
-	}
-
-	if (profiling)
-		prof_sub = SYS_CYCLE_LO;
+	if (R_PROF) r_prof_t1 = Sys_FloatTime ();
 	R_RenderWorld ();
-	if (profiling)
-		pq_prof_renderworld_cycles_frame = SYS_CYCLE_LO - prof_sub;
+	if (R_PROF) r_t_rworld = Sys_FloatTime () - r_prof_t1;
 	SNDDMA_FillRing();
-	pq_dbg_stage = 0x3252;
 
 	if (r_drawculledpolys)
 		R_ScanEdges ();
-	pq_dbg_stage = 0x3253;
 
 // only the world can be drawn back to front with no z reads or compares, just
 // z writes, so have the driver turn z compares on now
 	D_TurnZOn ();
-	pq_dbg_stage = 0x3254;
 
-	if (r_dspeeds.value)
-	{
-		rw_time2 = Sys_FloatTime ();
-		db_time1 = rw_time2;
-	}
-
-	if (profiling)
-		prof_sub = SYS_CYCLE_LO;
 	/* Bmodels share the same OF_EMIT_PERSP+DEPTH_WRITE span path as
 	 * world surfaces, so there's no GPU state ordering that requires
 	 * a drain between them. Per-surface kicks in D_DrawSpans8 keep
@@ -1355,27 +999,16 @@ PQ_HOT void R_EdgeDrawing (void)
 	 * that used to bracket this call were removed: previously they
 	 * forced a full pipeline drain twice per frame "for insurance"
 	 * but blocked CPU on GPU each time. */
+	if (R_PROF) r_prof_t1 = Sys_FloatTime ();
 	R_DrawBEntitiesOnList ();
-	if (profiling)
-		pq_prof_bentities_cycles_frame = SYS_CYCLE_LO - prof_sub;
+	if (R_PROF) r_t_bent = Sys_FloatTime () - r_prof_t1;
 	SNDDMA_FillRing();
-	pq_dbg_stage = 0x3255;
 
-	if (r_dspeeds.value)
-	{
-		db_time2 = Sys_FloatTime ();
-		se_time1 = db_time2;
-	}
 
-	pq_dbg_stage = 0x3256;
-
-	if (profiling)
-		prof_sub = SYS_CYCLE_LO;
+	if (R_PROF) r_prof_t1 = Sys_FloatTime ();
 	if (!(r_drawpolys | r_drawculledpolys))
 		R_ScanEdges ();
-	if (profiling)
-		pq_prof_scanedges_cycles_frame = SYS_CYCLE_LO - prof_sub;
-	pq_dbg_stage = 0x3257;
+	if (R_PROF) r_t_scan = Sys_FloatTime () - r_prof_t1;
 }
 
 
@@ -1388,101 +1021,51 @@ r_refdef must be set before the first call
 */
 void R_RenderView_ (void)
 {
-	extern volatile unsigned int pq_dbg_stage;
 	byte	warpbuffer[WARP_WIDTH * WARP_HEIGHT];
-	unsigned int prof_start;
-	int profiling = (int)pq_cycleprof.value;
 
 	r_warpbuffer = warpbuffer;
 
-	if (profiling) {
-		pq_prof_spans8_cycles_frame = 0;
-		pq_prof_spans8_calls_frame = 0;
-		pq_prof_zspans_cycles_frame = 0;
-		pq_prof_zspans_calls_frame = 0;
-		pq_prof_alias_cycles_frame = 0;
-		pq_prof_edge_cycles_frame = 0;
-		pq_prof_total_cycles_frame = 0;
-		pq_prof_zfill_wait_cycles_frame = 0;
-		pq_prof_entities_cycles_frame = 0;
-		pq_prof_viewmodel_cycles_frame = 0;
-		pq_prof_renderworld_cycles_frame = 0;
-		pq_prof_scanedges_cycles_frame = 0;
-		pq_prof_bentities_cycles_frame = 0;
-		pq_prof_ds_calcgrad_cycles = 0;
-		pq_prof_ds_cachesurf_cycles = 0;
-		pq_prof_ds_sky_cycles = 0;
-		pq_prof_rw_renderface_cycles = 0;
-		pq_prof_gpu_wait_cycles = 0;   /* accumulates across the frame */
-		{
-			/* FrameGap = (this frame's start) - (previous frame's end).
-			 * Captures all CPU idle / blocked time outside R_RenderView_:
-			 * VID_Update's of_video_flip, audio fill, host-loop overhead,
-			 * input poll, server tick, etc.  First frame's gap is 0. */
-			unsigned int now = SYS_CYCLE_LO;
-			pq_prof_frame_gap_cycles_frame = (pq_prev_frame_end_cycles != 0)
-				? now - pq_prev_frame_end_cycles : 0;
-			pq_prof_total_cycles_frame = now;        /* start of frame */
-		}
 
-		of_emit_prof_frame_start();
-	}
-
-	if (r_timegraph.value || r_speeds.value || r_dspeeds.value)
-		r_time1 = Sys_FloatTime ();
-
+	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	R_SetupFrame ();
-	pq_dbg_stage = 0x3201;
 
 #ifdef PASSAGES
 SetVisibilityByPassages ();
 #else
-	pq_dbg_stage = 0x3202;
 	R_MarkLeaves ();	// done here so we know if we're in water
-	pq_dbg_stage = 0x3203;
 #endif
+	if (R_PROF) r_t_setup = Sys_FloatTime () - r_prof_t0;
 
 // make FDIV fast. This reduces timing precision after we've been running for a
 // while, so we don't do it globally.  This also sets chop mode, and we do it
 // here so that setup stuff like the refresh area calculations match what's
 // done in screen.c
 	/* No FPU mode switch needed on this target. */
-	pq_dbg_stage = 0x3204;
 
 	if (!cl_entities[0].model || !cl.worldmodel)
 		Sys_Error ("R_RenderView: NULL worldmodel");
-	pq_dbg_stage = 0x3205;
 
-	pq_dbg_stage = 0x3206;
 
 	/* Z clear is queued on the GPU at the end of each frame before the
 	 * flip fence. First frame has no previous clear, so do one now. */
 	{
 		static qboolean zclear_started = false;
 		if (!zclear_started) {
-			if (profiling)
-				prof_start = SYS_CYCLE_LO;
 			of_emit_clear(OF_EMIT_CLEAR_DEPTH, 0, 0);
 			of_emit_finish();
-			if (profiling)
-				pq_prof_zfill_wait_cycles_frame = SYS_CYCLE_LO - prof_start;
 			zclear_started = true;
 		}
 	}
 
-	if (profiling)
-		prof_start = SYS_CYCLE_LO;
 	pq_gpu_zwrite_pending = 0;
+	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	R_EdgeDrawing ();
-	if (profiling)
-		pq_prof_edge_cycles_frame = SYS_CYCLE_LO - prof_start;
-	pq_dbg_stage = 0x3207;
+	if (R_PROF) r_t_edges = Sys_FloatTime () - r_prof_t0;
 
 	// Top up audio FIFO mid-frame to prevent underrun during long renders.
 	// Only touches DMA buffer (~16KB) + FIFO MMIO — minimal D-cache impact.
 	S_ExtraUpdate();
 
-	pq_dbg_stage = 0x3208;
 
 	if (pq_gpu_zwrite_pending)
 	{
@@ -1490,43 +1073,16 @@ SetVisibilityByPassages ();
 		pq_gpu_zwrite_pending = 0;
 	}
 
-	if (r_dspeeds.value)
-	{
-		se_time2 = Sys_FloatTime ();
-		de_time1 = se_time2;
-	}
-	pq_dbg_stage = 0x3209;
-
-	if (profiling)
-		prof_start = SYS_CYCLE_LO;
+	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	R_DrawEntitiesOnList ();
-	if (profiling)
-		pq_prof_entities_cycles_frame = SYS_CYCLE_LO - prof_start;
-	pq_dbg_stage = 0x320A;
+	if (R_PROF) r_t_alias = Sys_FloatTime () - r_prof_t0;
 
-	if (r_dspeeds.value)
-	{
-		de_time2 = Sys_FloatTime ();
-		dv_time1 = de_time2;
-	}
-	pq_dbg_stage = 0x320B;
-
-	if (profiling)
-		prof_start = SYS_CYCLE_LO;
 	extern int pq_noz_mode;
 	pq_noz_mode = 1;
+	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	R_DrawViewModel ();
+	if (R_PROF) r_t_view = Sys_FloatTime () - r_prof_t0;
 	pq_noz_mode = 0;
-	if (profiling)
-		pq_prof_viewmodel_cycles_frame = SYS_CYCLE_LO - prof_start;
-	pq_dbg_stage = 0x320C;
-
-	if (r_dspeeds.value)
-	{
-		dv_time2 = Sys_FloatTime ();
-		dp_time1 = Sys_FloatTime ();
-	}
-	pq_dbg_stage = 0x320D;
 
 	if (pq_gpu_zwrite_pending)
 	{
@@ -1534,39 +1090,18 @@ SetVisibilityByPassages ();
 		pq_gpu_zwrite_pending = 0;
 	}
 
+	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	if (r_drawparticles.value)
 		R_DrawParticles ();
+	if (R_PROF) r_t_part = Sys_FloatTime () - r_prof_t0;
 
-	pq_dbg_stage = 0x320E;
 
-	if (r_dspeeds.value)
-		dp_time2 = Sys_FloatTime ();
-
+	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	if (r_dowarp)
 		D_WarpScreen ();
-	pq_dbg_stage = 0x320F;
-
-	if (profiling) {
-		unsigned int frame_end_now = SYS_CYCLE_LO;
-		pq_prof_total_cycles_frame = frame_end_now - pq_prof_total_cycles_frame;
-		pq_prev_frame_end_cycles   = frame_end_now;
-
-		of_emit_prof_frame_end();
-	}
+	if (R_PROF) r_t_warp = Sys_FloatTime () - r_prof_t0;
 
 	V_SetContentsColor (r_viewleaf->contents);
-
-	if (r_timegraph.value)
-		R_TimeGraph ();
-
-	if (r_aliasstats.value)
-		R_PrintAliasStats ();
-
-	if (r_speeds.value)
-		R_PrintTimes ();
-
-	if (r_dspeeds.value)
-		R_PrintDSpeeds ();
 
 	if (r_reportsurfout.value && r_outofsurfaces)
 		Con_Printf ("Short %d surfaces\n", r_outofsurfaces);
@@ -1574,243 +1109,6 @@ SetVisibilityByPassages ();
 	if (r_reportedgeout.value && r_outofedges)
 		Con_Printf ("Short roughly %d edges\n", r_outofedges * 2 / 3);
 
-	if (profiling) {
-		pq_prof_frame_counter++;
-
-		if (profiling == 1) {
-			/* Mode 1: existing Con_Printf every 30 frames */
-			if ((pq_prof_frame_counter % 30) == 0) {
-				Con_Printf ("pq_prof cyc edge:%u spans:%u z:%u alias:%u calls s:%u z:%u batch:%u/%u dma:%u ringw:%u pz:%u/%u\n",
-					pq_prof_edge_cycles_frame,
-					pq_prof_spans8_cycles_frame,
-					pq_prof_zspans_cycles_frame,
-					pq_prof_alias_cycles_frame,
-					pq_prof_spans8_calls_frame,
-					pq_prof_zspans_calls_frame,
-					pq_gpu_batch_flushes_frame,
-					pq_gpu_batch_spans_frame,
-					pq_gpu_cmd_dma_flushes_frame,
-					pq_gpu_ring_waits_frame,
-					pq_gpu_param_zwrite_spans_frame,
-					pq_gpu_param_ztest_spans_frame);
-			}
-		} else if (profiling == 2) {
-			/* Mode 2: accumulate, average every 64 frames, draw terminal */
-			pq_prof_total_accum += pq_prof_total_cycles_frame;
-			pq_prof_zfill_wait_accum += pq_prof_zfill_wait_cycles_frame;
-			pq_prof_edge_accum += pq_prof_edge_cycles_frame;
-			pq_prof_entities_accum += pq_prof_entities_cycles_frame;
-			pq_prof_viewmodel_accum += pq_prof_viewmodel_cycles_frame;
-			pq_prof_spans8_accum += pq_prof_spans8_cycles_frame;
-			pq_prof_zspans_accum += pq_prof_zspans_cycles_frame;
-			pq_prof_alias_accum += pq_prof_alias_cycles_frame;
-			pq_prof_spans8_calls_accum += pq_prof_spans8_calls_frame;
-			pq_prof_zspans_calls_accum += pq_prof_zspans_calls_frame;
-			pq_prof_renderworld_accum += pq_prof_renderworld_cycles_frame;
-			pq_prof_scanedges_accum += pq_prof_scanedges_cycles_frame;
-			pq_prof_bentities_accum += pq_prof_bentities_cycles_frame;
-			pq_prof_se_insert_accum += pq_prof_se_insert_cycles;
-			pq_prof_se_generate_accum += pq_prof_se_generate_cycles;
-			pq_prof_se_step_accum += pq_prof_se_step_cycles;
-			pq_prof_se_draw_accum += pq_prof_se_draw_cycles;
-			pq_prof_se_remove_accum += pq_prof_se_remove_cycles;
-			pq_prof_se_final_accum += pq_prof_se_final_cycles;
-			pq_prof_gpu_wait_accum += pq_prof_gpu_wait_cycles;
-			pq_prof_video_flip_accum += pq_prof_video_flip_cycles;
-			pq_prof_frame_gap_accum += pq_prof_frame_gap_cycles_frame;
-			if (pq_prof_aet_peak > pq_prof_aet_peak_accum) {
-				pq_prof_aet_peak_accum = pq_prof_aet_peak;
-				pq_prof_aet_peak_scanline_accum = pq_prof_aet_peak_scanline;
-			}
-			pq_prof_aet_total_accum += pq_prof_aet_total_edges;
-			if (pq_prof_aet_step_max > pq_prof_aet_step_max_accum)
-				pq_prof_aet_step_max_accum = pq_prof_aet_step_max;
-			pq_prof_aet_step_max = 0;  // reset per-frame
-			pq_prof_hw_spans_total_accum += pq_prof_hw_spans_total;
-			pq_prof_hw_spans_linked_accum += pq_prof_hw_spans_linked;
-			pq_prof_ds_calcgrad_accum += pq_prof_ds_calcgrad_cycles;
-			pq_prof_ds_cachesurf_accum += pq_prof_ds_cachesurf_cycles;
-			pq_prof_ds_sky_accum += pq_prof_ds_sky_cycles;
-			pq_prof_rw_renderface_accum += pq_prof_rw_renderface_cycles;
-
-			pq_gpu_batch_flushes_accum += pq_gpu_batch_flushes_frame;
-			pq_gpu_batch_spans_accum += pq_gpu_batch_spans_frame;
-			pq_gpu_batch_words_accum += pq_gpu_batch_words_frame;
-			pq_gpu_cmd_dma_flushes_accum += pq_gpu_cmd_dma_flushes_frame;
-			pq_gpu_dma_waits_accum += pq_gpu_dma_waits_frame;
-			pq_gpu_dma_spin_iters_accum += pq_gpu_dma_spin_iters_frame;
-			pq_gpu_ring_waits_accum += pq_gpu_ring_waits_frame;
-			pq_gpu_ring_spin_iters_accum += pq_gpu_ring_spin_iters_frame;
-			pq_gpu_min_ring_free_accum += pq_gpu_min_ring_free_frame;
-			pq_gpu_ring_free_accum += pq_gpu_ring_free_frame;
-			pq_gpu_status_or_accum |= pq_gpu_status_frame;
-			pq_gpu_tex_req_accum += pq_gpu_tex_req_frame;
-			pq_gpu_tex_miss_accum += pq_gpu_tex_miss_frame;
-			pq_gpu_stall_total_accum += pq_gpu_stall_total_frame;
-			pq_gpu_param_zwrite_spans_accum += pq_gpu_param_zwrite_spans_frame;
-			pq_gpu_param_ztest_spans_accum += pq_gpu_param_ztest_spans_frame;
-
-			if ((pq_prof_frame_counter & 63) == 0) {
-				pq_prof_avg_total = pq_prof_total_accum >> 6;
-				pq_prof_avg_zfill_wait = pq_prof_zfill_wait_accum >> 6;
-				pq_prof_avg_edge = pq_prof_edge_accum >> 6;
-				pq_prof_avg_entities = pq_prof_entities_accum >> 6;
-				pq_prof_avg_viewmodel = pq_prof_viewmodel_accum >> 6;
-				pq_prof_avg_spans8 = pq_prof_spans8_accum >> 6;
-				pq_prof_avg_zspans = pq_prof_zspans_accum >> 6;
-				pq_prof_avg_alias = pq_prof_alias_accum >> 6;
-				pq_prof_avg_spans8_calls = pq_prof_spans8_calls_accum >> 6;
-				pq_prof_avg_zspans_calls = pq_prof_zspans_calls_accum >> 6;
-				pq_prof_avg_renderworld = pq_prof_renderworld_accum >> 6;
-				pq_prof_avg_scanedges = pq_prof_scanedges_accum >> 6;
-				pq_prof_avg_bentities = pq_prof_bentities_accum >> 6;
-				pq_prof_avg_se_insert = pq_prof_se_insert_accum >> 6;
-				pq_prof_avg_se_generate = pq_prof_se_generate_accum >> 6;
-				pq_prof_avg_se_step = pq_prof_se_step_accum >> 6;
-				pq_prof_avg_se_draw = pq_prof_se_draw_accum >> 6;
-				pq_prof_avg_se_remove = pq_prof_se_remove_accum >> 6;
-				pq_prof_avg_se_final = pq_prof_se_final_accum >> 6;
-				pq_prof_avg_gpu_wait = pq_prof_gpu_wait_accum >> 6;
-				pq_prof_avg_video_flip = pq_prof_video_flip_accum >> 6;
-				pq_prof_avg_frame_gap  = pq_prof_frame_gap_accum  >> 6;
-				pq_prof_avg_aet_peak = pq_prof_aet_peak_accum;
-				pq_prof_avg_aet_peak_scanline = pq_prof_aet_peak_scanline_accum;
-				pq_prof_avg_aet_total = pq_prof_aet_total_accum >> 6;
-				pq_prof_avg_aet_step_max = pq_prof_aet_step_max_accum;
-				pq_prof_avg_hw_spans_total = pq_prof_hw_spans_total_accum >> 6;
-				pq_prof_avg_hw_spans_linked = pq_prof_hw_spans_linked_accum >> 6;
-				pq_prof_avg_ds_calcgrad = pq_prof_ds_calcgrad_accum >> 6;
-				pq_prof_avg_ds_cachesurf = pq_prof_ds_cachesurf_accum >> 6;
-				pq_prof_avg_ds_sky = pq_prof_ds_sky_accum >> 6;
-				pq_prof_avg_rw_renderface = pq_prof_rw_renderface_accum >> 6;
-				pq_gpu_avg_batch_flushes = pq_gpu_batch_flushes_accum >> 6;
-				pq_gpu_avg_batch_spans = pq_gpu_batch_spans_accum >> 6;
-				pq_gpu_avg_batch_words = pq_gpu_batch_words_accum >> 6;
-				pq_gpu_avg_cmd_dma_flushes = pq_gpu_cmd_dma_flushes_accum >> 6;
-				pq_gpu_avg_dma_waits = pq_gpu_dma_waits_accum >> 6;
-				pq_gpu_avg_dma_spin_iters = pq_gpu_dma_spin_iters_accum >> 6;
-				pq_gpu_avg_ring_waits = pq_gpu_ring_waits_accum >> 6;
-				pq_gpu_avg_ring_spin_iters = pq_gpu_ring_spin_iters_accum >> 6;
-				pq_gpu_avg_min_ring_free = pq_gpu_min_ring_free_accum >> 6;
-				pq_gpu_avg_ring_free = pq_gpu_ring_free_accum >> 6;
-				pq_gpu_avg_status_or = pq_gpu_status_or_accum;
-				pq_gpu_avg_tex_req = pq_gpu_tex_req_accum >> 6;
-				pq_gpu_avg_tex_miss = pq_gpu_tex_miss_accum >> 6;
-				pq_gpu_avg_stall_total = pq_gpu_stall_total_accum >> 6;
-				pq_gpu_avg_param_zwrite_spans = pq_gpu_param_zwrite_spans_accum >> 6;
-				pq_gpu_avg_param_ztest_spans = pq_gpu_param_ztest_spans_accum >> 6;
-
-				pq_prof_total_accum = 0;
-				pq_prof_zfill_wait_accum = 0;
-				pq_prof_edge_accum = 0;
-				pq_prof_entities_accum = 0;
-				pq_prof_viewmodel_accum = 0;
-				pq_prof_spans8_accum = 0;
-				pq_prof_zspans_accum = 0;
-				pq_prof_alias_accum = 0;
-				pq_prof_spans8_calls_accum = 0;
-				pq_prof_zspans_calls_accum = 0;
-				pq_prof_renderworld_accum = 0;
-				pq_prof_scanedges_accum = 0;
-				pq_prof_bentities_accum = 0;
-				pq_prof_se_insert_accum = 0;
-				pq_prof_se_generate_accum = 0;
-				pq_prof_se_step_accum = 0;
-				pq_prof_se_draw_accum = 0;
-				pq_prof_se_remove_accum = 0;
-				pq_prof_se_final_accum = 0;
-				pq_prof_gpu_wait_accum = 0;
-				pq_prof_video_flip_accum = 0;
-				pq_prof_frame_gap_accum  = 0;
-				pq_prof_aet_peak_accum = 0;
-				pq_prof_aet_peak_scanline_accum = 0;
-				pq_prof_aet_total_accum = 0;
-				pq_prof_aet_step_max_accum = 0;
-				pq_prof_hw_spans_total_accum = 0;
-				pq_prof_hw_spans_linked_accum = 0;
-				pq_prof_ds_calcgrad_accum = 0;
-				pq_prof_ds_cachesurf_accum = 0;
-				pq_prof_ds_sky_accum = 0;
-				pq_prof_rw_renderface_accum = 0;
-				pq_gpu_batch_flushes_accum = 0;
-				pq_gpu_batch_spans_accum = 0;
-				pq_gpu_batch_words_accum = 0;
-				pq_gpu_cmd_dma_flushes_accum = 0;
-				pq_gpu_dma_waits_accum = 0;
-				pq_gpu_dma_spin_iters_accum = 0;
-				pq_gpu_ring_waits_accum = 0;
-				pq_gpu_ring_spin_iters_accum = 0;
-				pq_gpu_min_ring_free_accum = 0;
-				pq_gpu_ring_free_accum = 0;
-				pq_gpu_status_or_accum = 0;
-				pq_gpu_tex_req_accum = 0;
-				pq_gpu_tex_miss_accum = 0;
-				pq_gpu_stall_total_accum = 0;
-				pq_gpu_param_zwrite_spans_accum = 0;
-				pq_gpu_param_ztest_spans_accum = 0;
-
-				PQ_Prof_DrawTerminal();
-			}
-		}
-	}
-
-	/* Display mode transitions for profiling mode 2 */
-	if (profiling == 2 && pq_prof_prev_mode != 2) {
-		/* Entering mode 2: switch to terminal display */
-		SYS_DISPLAY_MODE = 0;
-		term_clear();
-		pq_prof_frame_counter = 0;
-		pq_prof_total_accum = 0;
-		pq_prof_zfill_wait_accum = 0;
-		pq_prof_edge_accum = 0;
-		pq_prof_entities_accum = 0;
-		pq_prof_viewmodel_accum = 0;
-		pq_prof_spans8_accum = 0;
-		pq_prof_zspans_accum = 0;
-		pq_prof_alias_accum = 0;
-		pq_prof_spans8_calls_accum = 0;
-		pq_prof_zspans_calls_accum = 0;
-		pq_prof_renderworld_accum = 0;
-		pq_prof_scanedges_accum = 0;
-		pq_prof_bentities_accum = 0;
-		pq_prof_se_insert_accum = 0;
-		pq_prof_se_generate_accum = 0;
-		pq_prof_se_step_accum = 0;
-		pq_prof_se_draw_accum = 0;
-		pq_prof_aet_peak_accum = 0;
-		pq_prof_aet_peak_scanline_accum = 0;
-		pq_prof_aet_total_accum = 0;
-		pq_prof_aet_step_max_accum = 0;
-		pq_prof_hw_spans_total_accum = 0;
-		pq_prof_hw_spans_linked_accum = 0;
-		pq_prof_ds_calcgrad_accum = 0;
-		pq_prof_ds_cachesurf_accum = 0;
-		pq_prof_ds_sky_accum = 0;
-		pq_prof_rw_renderface_accum = 0;
-		pq_gpu_batch_flushes_accum = 0;
-		pq_gpu_batch_spans_accum = 0;
-		pq_gpu_batch_words_accum = 0;
-		pq_gpu_cmd_dma_flushes_accum = 0;
-		pq_gpu_dma_waits_accum = 0;
-		pq_gpu_dma_spin_iters_accum = 0;
-		pq_gpu_ring_waits_accum = 0;
-		pq_gpu_ring_spin_iters_accum = 0;
-		pq_gpu_min_ring_free_accum = 0;
-		pq_gpu_ring_free_accum = 0;
-		pq_gpu_status_or_accum = 0;
-		pq_gpu_tex_req_accum = 0;
-		pq_gpu_tex_miss_accum = 0;
-		pq_gpu_stall_total_accum = 0;
-		pq_gpu_param_zwrite_spans_accum = 0;
-		pq_gpu_param_ztest_spans_accum = 0;
-	} else if (profiling != 2 && pq_prof_prev_mode == 2) {
-		/* Leaving mode 2: switch back to framebuffer */
-		SYS_DISPLAY_MODE = 1;
-	}
-	pq_prof_prev_mode = profiling;
-
-// back to high floating-point precision
-	pq_dbg_stage = 0x3210;
 
 	/* Queue z-buffer clear for the next frame.  VID_Update places the flip
 	 * after this command, so the next frame's wait-sync also retires the
@@ -1820,7 +1118,6 @@ SetVisibilityByPassages ();
 
 void R_RenderView (void)
 {
-	extern volatile unsigned int pq_dbg_stage;
 	int		dummy;
 	int		delta;
 	
@@ -1837,9 +1134,7 @@ void R_RenderView (void)
 	if ( (long)(&r_warpbuffer) & 3 )
 		Sys_Error ("Globals are missaligned");
 
-	pq_dbg_stage = 0x3211;
 	R_RenderView_ ();
-	pq_dbg_stage = 0x3212;
 }
 
 /*

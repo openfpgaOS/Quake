@@ -449,7 +449,7 @@ void M_SinglePlayer_Key (int key)
 
 int		load_cursor;		// 0 < load_cursor < MAX_SAVEGAMES
 
-#define	MAX_SAVEGAMES		12
+#define	MAX_SAVEGAMES		10	// bound save slots s0..s9
 char	m_filenames[MAX_SAVEGAMES][SAVEGAME_COMMENT_LENGTH+1];
 int		loadable[MAX_SAVEGAMES];
 int		foreignsave[MAX_SAVEGAMES];
@@ -457,7 +457,6 @@ int		foreignsave[MAX_SAVEGAMES];
 void M_ScanSaves (void)
 {
 	int		i;
-	char	name[MAX_OSPATH];
 	char	comment[SAVEGAME_COMMENT_LENGTH+1];
 	FILE	*f;
 	qboolean	wrong_game;
@@ -467,8 +466,7 @@ void M_ScanSaves (void)
 		strcpy (m_filenames[i], "--- UNUSED SLOT ---");
 		loadable[i] = false;
 		foreignsave[i] = false;
-		sprintf (name, "%s/s%i.sav", com_gamedir, i);
-		f = fopen (name, "r");
+		f = Sys_OpenSaveSlot (i, "r");
 		if (!f)
 			continue;
 		if (Host_ReadSavegameHeader (f, comment, &wrong_game))
@@ -3088,6 +3086,8 @@ void M_Draw (void)
 
 	if (!m_recursiveDraw)
 	{
+		static int m_last_drawn_state = -1;
+
 		scr_copyeverything = 1;
 
 		if (scr_con_current)
@@ -3100,7 +3100,18 @@ void M_Draw (void)
 		else
 			Draw_FadeScreen ();
 
-		scr_fullupdate = 0;
+		/* Stock code forced scr_fullupdate = 0 every menu frame, which
+		 * makes SCR_UpdateScreen run a full-screen Draw_TileClear and a
+		 * full sbar invalidation per frame on top of the 3D view and the
+		 * full-screen fade — the menus visibly dragged the frame rate.
+		 * The world view + fade + menu repaint everything they own each
+		 * frame anyway, so a full background repaint is only needed when
+		 * the menu page actually changes. */
+		if (m_state != m_last_drawn_state)
+		{
+			m_last_drawn_state = m_state;
+			scr_fullupdate = 0;
+		}
 	}
 	else
 	{

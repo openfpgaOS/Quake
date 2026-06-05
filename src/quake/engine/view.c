@@ -996,7 +996,6 @@ extern vrect_t	scr_vrect;
 
 void V_RenderView (void)
 {
-	extern volatile unsigned int pq_dbg_stage;
 	static int pq_render_warmup = 0;
 	if (con_forcedup)
 		return;
@@ -1005,7 +1004,6 @@ void V_RenderView (void)
 	if (cls.signon == SIGNONS && pq_render_warmup < 4)
 	{
 		pq_render_warmup++;
-		pq_dbg_stage = 0x30F0 + pq_render_warmup;
 		return;
 	}
 
@@ -1029,7 +1027,6 @@ void V_RenderView (void)
 
 	if (r_dynamic.value)
 		R_PushDlights ();
-	pq_dbg_stage = 0x3101;
 
 	if (lcd_x.value)
 	{
@@ -1045,7 +1042,6 @@ void V_RenderView (void)
 		for (i=0 ; i<3 ; i++)
 			r_refdef.vieworg[i] -= right[i]*lcd_x.value;
 		R_RenderView ();
-		pq_dbg_stage = 0x3102;
 
 		vid.buffer += vid.rowbytes>>1;
 
@@ -1056,7 +1052,6 @@ void V_RenderView (void)
 		for (i=0 ; i<3 ; i++)
 			r_refdef.vieworg[i] += 2*right[i]*lcd_x.value;
 		R_RenderView ();
-		pq_dbg_stage = 0x3103;
 
 		vid.buffer -= vid.rowbytes>>1;
 
@@ -1068,7 +1063,6 @@ void V_RenderView (void)
 	else
 	{
 		R_RenderView ();
-		pq_dbg_stage = 0x3104;
 	}
 
 #ifndef GLQUAKE

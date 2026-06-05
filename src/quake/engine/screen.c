@@ -807,9 +807,16 @@ WARNING: be very careful calling this from elsewhere, because the refresh
 needs almost the entire 256k of stack space!
 ==================
 */
+/* Per-phase gfx timings in seconds, filled when host_speeds is set and read
+ * by the host.c trace to split the gfx bucket into vsync-wait / 3D world /
+ * 2D HUD / framebuffer present. */
+float scr_t_wait = 0, scr_t_world = 0, scr_t_2d = 0, scr_t_present = 0;
+static float scr_prof_t0;
+extern cvar_t host_speeds;
+#define SCR_PROF (host_speeds.value != 0)
+
 void SCR_UpdateScreen (void)
 {
-	extern volatile unsigned int pq_dbg_stage;
 	static float	oldscr_viewsize;
 	static float	oldlcd_x;
 	vrect_t		vrect;
@@ -876,7 +883,9 @@ void SCR_UpdateScreen (void)
 // Game logic ran during the vsync dead time between VID_Update and here.
 //
 	extern void VID_WaitSync(void);
+	if (SCR_PROF) scr_prof_t0 = Sys_FloatTime();
 	VID_WaitSync();
+	if (SCR_PROF) scr_t_wait = Sys_FloatTime() - scr_prof_t0;
 
 //
 // do 3D refresh drawing, and then update the screen
@@ -900,10 +909,11 @@ void SCR_UpdateScreen (void)
 									//  for linear writes all the time
 
 	VID_LockBuffer ();
-	pq_dbg_stage = 0x3001;
 
+	if (SCR_PROF) scr_prof_t0 = Sys_FloatTime();
 	V_RenderView ();
-	pq_dbg_stage = 0x3002;
+	if (SCR_PROF) { scr_t_world = Sys_FloatTime() - scr_prof_t0;
+	                scr_prof_t0 = Sys_FloatTime(); }   /* start 2D phase */
 
 	VID_UnlockBuffer ();
 
@@ -955,6 +965,9 @@ void SCR_UpdateScreen (void)
 
 	V_UpdatePalette ();
 
+	if (SCR_PROF) { scr_t_2d = Sys_FloatTime() - scr_prof_t0;
+	                scr_prof_t0 = Sys_FloatTime(); }   /* start present phase */
+
 //
 // update one of three areas
 //
@@ -989,6 +1002,8 @@ void SCR_UpdateScreen (void)
 	
 		VID_Update (&vrect);
 	}
+
+	if (SCR_PROF) scr_t_present = Sys_FloatTime() - scr_prof_t0;
 }
 
 

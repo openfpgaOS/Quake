@@ -25,16 +25,26 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "sysreg_stub.h"
 
 extern int	pq_combined_z_active;
+
+/* [surf] trace buckets (defined in r_main.c, printed by host.c) */
+extern cvar_t	host_speeds;
+extern float	r_t_surfz, r_t_surfsky, r_t_surfturb;
+
+/* Bracket a rare draw path for the [surf] trace.  Costs 2 timer ecalls
+ * per *invocation* (z-fills, sky and water surfaces only) — the common
+ * cache-hit + emit path stays free of measurement overhead. */
+#define DS_TRACE(acc, call) do {					\
+		if (host_speeds.value) {				\
+			float _ts = Sys_FloatTime ();			\
+			call;						\
+			(acc) += Sys_FloatTime () - _ts;		\
+		} else {						\
+			call;						\
+		}							\
+	} while (0)
 extern int	r_gpu_world_direct_active;
 extern cvar_t	pq_gpu_world_light;
 
-/* Sub-profiling for D_DrawSurfaces breakdown */
-unsigned int pq_prof_ds_calcgrad_cycles;
-unsigned int pq_prof_ds_cachesurf_cycles;
-unsigned int pq_prof_ds_sky_cycles;
-extern unsigned int pq_prof_spans8_cycles_frame;
-extern unsigned int pq_prof_zspans_cycles_frame;
-extern cvar_t pq_cycleprof;
 
 static int	miplevel;
 
@@ -167,8 +177,6 @@ PQ_HOT void D_DrawSurfaces (void)
 	surfcache_t		*pcurrentcache;
 	vec3_t			world_transformed_modelorg;
 	vec3_t			local_modelorg;
-	int profiling = (int)pq_cycleprof.value;
-	unsigned int prof_t;
 
 	currententity = &cl_entities[0];
 	TransformVector (modelorg, transformed_modelorg);
@@ -188,9 +196,7 @@ PQ_HOT void D_DrawSurfaces (void)
 			d_ziorigin = s->d_ziorigin;
 
 			D_DrawSolidSurface (s, (int)s->data & 0xFF);
-			if (profiling) prof_t = SYS_CYCLE_LO;
-			D_DrawZSpans (s->spans);
-			if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+			DS_TRACE (r_t_surfz, D_DrawZSpans (s->spans));
 		}
 	}
 	else
@@ -215,9 +221,7 @@ PQ_HOT void D_DrawSurfaces (void)
 					R_MakeSky ();
 				}
 
-				if (profiling) prof_t = SYS_CYCLE_LO;
-				D_DrawSkyScans8 (s->spans);
-				if (profiling) pq_prof_ds_sky_cycles += SYS_CYCLE_LO - prof_t;
+				DS_TRACE (r_t_surfsky, D_DrawSkyScans8 (s->spans));
 			}
 			else if (s->flags & SURF_DRAWBACKGROUND)
 			{
@@ -228,9 +232,7 @@ PQ_HOT void D_DrawSurfaces (void)
 				if (!r_gpu_world_direct_active)
 				{
 					D_DrawSolidSurface (s, (int)r_clearcolor.value & 0xFF);
-					if (profiling) prof_t = SYS_CYCLE_LO;
-					D_DrawZSpans (s->spans);
-					if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+					DS_TRACE (r_t_surfz, D_DrawZSpans (s->spans));
 				}
 			}
 			else if (s->flags & SURF_DRAWTURB)
@@ -281,15 +283,11 @@ PQ_HOT void D_DrawSurfaces (void)
 					last_bmodel_entity = NULL;
 				}
 
-				if (profiling) prof_t = SYS_CYCLE_LO;
 				D_CalcGradients (pface);
-				if (profiling) pq_prof_ds_calcgrad_cycles += SYS_CYCLE_LO - prof_t;
-				Turbulent8 (s->spans);
+				DS_TRACE (r_t_surfturb, Turbulent8 (s->spans));
 				if (!pq_combined_z_active)
 				{
-					if (profiling) prof_t = SYS_CYCLE_LO;
-					D_DrawZSpans (s->spans);
-					if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+					DS_TRACE (r_t_surfz, D_DrawZSpans (s->spans));
 				}
 				pq_combined_z_active = 0;
 			}
@@ -338,7 +336,6 @@ PQ_HOT void D_DrawSurfaces (void)
 				miplevel = D_MipLevelForScale (s->nearzi * scale_for_mip
 				* pface->texinfo->mipadjust);
 
-				if (profiling) prof_t = SYS_CYCLE_LO;
 #if D_GPU_WORLD_LIGHT
 				int gpu_light_mode = (int)pq_gpu_world_light.value;
 				if (gpu_light_mode != 1)
@@ -366,7 +363,6 @@ PQ_HOT void D_DrawSurfaces (void)
 					pq_world_tex_s_offset = 0;
 					pq_world_tex_t_offset = 0;
 				}
-				if (profiling) pq_prof_ds_cachesurf_cycles += SYS_CYCLE_LO - prof_t;
 
 	#if D_GPU_WORLD_TRIS && !D_GPU_WORLD_DIRECT
 				/* T6 better: tessellate the surface into GPU triangles
@@ -378,22 +374,16 @@ PQ_HOT void D_DrawSurfaces (void)
 				 * colormap lookup. */
 				R_DrawSurfaceTris (pface, miplevel);
 #else
-				if (profiling) prof_t = SYS_CYCLE_LO;
 				D_CalcGradients (pface);
-				if (profiling) pq_prof_ds_calcgrad_cycles += SYS_CYCLE_LO - prof_t;
 
-				if (profiling) prof_t = SYS_CYCLE_LO;
 				(*d_drawspans) (s->spans);
-				if (profiling) pq_prof_spans8_cycles_frame += SYS_CYCLE_LO - prof_t;
 #endif
 
 				/* CPU-side z-fill for sprite/alias depth occlusion when the
 				 * selected world draw path did not co-write compatible z. */
 				if (!pq_combined_z_active)
 				{
-					if (profiling) prof_t = SYS_CYCLE_LO;
-					D_DrawZSpans (s->spans);
-					if (profiling) pq_prof_zspans_cycles_frame += SYS_CYCLE_LO - prof_t;
+					DS_TRACE (r_t_surfz, D_DrawZSpans (s->spans));
 				}
 				pq_combined_z_active = 0;
 			}

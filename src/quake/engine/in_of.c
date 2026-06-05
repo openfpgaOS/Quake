@@ -5,8 +5,9 @@
  *   D-pad Up/Down      -> move forward/back
  *   D-pad Left/Right   -> turn left/right
  *   L1 + D-pad L/R     -> strafe left/right
- *   L2 / R2            -> strafe left/right
- *   Left stick         -> move forward/back + turn
+ *   L2                 -> run
+ *   R2                 -> fire
+ *   Left stick         -> move forward/back + strafe left/right
  *   Right stick        -> mouse look
  *   A                  -> fire
  *   R1 + A             -> look up
@@ -25,6 +26,7 @@
 
 #include "of.h"
 #include "of_input.h"
+#include "of_analogizer.h"
 
 #include <string.h>
 
@@ -64,6 +66,49 @@ typedef enum {
 } pad_b_mode_t;
 
 static uint32_t prev_buttons;
+
+/* Analog axes are trusted only after one of them produces a value a
+ * live, centred-at-rest stick can produce.  Digital pads on the SNAC
+ * link port have no sticks: their undriven APF joy fields reach us
+ * pinned at INT16_MIN every poll, which would otherwise decode as a
+ * permanent full up-left deflection (ghost forward-move + left yaw).
+ * A real stick rests near 0 and leaves {0, INT16_MIN} the moment it
+ * is touched, so the latch engages immediately for analog controllers
+ * and never for SNAC pads (see pad_axis_live / IN_Move). */
+static int pad_analog_seen;
+
+/* Dock-pad look sensitivity, 0..1 (archived in the config).  Applied to
+ * the right-stick view rate only — full stick deflection still moves at
+ * full speed, and a SNAC DualShock (PSX Analog) keeps the full look rate
+ * since its pots already feel right at 1:1.
+ *
+ * Named joy_docklook (was joy_docksens): renamed so configs that
+ * archived an old value during tuning stop pinning the shipped
+ * default.  Deliberately NOT archived while the default is being
+ * tuned — an archived copy in quake.cfg would pin old values and
+ * mask every default change (which is exactly what happened during
+ * the joy_docksens era). */
+cvar_t joy_docklook = {"joy_docklook", "0.8", false};
+
+/* True when P1's analog axes come from a SNAC PSX-Analog pad rather
+ * than the dock/Bluetooth controller. */
+static int pad_snac_analog_p1(void)
+{
+    of_analogizer_state_t st;
+
+    if (!of_analogizer_enabled())
+        return 0;
+    if (of_analogizer_state(&st) < 0 || !st.enabled)
+        return 0;
+    /* PSX Analog (0x12) / PSX Analog Fast (0x13) are the only SNAC
+     * types with sticks. */
+    if (st.snac_type != 0x12 && st.snac_type != 0x13)
+        return 0;
+    /* 0x40 (raw) / 1 (normalised) = "SNAC -> P2": P1 stays on the dock. */
+    if (st.snac_assignment == 0x40 || st.snac_assignment == 1)
+        return 0;
+    return 1;
+}
 static pad_slot_t dpad_up_slot    = {PAD_ACT_NONE, K_AUX1};
 static pad_slot_t dpad_down_slot  = {PAD_ACT_NONE, K_AUX2};
 static pad_slot_t dpad_left_slot  = {PAD_ACT_NONE, K_AUX3};
@@ -73,6 +118,8 @@ static pad_slot_t b_slot          = {PAD_ACT_NONE, K_AUX6};
 static pad_slot_t x_slot          = {PAD_ACT_NONE, K_AUX7};
 static pad_slot_t y_slot          = {PAD_ACT_NONE, K_AUX8};
 static pad_slot_t select_slot     = {PAD_ACT_NONE, K_AUX9};
+static pad_slot_t r2_slot         = {PAD_ACT_NONE, K_AUX10};
+static pad_slot_t l2_slot         = {PAD_ACT_NONE, K_AUX11};
 static pad_b_mode_t b_mode;
 static qboolean b_physical_down;
 static float b_down_time;
@@ -144,6 +191,8 @@ static void clear_game_actions(void)
     set_slot_action(&x_slot, PAD_ACT_NONE);
     set_slot_action(&y_slot, PAD_ACT_NONE);
     set_slot_action(&select_slot, PAD_ACT_NONE);
+    set_slot_action(&r2_slot, PAD_ACT_NONE);
+    set_slot_action(&l2_slot, PAD_ACT_NONE);
     b_mode = PAD_B_NONE;
     b_physical_down = false;
     x_chord_fired = false;
@@ -154,9 +203,14 @@ void IN_ClearStates(void)
 {
     clear_game_actions();
     prev_buttons = 0;
+    pad_analog_seen = 0;
 }
 
-void IN_Init(void)    { IN_ClearStates(); }
+void IN_Init(void)
+{
+    Cvar_RegisterVariable (&joy_docklook);
+    IN_ClearStates();
+}
 void IN_Shutdown(void){ IN_ClearStates(); }
 void IN_Commands(void){ }
 
@@ -166,6 +220,23 @@ static void send_edge_key(uint32_t changed, uint32_t buttons,
 {
     if (!(changed & mask)) return;
     Key_Event(quake_key, (buttons & mask) ? true : false);
+}
+
+static int pad_axis_live(int16_t v)
+{
+    return v != 0 && v != (int16_t)0x8000;
+}
+
+/* Softened response for the dock pad's movement stick: a 50/50 blend
+ * of linear and squared, out = v*(128+|v|)/256 over the ±128 range.
+ * Pure squared felt sluggish mid-range; this keeps walking speeds
+ * reasonable (half tilt -> ~37%) while still calming the centre, and
+ * full deflection reaches full speed.  SNAC DualShock sticks stay
+ * linear (1:1). */
+static int axis_curved(int v)
+{
+    int a = v < 0 ? -v : v;
+    return v * (128 + a) / 256;
 }
 
 static int axis_scaled(int16_t value)
@@ -325,6 +396,10 @@ void IN_SendKeyEvents(void)
 
     set_slot_action(&select_slot,
         (buttons & OF_BTN_SELECT) ? PAD_ACT_SHOWSCORES : PAD_ACT_NONE);
+    set_slot_action(&r2_slot,
+        (buttons & OF_BTN_R2) ? PAD_ACT_ATTACK : PAD_ACT_NONE);
+    set_slot_action(&l2_slot,
+        (buttons & OF_BTN_L2) ? PAD_ACT_SPEED : PAD_ACT_NONE);
     send_edge_key(changed, buttons, OF_BTN_START, K_ESCAPE);
 
     prev_buttons = buttons;
@@ -335,27 +410,45 @@ void IN_Move(usercmd_t *cmd)
     of_input_state_t st;
     of_input_state(0, &st);
 
+    /* SNAC / digital-pad guard: see pad_analog_seen above. */
+    if (!pad_analog_seen) {
+        if (pad_axis_live(st.joy_lx) || pad_axis_live(st.joy_ly) ||
+            pad_axis_live(st.joy_rx) || pad_axis_live(st.joy_ry))
+            pad_analog_seen = 1;
+        else
+            st.joy_lx = st.joy_ly = st.joy_rx = st.joy_ry = 0;
+    }
+
     if (key_dest == key_game) {
+        int dock = !pad_snac_analog_p1();
         int lx = axis_scaled(st.joy_lx);
         int ly = axis_scaled(st.joy_ly);
         int rx = axis_scaled(st.joy_rx);
         int ry = axis_scaled(st.joy_ry);
 
-        cmd->forwardmove += -ly * cl_forwardspeed.value / 128.0f;
-
-        if (lx) {
-            cl.viewangles[YAW] -= host_frametime * cl_yawspeed.value *
-                                  (float)lx / 128.0f;
-            cl.viewangles[YAW] = anglemod(cl.viewangles[YAW]);
+        if (dock) {
+            lx = axis_curved(lx);   /* soften the dock movement stick */
+            ly = axis_curved(ly);
         }
+
+        cmd->forwardmove += -ly * cl_forwardspeed.value / 128.0f;
+        cmd->sidemove   += lx * cl_sidespeed.value / 128.0f;
+
+        float looksens = 1.0f;
+        if (dock) {
+            looksens = joy_docklook.value;
+            if (looksens < 0.05f)      looksens = 0.05f;
+            else if (looksens > 1.0f)  looksens = 1.0f;
+        }
+
         if (rx) {
             cl.viewangles[YAW] -= host_frametime * cl_yawspeed.value *
-                                  (float)rx / 128.0f;
+                                  looksens * (float)rx / 128.0f;
             cl.viewangles[YAW] = anglemod(cl.viewangles[YAW]);
         }
         if (ry) {
             cl.viewangles[PITCH] += host_frametime * cl_pitchspeed.value *
-                                    (float)ry / 128.0f;
+                                    looksens * (float)ry / 128.0f;
             if (cl.viewangles[PITCH] > 80)
                 cl.viewangles[PITCH] = 80;
             if (cl.viewangles[PITCH] < -70)
@@ -363,7 +456,5 @@ void IN_Move(usercmd_t *cmd)
             V_StopPitchDrift();
         }
 
-        if (st.buttons & OF_BTN_L2) cmd->sidemove -= cl_sidespeed.value;
-        if (st.buttons & OF_BTN_R2) cmd->sidemove += cl_sidespeed.value;
     }
 }

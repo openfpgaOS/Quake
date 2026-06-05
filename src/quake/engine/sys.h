@@ -21,6 +21,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 //
 // file IO
+
+/* openfpgaOS: open save slot 0..9 by its data-slot binding (never by path). */
+FILE *Sys_OpenSaveSlot (int idx, const char *mode);
 //
 
 // returns the file size

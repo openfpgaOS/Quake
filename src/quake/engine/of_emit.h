@@ -177,8 +177,6 @@ void of_emit_depth_test(of_emit_depth_func_t func);
 
 int of_emit_supports(uint32_t cap);
 int of_emit_gpu_ready(void);
-void of_emit_prof_frame_start(void);
-void of_emit_prof_frame_end(void);
 
 /* ------- Draw submission -------------------------------------------- */
 

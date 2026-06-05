@@ -18,7 +18,17 @@
             { "id": 16, "filename": "s6.sav" },
             { "id": 17, "filename": "s7.sav" },
             { "id": 18, "filename": "s8.sav" },
-            { "id": 19, "filename": "s9.sav" }
+            { "id": 19, "filename": "s9.sav" },
+            { "id": 22, "filename": "cd/Quake (USA) (Track 02).bin" },
+            { "id": 23, "filename": "cd/Quake (USA) (Track 03).bin" },
+            { "id": 24, "filename": "cd/Quake (USA) (Track 04).bin" },
+            { "id": 25, "filename": "cd/Quake (USA) (Track 05).bin" },
+            { "id": 26, "filename": "cd/Quake (USA) (Track 06).bin" },
+            { "id": 27, "filename": "cd/Quake (USA) (Track 07).bin" },
+            { "id": 28, "filename": "cd/Quake (USA) (Track 08).bin" },
+            { "id": 29, "filename": "cd/Quake (USA) (Track 09).bin" },
+            { "id": 30, "filename": "cd/Quake (USA) (Track 10).bin" },
+            { "id": 31, "filename": "cd/Quake (USA) (Track 11).bin" }
         ]
     }
 }

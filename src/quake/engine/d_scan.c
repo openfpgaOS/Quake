@@ -49,6 +49,29 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define D_GPU_WORLD_LIGHT 1
 #endif
 
+/* Q29 param setup via the FPU instead of exact 64-bit fixed point.
+ *
+ * The [surf] trace showed `emit` dominating D_DrawSurfaces (~15-20 us
+ * per surface): the int64 path manually decomposes nine IEEE floats,
+ * runs six 64-bit numerator MACs and a 64-bit corner scan -- ~1.5-2k
+ * cycles of soft math per surface on rv32.  But its inputs (d_sdivz*,
+ * d_zi*, computed by D_CalcGradients) are float32 to begin with, so
+ * bit-exact integer arithmetic on top adds no real precision.
+ *
+ * The float path computes the same attr planes in ~30 FPU ops:
+ *   N(coef) = divz_coef + (float)adjust * zi_coef        (value units)
+ *   attr    = (int32)(N * 2^(29-shift))                  (Q29 >> shift)
+ * shift is derived from the exponent of the max |corner| with one
+ * spare bit of headroom, which both keeps the int32 casts in range
+ * (< 2^30) and absorbs per-step truncation drift in the GPU's
+ * interpolator.  Worst-case s/t error vs the int64 path is ~2^-24
+ * relative to the corner max -- far below 1/256 texel.
+ *
+ * Set to 0 to bisect against the exact int64 path. */
+#ifndef D_PARAM_FLOAT_SETUP
+#define D_PARAM_FLOAT_SETUP 1
+#endif
+
 /* D_GPU_WORLD_TRIS is defined in d_local.h so d_edge.c's per-surface
  * dispatch sees the same value. */
 
@@ -66,11 +89,6 @@ unsigned char	*r_turb_pbase, *r_turb_pdest;
 fixed16_t		r_turb_s, r_turb_t, r_turb_sstep, r_turb_tstep;
 int				*r_turb_turb;
 int				r_turb_spancount;
-unsigned int	pq_prof_spans8_cycles_frame;
-unsigned int	pq_prof_spans8_calls_frame;
-unsigned int	pq_prof_zspans_cycles_frame;
-unsigned int	pq_prof_zspans_calls_frame;
-extern cvar_t	pq_cycleprof;
 extern cvar_t	pq_gpu_zwrite;
 extern cvar_t	pq_gpu_world_light;
 extern cvar_t	pq_gpu_persp;
@@ -974,11 +992,6 @@ fall back to older SDK helpers or CPU-side per-16-pixel affine spans.
 PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 {
 	unsigned char *pbase = (unsigned char *)cacheblock;
-	int profiling = (int)pq_cycleprof.value;
-
-	if (profiling)
-		pq_prof_spans8_calls_frame++;
-
 #if D_GPU_WORLD_LIGHT
 	const int gpu_world_light = pq_world_light_mode;
 #else
@@ -1033,27 +1046,11 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 		}
 
 		if (total_records != 0) {
-			const int64_t zi_org_q45 = D_FloatToScaledI64(d_ziorigin, 45);
-			const int64_t zi_stepv_q45 = D_FloatToScaledI64(d_zistepv, 45);
-			const int64_t zi_stepu_q45 = D_FloatToScaledI64(d_zistepu, 45);
-			const int64_t attr_du_q29[3] = {
-				D_Q29NumeratorI64(d_sdivzstepu, sadjust, zi_stepu_q45),
-				D_Q29NumeratorI64(d_tdivzstepu, tadjust, zi_stepu_q45),
-				D_Q29FromQ45I64(zi_stepu_q45),
-			};
-			const int64_t attr_dv_q29[3] = {
-				D_Q29NumeratorI64(d_sdivzstepv, sadjust, zi_stepv_q45),
-				D_Q29NumeratorI64(d_tdivzstepv, tadjust, zi_stepv_q45),
-				D_Q29FromQ45I64(zi_stepv_q45),
-			};
-			const int64_t attr_abs_origin_q29[3] = {
-				D_Q29NumeratorI64(d_sdivzorigin, sadjust, zi_org_q45),
-				D_Q29NumeratorI64(d_tdivzorigin, tadjust, zi_org_q45),
-				D_Q29FromQ45I64(zi_org_q45),
-			};
-			int64_t attr_origin_q29[3];
-			of_emit_param_span_list_t params;
-			unsigned q29_shift;
+			/* Static template: zero-initialised once at load; the
+			 * constant-zero fields (colormap_id, masks, light plane,
+			 * clamp[2], reserved) never change, so skip the ~100-byte
+			 * memset that used to run per surface. */
+			static of_emit_param_span_list_t params;
 			uint8_t flags = OF_EMIT_PERSP;
 			const int gpu_zwrite =
 				(int)pq_gpu_zwrite.value &&
@@ -1061,7 +1058,6 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 				d_pzbuffer != NULL && d_zwidth != 0 &&
 				(flags & (OF_EMIT_SKIP_ZERO | OF_EMIT_COLUMN)) == 0;
 
-			memset(&params, 0, sizeof(params));
 			params.fb_base       = (uint32_t)(uintptr_t)
 				(d_viewbuffer + screenwidth * base_v + base_u);
 			params.fb_major_step = screenwidth;
@@ -1074,23 +1070,116 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 			params.z_mode        = gpu_zwrite ? OF_EMIT_PARAM_Z_WRITE_ZI
 			                                  : OF_EMIT_PARAM_Z_NONE;
 
-			/* Keep record coordinates local to this surface batch. */
-			for (int i = 0; i < 3; i++) {
-				attr_origin_q29[i] = D_SpanMad2I64(attr_abs_origin_q29[i],
-					attr_dv_q29[i], base_v, attr_du_q29[i], base_u);
+#if D_PARAM_FLOAT_SETUP
+			/* FPU fast path — attr planes in value units, scaled to
+			 * Q29>>shift once at pack time.  See D_PARAM_FLOAT_SETUP. */
+			{
+				/* sadjust/tadjust are 16.16 fixed — scale to value
+				 * units to match the int path's adj_hi/adj_lo split
+				 * (N = divz + (adjust/65536)*zi). */
+				const float fsadj = (float)sadjust * (1.0f / 65536.0f);
+				const float ftadj = (float)tadjust * (1.0f / 65536.0f);
+				const float fmu = (float)(max_u - base_u);
+				const float fmv = (float)(max_v - base_v);
+				float f_org[3], f_du[3], f_dv[3];
+				float fmax, scale;
+				int i, sh;
+
+				f_du[0]  = d_sdivzstepu  + fsadj * d_zistepu;
+				f_dv[0]  = d_sdivzstepv  + fsadj * d_zistepv;
+				f_org[0] = d_sdivzorigin + fsadj * d_ziorigin;
+				f_du[1]  = d_tdivzstepu  + ftadj * d_zistepu;
+				f_dv[1]  = d_tdivzstepv  + ftadj * d_zistepv;
+				f_org[1] = d_tdivzorigin + ftadj * d_ziorigin;
+				f_du[2]  = d_zistepu;
+				f_dv[2]  = d_zistepv;
+				f_org[2] = d_ziorigin;
+
+				/* Rebase to the surface batch origin and bound the
+				 * magnitude over coefficients and rect corners (same
+				 * candidate set as D_ParamSurfaceQ29Shift). */
+				fmax = 0.0f;
+				for (i = 0; i < 3; i++) {
+					float o, du_span, dv_span, c;
+
+					f_org[i] += f_dv[i] * (float)base_v +
+					            f_du[i] * (float)base_u;
+					o = f_org[i];
+					du_span = f_du[i] * fmu;
+					dv_span = f_dv[i] * fmv;
+					c = fabsf(o);                     if (c > fmax) fmax = c;
+					c = fabsf(f_du[i]);               if (c > fmax) fmax = c;
+					c = fabsf(f_dv[i]);               if (c > fmax) fmax = c;
+					c = fabsf(o + du_span);           if (c > fmax) fmax = c;
+					c = fabsf(o + dv_span);           if (c > fmax) fmax = c;
+					c = fabsf(o + du_span + dv_span); if (c > fmax) fmax = c;
+				}
+
+				/* fmax < 2^e (exponent from the float bits).  shift =
+				 * e-1 keeps attrs < 2^30: safe int32 casts plus one
+				 * headroom bit for interpolator truncation drift. */
+				{
+					union { float f; uint32_t u; } mb, sb;
+
+					mb.f = fmax;
+					sh = (int)((mb.u >> 23) & 0xFFu) - 126 - 1;
+					if (sh < 0) sh = 0;
+					else if (sh > 31) sh = 31;
+
+					sb.u = (uint32_t)(127 + 29 - sh) << 23;	/* 2^(29-sh) */
+					scale = sb.f;
+				}
+
+				params.q29_attr_shift = (uint8_t)sh;
+				for (i = 0; i < 3; i++) {
+					params.attr_origin[i] = (int32_t)(f_org[i] * scale);
+					params.attr_du[i]     = (int32_t)(f_du[i] * scale);
+					params.attr_dv[i]     = (int32_t)(f_dv[i] * scale);
+				}
 			}
-			q29_shift = D_ParamSurfaceQ29Shift(attr_origin_q29,
-				attr_du_q29, attr_dv_q29,
-				max_u - base_u, max_v - base_v);
-			params.q29_attr_shift = (uint8_t)q29_shift;
-			for (int i = 0; i < 3; i++) {
-				params.attr_origin[i] =
-					D_I64ToI32Sat(D_ShrTrunc64(attr_origin_q29[i], q29_shift));
-				params.attr_du[i] =
-					D_I64ToI32Sat(D_ShrTrunc64(attr_du_q29[i], q29_shift));
-				params.attr_dv[i] =
-					D_I64ToI32Sat(D_ShrTrunc64(attr_dv_q29[i], q29_shift));
+#else
+			/* Exact 64-bit fixed-point path (bisect reference). */
+			{
+				const int64_t zi_org_q45 = D_FloatToScaledI64(d_ziorigin, 45);
+				const int64_t zi_stepv_q45 = D_FloatToScaledI64(d_zistepv, 45);
+				const int64_t zi_stepu_q45 = D_FloatToScaledI64(d_zistepu, 45);
+				const int64_t attr_du_q29[3] = {
+					D_Q29NumeratorI64(d_sdivzstepu, sadjust, zi_stepu_q45),
+					D_Q29NumeratorI64(d_tdivzstepu, tadjust, zi_stepu_q45),
+					D_Q29FromQ45I64(zi_stepu_q45),
+				};
+				const int64_t attr_dv_q29[3] = {
+					D_Q29NumeratorI64(d_sdivzstepv, sadjust, zi_stepv_q45),
+					D_Q29NumeratorI64(d_tdivzstepv, tadjust, zi_stepv_q45),
+					D_Q29FromQ45I64(zi_stepv_q45),
+				};
+				const int64_t attr_abs_origin_q29[3] = {
+					D_Q29NumeratorI64(d_sdivzorigin, sadjust, zi_org_q45),
+					D_Q29NumeratorI64(d_tdivzorigin, tadjust, zi_org_q45),
+					D_Q29FromQ45I64(zi_org_q45),
+				};
+				int64_t attr_origin_q29[3];
+				unsigned q29_shift;
+
+				/* Keep record coordinates local to this surface batch. */
+				for (int i = 0; i < 3; i++) {
+					attr_origin_q29[i] = D_SpanMad2I64(attr_abs_origin_q29[i],
+						attr_dv_q29[i], base_v, attr_du_q29[i], base_u);
+				}
+				q29_shift = D_ParamSurfaceQ29Shift(attr_origin_q29,
+					attr_du_q29, attr_dv_q29,
+					max_u - base_u, max_v - base_v);
+				params.q29_attr_shift = (uint8_t)q29_shift;
+				for (int i = 0; i < 3; i++) {
+					params.attr_origin[i] =
+						D_I64ToI32Sat(D_ShrTrunc64(attr_origin_q29[i], q29_shift));
+					params.attr_du[i] =
+						D_I64ToI32Sat(D_ShrTrunc64(attr_du_q29[i], q29_shift));
+					params.attr_dv[i] =
+						D_I64ToI32Sat(D_ShrTrunc64(attr_dv_q29[i], q29_shift));
+				}
 			}
+#endif
 			params.clamp_min[0] = 0;
 			params.clamp_max[0] = bbextents;
 			params.clamp_min[1] = 0;
@@ -1100,6 +1189,10 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 					(d_pzbuffer + d_zwidth * base_v + base_u);
 				params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
 				params.z_minor_step = (int32_t)sizeof(short);
+			} else {
+				params.z_base = 0;
+				params.z_major_step = 0;
+				params.z_minor_step = 0;
 			}
 
 			uint32_t batch_count = 0;
@@ -1330,11 +1423,6 @@ PQ_FASTTEXT void D_DrawZSpans (espan_t *pspan)
 	float  du, dv;
 	int    doublecount;
 	unsigned ltemp;
-	int profiling = (int)pq_cycleprof.value;
-
-	if (profiling)
-		pq_prof_zspans_calls_frame++;
-
 	izistep = (int)(d_zistepu * 0x8000 * 0x10000);
 
 	do

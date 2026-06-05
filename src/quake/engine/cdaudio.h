@@ -25,3 +25,5 @@ void CDAudio_Pause(void);
 void CDAudio_Resume(void);
 void CDAudio_Shutdown(void);
 void CDAudio_Update(void);
+void CDAudio_DrainAsync(void);
+void CDAudio_PostponeResume(int ms);

@@ -16,15 +16,10 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
 
 /* Quake globals */
 qboolean isDedicated = false;
-
-/* Hang-debug stage counters — Quake wrote these from various hot
- * paths so a post-mortem hex dump of SDRAM would show where execution
- * had last been. Not needed here, but still written by the engine. */
-volatile unsigned int pq_dbg_stage;
-volatile unsigned int pq_dbg_info;
 
 #define QUAKE_CONFIG_SECTION "quake"
 #define QUAKE_DEFAULT_CONFIG "quake.cfg"
@@ -268,6 +263,16 @@ int Sys_QuakePackPath(char *dir, int pak_index, char *out, int out_size)
     return -1;
 }
 
+/* Read an integer from the [quake] section of the .ini, or return def.
+ * Lets debug knobs (e.g. host_speeds) be enabled without console input. */
+int Sys_IniGetInt(const char *key, int def)
+{
+    char val[32];
+    if (of_config_get(QUAKE_CONFIG_SECTION, key, val, sizeof(val)) == 0 && val[0])
+        return atoi(val);
+    return def;
+}
+
 /* ---------------- File I/O ------------------------------------------ */
 
 #define MAX_HANDLES 16
@@ -293,7 +298,9 @@ int filelength(FILE *f)
 
 int Sys_FileOpenRead(char *path, int *hndl)
 {
-    int i = findhandle();
+    int i;
+    CDAudio_DrainAsync();   /* free the slot bridge before a blocking read */
+    i = findhandle();
     int mapped_config = Sys_IsConfigPath(path);
     const char *name = Sys_MapConfigName(path);
     FILE *f = fopen(name, "rb");
@@ -340,6 +347,7 @@ int Sys_FileRead(int handle, void *dest, int count)
 {
     if (handle <= 0 || handle >= MAX_HANDLES || !sys_handles[handle])
         return 0;
+    CDAudio_DrainAsync();   /* free the slot bridge before a blocking read */
     return (int)fread(dest, 1, (size_t)count, sys_handles[handle]);
 }
 
@@ -351,7 +359,9 @@ int Sys_FileWrite(int handle, void *data, int count)
 
 int Sys_FileTime(char *path)
 {
-    int mapped_config = Sys_IsConfigPath(path);
+    int mapped_config;
+    CDAudio_DrainAsync();   /* free the slot bridge before a blocking open */
+    mapped_config = Sys_IsConfigPath(path);
     const char *name = Sys_MapConfigName(path);
     FILE *f = fopen(name, "rb");
     if (!f && !mapped_config) f = fopen(path, "rb");
@@ -368,9 +378,46 @@ int Sys_FileTime(char *path)
 void Sys_mkdir(char *path) { (void)path; }
 
 /* ---------------- Save games ---------------------------------------- *
- * Save files and Quake configs are resolved by openfpgaOS filename bindings from
- * the APF instance file: s0.sav..s9.sav map to save data slots 10..19, while
- * the current instance's cfg file maps to the pre-save nonvolatile config slot 8. */
+ * Save files are bound by the APF instance file: s0.sav..s9.sav map to the
+ * nonvolatile save data slots 10..19 (the current instance's cfg file maps
+ * to config slot 8).  Bound slots appear as flat names in the kernel's
+ * virtual root — they must be resolved by slot id and opened by that name,
+ * never by a guessed "<gamedir>/sN.sav" path (same rule as the CD track
+ * resolution in cd_of.c: path-based opens of unbound names can wedge the
+ * slot bridge). */
+
+#define SYS_SAVE_SLOT_FIRST 10
+#define SYS_SAVE_SLOT_COUNT 10
+
+FILE *Sys_OpenSaveSlot(int idx, const char *mode)
+{
+    DIR *d;
+    struct dirent *e;
+    char name[64];
+    int found = 0;
+
+    if (idx < 0 || idx >= SYS_SAVE_SLOT_COUNT)
+        return NULL;
+
+    CDAudio_DrainAsync();   /* free the slot bridge before a blocking open */
+
+    d = opendir("/");
+    if (!d)
+        return NULL;
+    while ((e = readdir(d)) != NULL) {
+        if ((int)e->d_ino - 1 == SYS_SAVE_SLOT_FIRST + idx) {
+            snprintf(name, sizeof(name), "%s", e->d_name);
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+
+    if (!found)
+        return NULL;
+
+    return fopen(name, mode);
+}
 
 /* ---------------- Time ---------------------------------------------- */
 
@@ -423,18 +470,6 @@ void Sys_MakeCodeWriteable(unsigned long a, unsigned long b)
 
 /* DMA stats — stub for parity with Quake's terminal dump. */
 void Sys_PrintDmaStats(void) { }
-
-/* Quake's on-screen debug terminal.  The engine drives this as a
- * cursor-positioned grid (term_setpos + term_puts per row), but on
- * openfpgaOS there is no real TUI — output goes to UART.  Map each
- * row to one printed line: term_setpos becomes a no-op (row/col carry
- * no meaning over a serial stream), and term_puts emits the payload
- * followed by CRLF so each row lands on its own line in a UART log.
- * term_clear emits a leading blank line so consecutive dumps are
- * visually separated. */
-void term_clear(void)                 { fputs("\r\n", stdout); }
-void term_setpos(int row, int col)    { (void)row; (void)col; }
-void term_puts(const char *s)         { if (s) { fputs(s, stdout); fputs("\r\n", stdout); } }
 
 /* Quake SRAM-fill coprocessor — not present on openfpgaOS.  Stubbed. */
 void sram_fill_start(uint32_t dst, uint16_t value, uint32_t count)

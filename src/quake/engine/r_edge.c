@@ -23,27 +23,6 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_local.h"
 #include "sysreg_stub.h"
 
-/* Sub-profiling for R_ScanEdges breakdown */
-unsigned int pq_prof_se_insert_cycles;
-unsigned int pq_prof_se_generate_cycles;
-unsigned int pq_prof_se_step_cycles;
-unsigned int pq_prof_se_remove_cycles;   /* per-scanline R_RemoveEdges_Array */
-unsigned int pq_prof_se_final_cycles;    /* post-loop final-scan flush block */
-unsigned int pq_prof_aet_peak;
-unsigned int pq_prof_aet_peak_scanline;
-unsigned int pq_prof_aet_total_edges;
-unsigned int pq_prof_se_draw_cycles;
-unsigned int pq_prof_hw_spans_total;
-unsigned int pq_prof_hw_spans_linked;
-unsigned int pq_dbg_hw_nspans;
-unsigned int pq_dbg_hw_raw[3];
-unsigned int pq_dbg_hw_edges;
-unsigned int pq_dbg_hw_first_edge;
-unsigned int pq_dbg_hw_state;
-unsigned int pq_dbg_hw_edges_reg;
-static int pq_dbg_hw_captured;
-extern cvar_t pq_cycleprof;
-
 #if 0
 // FIXME
 the complex cases add new polys on most lines, so dont optimize for keeping them the same
@@ -66,7 +45,6 @@ surf_t	*surfaces, *surface_p, *surf_max;
 // surfaces[1] is the background, and is used as the active surface stack
 
 edge_t	*newedges[MAXHEIGHT];
-edge_t	*removeedges[MAXHEIGHT];
 
 espan_t	*span_p, *max_span_p;
 
@@ -78,7 +56,6 @@ int	current_iv;
 
 int	edge_head_u_shift20, edge_tail_u_shift20;
 
-static void (*pdrawfunc)(void);
 static void (*pdrawfunc_array)(void);
 
 edge_t	edge_head;
@@ -93,10 +70,10 @@ float	fv;
 Array-based Active Edge Table (AET) — Structure-of-Arrays layout
 
 SoA splits hot fields into separate arrays for optimal cache utilization
-on VexiiRiscv's single-issue in-order pipeline.  R_StepActiveU_Array only
-touches aet_u[] and aet_u_step[] (8 bytes/edge instead of 16), doubling
-the number of edges per cache line.  aet_surfs[] and aet_v_end[] are only
-accessed in GenerateSpans and RemoveEdges respectively.
+on VexiiRiscv's single-issue in-order pipeline.  R_StepRemoveEdges_Array
+only touches aet_v_end[], aet_u[] and aet_u_step[] (small sequential
+loads instead of 16-byte structs).  aet_surfs[] is only accessed in
+GenerateSpans.
 
 sort_keys[] mirrors aet_u[aet_order[i]] so the insertion sort inner loop
 uses a direct array compare instead of a double-indirected struct load,
@@ -115,17 +92,9 @@ static int aet_alloc;                                // next free pool slot (mon
 // Store v_end in edge_t->prev (unused by array-based AET, same cache line as u/surfs)
 #define EDGE_V_END(e)  ((unsigned short)(unsigned long)((e)->prev))
 
-void R_GenerateSpans (void);
-void R_GenerateSpansBackward (void);
-
-void R_LeadingEdge (edge_t *edge);
-void R_LeadingEdgeBackwards (edge_t *edge);
-void R_TrailingEdge (surf_t *surf, edge_t *edge);
-
 // Array-based AET functions
 void R_InsertNewEdges_Array (edge_t *edgestoadd);
-void R_RemoveEdges_Array (int iv);
-void R_StepActiveU_Array (void);
+void R_StepRemoveEdges_Array (int iv);
 void R_GenerateSpans_Array (void);
 void R_GenerateSpansBackward_Array (void);
 void R_TrailingEdge_A (surf_t *surf, int u);
@@ -199,14 +168,12 @@ PQ_FASTTEXT void R_BeginEdgeFrame (void)
 // put the background behind everything in the world
 	if (r_draworder.value)
 	{
-		pdrawfunc = R_GenerateSpansBackward;
 		pdrawfunc_array = R_GenerateSpansBackward_Array;
 		surfaces[1].key = 0;
 		r_currentkey = 1;
 	}
 	else
 	{
-		pdrawfunc = R_GenerateSpans;
 		pdrawfunc_array = R_GenerateSpans_Array;
 		surfaces[1].key = 0x7FFFFFFF;
 		r_currentkey = 0;
@@ -215,142 +182,8 @@ PQ_FASTTEXT void R_BeginEdgeFrame (void)
 	{
 		int height = r_refdef.vrectbottom - r_refdef.vrect.y;
 		memset (&newedges[r_refdef.vrect.y], 0, height * sizeof(edge_t *));
-		memset (&removeedges[r_refdef.vrect.y], 0, height * sizeof(edge_t *));
 	}
 }
-
-
-#if	!id386
-
-/*
-==============
-R_InsertNewEdges
-
-Adds the edges in the linked list edgestoadd, adding them to the edges in the
-linked list edgelist.  edgestoadd is assumed to be sorted on u, and non-empty (this is actually newedges[v]).  edgelist is assumed to be sorted on u, with a
-sentinel at the end (actually, this is the active edge table starting at
-edge_head.next).
-==============
-*/
-PQ_HOT void R_InsertNewEdges (edge_t *edgestoadd, edge_t *edgelist)
-{
-	edge_t	*next_edge;
-
-	do
-	{
-		next_edge = edgestoadd->next;
-	edgesearch:
-		if (edgelist->u >= edgestoadd->u)
-			goto addedge;
-		edgelist=edgelist->next;
-		if (edgelist->u >= edgestoadd->u)
-			goto addedge;
-		edgelist=edgelist->next;
-		if (edgelist->u >= edgestoadd->u)
-			goto addedge;
-		edgelist=edgelist->next;
-		if (edgelist->u >= edgestoadd->u)
-			goto addedge;
-		edgelist=edgelist->next;
-		goto edgesearch;
-
-	// insert edgestoadd before edgelist
-addedge:
-		edgestoadd->next = edgelist;
-		edgestoadd->prev = edgelist->prev;
-		edgelist->prev->next = edgestoadd;
-		edgelist->prev = edgestoadd;
-	} while ((edgestoadd = next_edge) != NULL);
-}
-
-#endif	// !id386
-	
-
-#if	!id386
-
-/*
-==============
-R_RemoveEdges
-==============
-*/
-PQ_HOT void R_RemoveEdges (edge_t *pedge)
-{
-
-	do
-	{
-		pedge->next->prev = pedge->prev;
-		pedge->prev->next = pedge->next;
-	} while ((pedge = pedge->nextremove) != NULL);
-}
-
-#endif	// !id386
-
-
-#if	!id386
-
-/*
-==============
-R_StepActiveU
-==============
-*/
-PQ_HOT void R_StepActiveU (edge_t *pedge)
-{
-	edge_t		*pnext_edge, *pwedge;
-
-	while (1)
-	{
-	nextedge:
-		pedge->u += pedge->u_step;
-		if (pedge->u < pedge->prev->u)
-			goto pushback;
-		pedge = pedge->next;
-			
-		pedge->u += pedge->u_step;
-		if (pedge->u < pedge->prev->u)
-			goto pushback;
-		pedge = pedge->next;
-			
-		pedge->u += pedge->u_step;
-		if (pedge->u < pedge->prev->u)
-			goto pushback;
-		pedge = pedge->next;
-			
-		pedge->u += pedge->u_step;
-		if (pedge->u < pedge->prev->u)
-			goto pushback;
-		pedge = pedge->next;
-			
-		goto nextedge;		
-		
-pushback:
-		if (pedge == &edge_aftertail)
-			return;
-			
-	// push it back to keep it sorted		
-		pnext_edge = pedge->next;
-
-	// pull the edge out of the edge list
-		pedge->next->prev = pedge->prev;
-		pedge->prev->next = pedge->next;
-
-		// find out where the edge goes in the edge list
-		pwedge = pedge->prev->prev;
-		while (pwedge->u > pedge->u)
-			pwedge = pwedge->prev;
-
-	// put the edge back into the edge list
-		pedge->next = pwedge->next;
-		pedge->prev = pwedge;
-		pedge->next->prev = pedge;
-		pwedge->next = pedge;
-
-		pedge = pnext_edge;
-		if (pedge == &edge_tail)
-			return;
-	}
-}
-
-#endif	// !id386
 
 
 /*
@@ -384,326 +217,6 @@ PQ_FASTTEXT void R_CleanupSpan ()
 		surf->spanstate = 0;
 		surf = surf->next;
 	} while (surf != &surfaces[1]);
-}
-
-
-/*
-==============
-R_LeadingEdgeBackwards
-==============
-*/
-PQ_HOT void R_LeadingEdgeBackwards (edge_t *edge)
-{
-	espan_t			*span;
-	surf_t			*surf, *surf2;
-	int				iu;
-
-// it's adding a new surface in, so find the correct place
-	surf = &surfaces[edge->surfs[1]];
-
-// don't start a span if this is an inverted span, with the end
-// edge preceding the start edge (that is, we've already seen the
-// end edge)
-	if (++surf->spanstate == 1)
-	{
-		surf2 = surfaces[1].next;
-
-		if (surf->key > surf2->key)
-			goto newtop;
-
-	// if it's two surfaces on the same plane, the one that's already
-	// active is in front, so keep going unless it's a bmodel
-		if (surf->insubmodel && (surf->key == surf2->key))
-		{
-		// must be two bmodels in the same leaf; don't care, because they'll
-		// never be farthest anyway
-			goto newtop;
-		}
-
-continue_search:
-
-		do
-		{
-			surf2 = surf2->next;
-		} while (surf->key < surf2->key);
-
-		if (surf->key == surf2->key)
-		{
-		// if it's two surfaces on the same plane, the one that's already
-		// active is in front, so keep going unless it's a bmodel
-			if (!surf->insubmodel)
-				goto continue_search;
-
-		// must be two bmodels in the same leaf; don't care which is really
-		// in front, because they'll never be farthest anyway
-		}
-
-		goto gotposition;
-
-newtop:
-	// emit a span (obscures current top)
-		iu = edge->u >> 20;
-
-		if (iu > surf2->last_u)
-		{
-			span = span_p++;
-			span->u = surf2->last_u;
-			span->count = iu - span->u;
-			span->v = current_iv;
-			span->pnext = surf2->spans;
-			surf2->spans = span;
-		}
-
-		// set last_u on the new span
-		surf->last_u = iu;
-				
-gotposition:
-	// insert before surf2
-		surf->next = surf2;
-		surf->prev = surf2->prev;
-		surf2->prev->next = surf;
-		surf2->prev = surf;
-	}
-}
-
-
-/*
-==============
-R_TrailingEdge
-==============
-*/
-PQ_HOT void R_TrailingEdge (surf_t *surf, edge_t *edge)
-{
-	espan_t			*span;
-	int				iu;
-
-// don't generate a span if this is an inverted span, with the end
-// edge preceding the start edge (that is, we haven't seen the
-// start edge yet)
-	if (--surf->spanstate == 0)
-	{
-		if (surf->insubmodel)
-			r_bmodelactive--;
-
-		if (surf == surfaces[1].next)
-		{
-		// emit a span (current top going away)
-			iu = edge->u >> 20;
-			if (iu > surf->last_u)
-			{
-				span = span_p++;
-				span->u = surf->last_u;
-				span->count = iu - span->u;
-				span->v = current_iv;
-				span->pnext = surf->spans;
-				surf->spans = span;
-			}
-
-		// set last_u on the surface below
-			surf->next->last_u = iu;
-		}
-
-		surf->prev->next = surf->next;
-		surf->next->prev = surf->prev;
-	}
-}
-
-
-#if	!id386
-
-/*
-==============
-R_LeadingEdge
-==============
-*/
-PQ_HOT void R_LeadingEdge (edge_t *edge)
-{
-	espan_t			*span;
-	surf_t			*surf, *surf2;
-	int				iu;
-	float			fu, newzi, testzi, newzitop, newzibottom;
-
-	if (edge->surfs[1])
-	{
-	// it's adding a new surface in, so find the correct place
-		surf = &surfaces[edge->surfs[1]];
-
-	// don't start a span if this is an inverted span, with the end
-	// edge preceding the start edge (that is, we've already seen the
-	// end edge)
-		if (++surf->spanstate == 1)
-		{
-			if (surf->insubmodel)
-				r_bmodelactive++;
-
-			surf2 = surfaces[1].next;
-
-			if (surf->key < surf2->key)
-				goto newtop;
-
-		// if it's two surfaces on the same plane, the one that's already
-		// active is in front, so keep going unless it's a bmodel
-			if (surf->insubmodel && (surf->key == surf2->key))
-			{
-			// must be two bmodels in the same leaf; sort on 1/z
-				fu = (float)(edge->u - 0xFFFFF) * (1.0 / 0x100000);
-				newzi = surf->d_ziorigin + fv*surf->d_zistepv +
-						fu*surf->d_zistepu;
-				newzibottom = newzi * 0.99;
-
-				testzi = surf2->d_ziorigin + fv*surf2->d_zistepv +
-						fu*surf2->d_zistepu;
-
-				if (newzibottom >= testzi)
-				{
-					goto newtop;
-				}
-
-				newzitop = newzi * 1.01;
-				if (newzitop >= testzi)
-				{
-					if (surf->d_zistepu >= surf2->d_zistepu)
-					{
-						goto newtop;
-					}
-				}
-			}
-
-continue_search:
-
-			do
-			{
-				surf2 = surf2->next;
-			} while (surf->key > surf2->key);
-
-			if (surf->key == surf2->key)
-			{
-			// if it's two surfaces on the same plane, the one that's already
-			// active is in front, so keep going unless it's a bmodel
-				if (!surf->insubmodel)
-					goto continue_search;
-
-			// must be two bmodels in the same leaf; sort on 1/z
-				fu = (float)(edge->u - 0xFFFFF) * (1.0 / 0x100000);
-				newzi = surf->d_ziorigin + fv*surf->d_zistepv +
-						fu*surf->d_zistepu;
-				newzibottom = newzi * 0.99;
-
-				testzi = surf2->d_ziorigin + fv*surf2->d_zistepv +
-						fu*surf2->d_zistepu;
-
-				if (newzibottom >= testzi)
-				{
-					goto gotposition;
-				}
-
-				newzitop = newzi * 1.01;
-				if (newzitop >= testzi)
-				{
-					if (surf->d_zistepu >= surf2->d_zistepu)
-					{
-						goto gotposition;
-					}
-				}
-
-				goto continue_search;
-			}
-
-			goto gotposition;
-
-newtop:
-		// emit a span (obscures current top)
-			iu = edge->u >> 20;
-
-			if (iu > surf2->last_u)
-			{
-				span = span_p++;
-				span->u = surf2->last_u;
-				span->count = iu - span->u;
-				span->v = current_iv;
-				span->pnext = surf2->spans;
-				surf2->spans = span;
-			}
-
-			// set last_u on the new span
-			surf->last_u = iu;
-				
-gotposition:
-		// insert before surf2
-			surf->next = surf2;
-			surf->prev = surf2->prev;
-			surf2->prev->next = surf;
-			surf2->prev = surf;
-		}
-	}
-}
-
-
-/*
-==============
-R_GenerateSpans
-==============
-*/
-PQ_HOT void R_GenerateSpans (void)
-{
-	edge_t			*edge;
-	surf_t			*surf;
-
-	r_bmodelactive = 0;
-
-// clear active surfaces to just the background surface
-	surfaces[1].next = surfaces[1].prev = &surfaces[1];
-	surfaces[1].last_u = edge_head_u_shift20;
-
-// generate spans
-	for (edge=edge_head.next ; edge != &edge_tail; edge=edge->next)
-	{			
-		if (edge->surfs[0])
-		{
-		// it has a left surface, so a surface is going away for this span
-			surf = &surfaces[edge->surfs[0]];
-
-			R_TrailingEdge (surf, edge);
-
-			if (!edge->surfs[1])
-				continue;
-		}
-
-		R_LeadingEdge (edge);
-	}
-
-	R_CleanupSpan ();
-}
-
-#endif	// !id386
-
-
-/*
-==============
-R_GenerateSpansBackward
-==============
-*/
-PQ_HOT void R_GenerateSpansBackward (void)
-{
-	edge_t			*edge;
-
-	r_bmodelactive = 0;
-
-// clear active surfaces to just the background surface
-	surfaces[1].next = surfaces[1].prev = &surfaces[1];
-	surfaces[1].last_u = edge_head_u_shift20;
-
-// generate spans
-	for (edge=edge_head.next ; edge != &edge_tail; edge=edge->next)
-	{			
-		if (edge->surfs[0])
-			R_TrailingEdge (&surfaces[edge->surfs[0]], edge);
-
-		if (edge->surfs[1])
-			R_LeadingEdgeBackwards (edge);
-	}
-
-	R_CleanupSpan ();
 }
 
 
@@ -780,92 +293,60 @@ PQ_FASTTEXT void R_InsertNewEdges_Array (edge_t *edgestoadd)
 
 /*
 ==============
-R_RemoveEdges_Array
+R_StepRemoveEdges_Array
 
-Compact out entries whose v_end == current scanline.
+Single pass per scanline over the sorted AET: drop entries whose
+v_end == iv (edge ended on this scanline), step u for the survivors,
+and rewrite aet_order[]/sort_keys[] compacted.  Then restore order
+with a nearly-sorted insertion sort (~O(n)).
+
+Replaces the separate R_RemoveEdges_Array + R_StepActiveU_Array
+passes — one traversal of the active table per scanline instead of
+two, on VexiiRiscv's single-issue in-order pipeline that's ~a third
+of the per-scanline AET maintenance cost.
+
+SoA layout: aet_u[] / aet_u_step[] / aet_v_end[] are separate
+arrays, so each load is small and sequential loads through
+aet_order[] prefetch well.
 ==============
 */
-PQ_FASTTEXT void R_RemoveEdges_Array (int iv)
+PQ_FASTTEXT void R_StepRemoveEdges_Array (int iv)
 {
-	int i, j;
+	int i, j, n;
 
-	for (i = 0, j = 0; i < aet_count; i++)
+	n = aet_count;
+	for (i = 0, j = 0; i < n; i++)
 	{
-		if (aet_v_end[aet_order[i]] != iv)
-		{
-			sort_keys[j] = sort_keys[i];
-			aet_order[j] = aet_order[i];
-			j++;
-		}
+		int idx = aet_order[i];
+		int u;
+
+		if (aet_v_end[idx] == iv)
+			continue;		// edge ends on this scanline — drop it
+
+		u = aet_u[idx] + aet_u_step[idx];
+		aet_u[idx] = u;
+		aet_order[j] = idx;
+		sort_keys[j] = u;
+		j++;
 	}
 	aet_count = j;
-}
-
-
-/*
-==============
-R_StepActiveU_Array
-
-Step all u values, then insertion sort (nearly sorted -> ~O(n)).
-==============
-*/
-unsigned int pq_prof_aet_step_max;  // max aet_count seen during Step
-
-PQ_FASTTEXT void R_StepActiveU_Array (void)
-{
-	int i;
-
-	if (aet_count > (int)pq_prof_aet_step_max)
-		pq_prof_aet_step_max = aet_count;
-
-	// Step all active u values and update sort_keys[] in lockstep.
-	// SoA layout: aet_u[] and aet_u_step[] are separate arrays,
-	// so each load is 4 bytes (16 values per cache line) vs 16 bytes
-	// per struct in the old AoS layout (4 per line).
-	// Unrolled 2x so the compiler can schedule independent loads
-	// for edge i+1 while processing stores for edge i (hides
-	// dependent-load stalls on in-order pipeline).
-	{
-		int n = aet_count;
-		for (i = 0; i + 1 < n; i += 2)
-		{
-			int idx0 = aet_order[i];
-			int idx1 = aet_order[i+1];
-			int u0 = aet_u[idx0] + aet_u_step[idx0];
-			int u1 = aet_u[idx1] + aet_u_step[idx1];
-			aet_u[idx0] = u0;
-			aet_u[idx1] = u1;
-			sort_keys[i]   = u0;
-			sort_keys[i+1] = u1;
-		}
-		if (i < n)
-		{
-			int idx = aet_order[i];
-			int u = aet_u[idx] + aet_u_step[idx];
-			aet_u[idx] = u;
-			sort_keys[i] = u;
-		}
-	}
 
 	// Insertion sort using sort_keys[] — direct array comparison,
-	// no double indirection (sort_keys[j] vs aet[aet_order[j]].u).
-	// The inner loop compare is now a single sequential load instead
-	// of two dependent loads, saving 3-4 cycles per comparison on
-	// VexiiRiscv's single-issue in-order pipeline.
-	for (i = 1; i < aet_count; i++)
+	// no double indirection (sort_keys[k] vs aet[aet_order[k]].u).
+	for (i = 1; i < j; i++)
 	{
 		int key = sort_keys[i];
 		if (key < sort_keys[i-1])
 		{
 			int idx = aet_order[i];
-			int j = i - 1;
+			int k = i - 1;
 			do {
-				sort_keys[j+1] = sort_keys[j];
-				aet_order[j+1] = aet_order[j];
-				j--;
-			} while (j >= 0 && sort_keys[j] > key);
-			sort_keys[j+1] = key;
-			aet_order[j+1] = idx;
+				sort_keys[k+1] = sort_keys[k];
+				aet_order[k+1] = aet_order[k];
+				k--;
+			} while (k >= 0 && sort_keys[k] > key);
+			sort_keys[k+1] = key;
+			aet_order[k+1] = idx;
 		}
 	}
 }
@@ -1148,17 +629,6 @@ PQ_HOT void R_GenerateSpans_HW (void)
 	{
 		int nspans = SCAN_SPAN_COUNT;
 		int max_si = surface_p - surfaces;
-		int do_capture = (!pq_dbg_hw_captured && hw_count > 0);
-		pq_prof_hw_spans_total += nspans;
-
-		if (do_capture) {
-			pq_dbg_hw_captured = 1;
-			pq_dbg_hw_nspans = nspans;
-			pq_dbg_hw_edges = hw_count;
-			pq_dbg_hw_first_edge = SCAN_DBG_FIRST_EDGE;
-			pq_dbg_hw_state = SCAN_DBG_STATE;
-			pq_dbg_hw_edges_reg = SCAN_DBG_EDGES;
-		}
 
 		if (nspans > 512)
 			nspans = 0;  // garbage — HW not responding correctly
@@ -1167,9 +637,6 @@ PQ_HOT void R_GenerateSpans_HW (void)
 			int si  = hw & 0x3FF;
 			int u   = (hw >> 10) & 0x3FF;
 			int cnt = (hw >> 20) & 0x3FF;
-
-			if (do_capture && i < 3)
-				pq_dbg_hw_raw[i] = hw;
 
 			if (si < 1 || si >= max_si || cnt == 0)
 				continue;  // skip invalid spans
@@ -1180,7 +647,6 @@ PQ_HOT void R_GenerateSpans_HW (void)
 				span->v = current_iv;
 				span->pnext = surfaces[si].spans;
 				surfaces[si].spans = span;
-				pq_prof_hw_spans_linked++;
 			}
 		}
 	}
@@ -1272,30 +738,17 @@ Each surface has a linked list of its visible spans
 ==============
 */
 
+/* Span-fill (D_DrawSurfaces) time accumulates here for the host.c [edge]
+ * trace; defined in r_main.c, reset per frame in R_EdgeDrawing. */
+extern float r_t_surf;
+extern cvar_t host_speeds;
+
 PQ_FASTTEXT void R_ScanEdges (void)
 {
 	int		iv, bottom;
 	static byte	basespans[MAXSPANS*sizeof(espan_t)+CACHE_SIZE];
 	espan_t	*basespan_p;
 	surf_t	*s;
-	int profiling = (int)pq_cycleprof.value;
-	unsigned int prof_t;
-	unsigned int prof_delta;
-	unsigned int final_t;
-	unsigned int final_attr;
-
-	if (profiling) {
-		pq_prof_se_insert_cycles = 0;
-		pq_prof_se_generate_cycles = 0;
-		pq_prof_se_step_cycles = 0;
-		pq_prof_se_draw_cycles = 0;
-		pq_prof_se_remove_cycles = 0;
-		pq_prof_se_final_cycles = 0;
-		pq_prof_hw_spans_total = 0;
-		pq_prof_hw_spans_linked = 0;
-		pq_prof_aet_peak = 0;
-		pq_prof_aet_peak_scanline = 0;
-	}
 
 	basespan_p = (espan_t *)
 			((long)(basespans + CACHE_SIZE - 1) & ~(CACHE_SIZE - 1));
@@ -1321,10 +774,6 @@ PQ_FASTTEXT void R_ScanEdges (void)
 		scanline_load_surface(s - surfaces, s->key, s->insubmodel);
 	SCAN_EDGE_HEAD_U = edge_head_u_shift20;
 	SCAN_EDGE_TAIL_U = edge_tail_u_shift20;
-	// Debug: read scanline regs (now at 0x60, no ATM collision)
-	pq_dbg_hw_state = SCAN_STATUS;
-	pq_dbg_hw_edges_reg = SCAN_DBG_EDGES;
-	pq_dbg_hw_first_edge = SCAN_DBG_FIRST_EDGE;
 #endif
 
 //
@@ -1341,37 +790,25 @@ PQ_FASTTEXT void R_ScanEdges (void)
 		surfaces[1].spanstate = 1;
 
 		if (newedges[iv])
-		{
-			if (profiling) prof_t = SYS_CYCLE_LO;
 			R_InsertNewEdges_Array (newedges[iv]);
-			if (profiling) pq_prof_se_insert_cycles += SYS_CYCLE_LO - prof_t;
-		}
 
-		if (profiling && aet_count > (int)pq_prof_aet_peak) {
-			pq_prof_aet_peak = aet_count;
-			pq_prof_aet_peak_scanline = iv;
-		}
-
-		if (profiling) prof_t = SYS_CYCLE_LO;
 #if HW_SCANLINE_ACCEL
 		R_GenerateSpans_HW ();
 #else
 		(*pdrawfunc_array) ();
 #endif
-		if (profiling) pq_prof_se_generate_cycles += SYS_CYCLE_LO - prof_t;
 
 	// flush the span list if we can't be sure we have enough spans left for
 	// the next scan
 		if (span_p >= max_span_p)
 		{
-			if (profiling) prof_t = SYS_CYCLE_LO;
-
 			if (r_drawculledpolys)
 				R_DrawCulledPolys ();
-			else
+			else {
+				float _ts = host_speeds.value ? Sys_FloatTime () : 0;
 				D_DrawSurfaces ();
-
-			if (profiling) pq_prof_se_draw_cycles += SYS_CYCLE_LO - prof_t;
+				if (host_speeds.value) r_t_surf += Sys_FloatTime () - _ts;
+			}
 
 		// clear the surface span pointers
 			for (s = &surfaces[1] ; s<surface_p ; s++)
@@ -1380,23 +817,10 @@ PQ_FASTTEXT void R_ScanEdges (void)
 			span_p = basespan_p;
 		}
 
-		if (profiling) prof_t = SYS_CYCLE_LO;
-		R_RemoveEdges_Array (iv);
-		if (profiling) pq_prof_se_remove_cycles += SYS_CYCLE_LO - prof_t;
-
-		if (profiling) prof_t = SYS_CYCLE_LO;
-		if (aet_count > 0)
-			R_StepActiveU_Array ();
-		if (profiling) pq_prof_se_step_cycles += SYS_CYCLE_LO - prof_t;
+		R_StepRemoveEdges_Array (iv);
 	}
 
-// do the last scan (no need to step or sort or remove on the last scan).
-// This block was the bulk of SE.Other before — D_DrawSurfaces here flushes
-// every surface that didn't trigger an in-loop overflow, which in
-// typical scenes is most of them.
-	final_attr = 0;
-	if (profiling) final_t = SYS_CYCLE_LO;
-
+// do the last scan (no need to step or sort or remove on the last scan)
 	current_iv = iv;
 	fv = (float)iv;
 
@@ -1404,46 +828,20 @@ PQ_FASTTEXT void R_ScanEdges (void)
 	surfaces[1].spanstate = 1;
 
 	if (newedges[iv])
-	{
-		if (profiling) prof_t = SYS_CYCLE_LO;
 		R_InsertNewEdges_Array (newedges[iv]);
-		if (profiling) {
-			prof_delta = SYS_CYCLE_LO - prof_t;
-			pq_prof_se_insert_cycles += prof_delta;
-			final_attr += prof_delta;
-		}
-	}
 
-	if (profiling) prof_t = SYS_CYCLE_LO;
 #if HW_SCANLINE_ACCEL
 	R_GenerateSpans_HW ();
 #else
 	(*pdrawfunc_array) ();
 #endif
-	if (profiling) {
-		prof_delta = SYS_CYCLE_LO - prof_t;
-		pq_prof_se_generate_cycles += prof_delta;
-		final_attr += prof_delta;
-	}
 
 // draw whatever's left in the span list
-	if (profiling) prof_t = SYS_CYCLE_LO;
 	if (r_drawculledpolys)
 		R_DrawCulledPolys ();
-	else
+	else {
+		float _ts = host_speeds.value ? Sys_FloatTime () : 0;
 		D_DrawSurfaces ();
-	if (profiling) {
-		prof_delta = SYS_CYCLE_LO - prof_t;
-		pq_prof_se_draw_cycles += prof_delta;
-		final_attr += prof_delta;
+		if (host_speeds.value) r_t_surf += Sys_FloatTime () - _ts;
 	}
-
-	if (profiling) {
-		prof_delta = SYS_CYCLE_LO - final_t;
-		pq_prof_se_final_cycles += (prof_delta > final_attr)
-			? prof_delta - final_attr : 0;
-	}
-
-	if (profiling)
-		pq_prof_aet_total_edges = aet_alloc;
 }

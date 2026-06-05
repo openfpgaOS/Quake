@@ -1382,6 +1382,8 @@ int COM_FindFile (char *filename, int *handle, FILE **file)
 	if (!file && !handle)
 		Sys_Error ("COM_FindFile: neither handle or file set");
 
+	CDAudio_DrainAsync ();	/* free the slot DMA bridge before file I/O */
+
 //
 // check for loose progs.dat override via dataslot
 //
@@ -1429,6 +1431,7 @@ int COM_FindFile (char *filename, int *handle, FILE **file)
 						}
 					else
 					{       // open a new file on the pakfile
+						CDAudio_DrainAsync ();  // free the slot bridge first
 						*file = fopen (pak->filename, "rb");
 						if (*file)
 							fseek (*file, pak->files[i].filepos, SEEK_SET);
@@ -1480,6 +1483,7 @@ int COM_FindFile (char *filename, int *handle, FILE **file)
 			else
 			{
 				Sys_FileClose (i);
+				CDAudio_DrainAsync ();  // free the slot bridge first
 				*file = fopen (netpath, "rb");
 			}
 			return com_filesize;

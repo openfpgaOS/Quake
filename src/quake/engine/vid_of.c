@@ -21,7 +21,6 @@
 #include "of_cache.h"
 #include "of_services.h"
 #include "of_gpu.h"                 /* static ring state lives HERE only */
-#include "sysreg_stub.h"            /* SYS_CYCLE_LO for GPU-wait profiling */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,45 +96,6 @@ _Static_assert(__builtin_offsetof(of_emit_param_span_list_t, attr_origin) ==
 unsigned short d_8to16table[256];
 unsigned       d_8to24table[256];
 
-/* GPU-utilisation probe: cumulative cycles the CPU spent blocked inside
- * of_emit_finish() — i.e. waiting for the GPU to drain submitted work.
- * Resets at frame start (R_RenderView_).  Synthesised cycles via
- * SYS_CYCLE_LO (= of_time_us()*105) so the units match other buckets.
- *
- * Interpretation:
- *   pq_prof_gpu_wait ≈ 0  → CPU is the bottleneck (GPU keeping up easily).
- *   pq_prof_gpu_wait > 0  → CPU was idle waiting for GPU for that span;
- *                            of_emit_finish() takes ~that long per call. */
-unsigned int   pq_prof_gpu_wait_cycles;
-
-/* Page-flip wait duration.  With OF_EMIT_CAP_FLIP this measures the
- * deferred present wait plus the next acquire_next syscall.  Otherwise it
- * measures the conservative kernel-driven of_video_flip() path. */
-unsigned int   pq_prof_video_flip_cycles;
-
-/* GPU command-path profiler.  These are architecture-native counters
- * for the openfpgaOS GPU path: span batches, command-DMA pressure,
- * ring pressure, texture-cache traffic, and compact GPU status. */
-unsigned int   pq_gpu_batch_flushes_frame;
-unsigned int   pq_gpu_batch_spans_frame;
-unsigned int   pq_gpu_batch_words_frame;
-unsigned int   pq_gpu_cmd_dma_flushes_frame;
-unsigned int   pq_gpu_dma_waits_frame;
-unsigned int   pq_gpu_dma_spin_iters_frame;
-unsigned int   pq_gpu_ring_waits_frame;
-unsigned int   pq_gpu_ring_spin_iters_frame;
-unsigned int   pq_gpu_min_ring_free_frame;
-unsigned int   pq_gpu_ring_free_frame;
-unsigned int   pq_gpu_status_frame;
-unsigned int   pq_gpu_rdptr_frame;
-unsigned int   pq_gpu_wrptr_frame;
-unsigned int   pq_gpu_fence_frame;
-unsigned int   pq_gpu_tex_req_frame;
-unsigned int   pq_gpu_tex_miss_frame;
-unsigned int   pq_gpu_stall_total_frame;
-unsigned int   pq_gpu_param_zwrite_spans_frame;
-unsigned int   pq_gpu_param_ztest_spans_frame;
-
 /* Triple-buffer slot index used only when the runtime advertises the
  * GPU-triggered CMD_FLIP path.  Kernel-driven flips keep this at -1. */
 static int     draw_idx = -1;
@@ -146,7 +106,6 @@ static int     zbuffer_cpu_cached;
 static uint32_t of_emit_caps;
 static int     of_emit_ready;
 static int     of_emit_cpu_sync_needed;
-static of_gpu_debug_snapshot_t gpu_prof_start_snap;
 static uint8_t *vid_fb_raw[VIDEO_BUFFERS];
 static byte    *vid_fb_uncached[VIDEO_BUFFERS];
 static of_video_mode_t vid_mode;
@@ -193,32 +152,6 @@ static short zbuffer_storage[ZBUFFER_MAX_WIDTH * ZBUFFER_MAX_HEIGHT]
  * of_emit_span so it gets the same grouping automatically. */
 static of_emit_span_t span_buf[PQ_GPU_SPAN_BATCH_MAX];
 static int           span_buf_count;
-
-static unsigned int gpu_affine_group_words(unsigned int lanes)
-{
-    unsigned int words = 0;
-    while (lanes != 0) {
-        unsigned int chunk = lanes;
-        if (chunk > OF_GPU_AFFINE_SPAN_GROUP_MAX_NATIVE_LANES)
-            chunk = OF_GPU_AFFINE_SPAN_GROUP_MAX_NATIVE_LANES;
-        words += 1u + OF_GPU_PARAM_DIRECT_AFFINE_WORDS(chunk);
-        lanes -= chunk;
-    }
-    return words;
-}
-
-static unsigned int gpu_persp_group_words(unsigned int lanes)
-{
-    unsigned int words = 0;
-    while (lanes != 0) {
-        unsigned int chunk = lanes;
-        if (chunk > 4u)
-            chunk = 4u;
-        words += 1u + OF_GPU_PARAM_SPAN_LIST_WORDS(chunk);
-        lanes -= chunk;
-    }
-    return words;
-}
 
 static inline int32_t gpu_i32_add_mul(int32_t a, int32_t step, int n)
 {
@@ -515,7 +448,6 @@ static void gpu_flush_affine_group(of_gpu_affine_span_group_t *group,
         return;
 
     group->lane_count = (uint8_t)*lanes;
-    pq_gpu_batch_words_frame += gpu_affine_group_words((unsigned int)*lanes);
     of_gpu_draw_affine_span_group(group);
     *lanes = 0;
 }
@@ -657,8 +589,6 @@ static void gpu_flush_persp_group(gpu_persp_builder_t *builder)
         return;
 
     builder->group.lane_count = (uint8_t)builder->lanes;
-    pq_gpu_batch_words_frame +=
-        gpu_persp_group_words((unsigned int)builder->lanes);
     of_gpu_draw_persp_span_group(&builder->group);
     builder->lanes = 0;
     builder->major_ready = 0;
@@ -687,7 +617,6 @@ static void gpu_draw_persp_span(const of_emit_span_t *sp)
     group.zi_minor_step = sp->zi_step;
     group.light = (int32_t)((uint32_t)(sp->light & 0x3Fu) << 16);
 
-    pq_gpu_batch_words_frame += 1u + OF_GPU_PARAM_SPAN_LIST_WORDS(1u);
     of_gpu_draw_persp_span_group(&group);
 }
 
@@ -702,12 +631,7 @@ static inline int flush_span_batch(void)
         uint64_t range_hi[OF_GPU_AFFINE_SPAN_GROUP_MAX_LANES];
         int affine_lanes = 0;
 
-        pq_gpu_batch_flushes_frame++;
-        pq_gpu_batch_spans_frame += (unsigned int)count;
-
         memset(&persp_group, 0, sizeof(persp_group));
-        if (used_dma)
-            pq_gpu_cmd_dma_flushes_frame++;
 
         for (int i = 0; i < count; i++) {
             of_emit_span_t *sp = &span_buf[i];
@@ -768,72 +692,6 @@ int of_emit_supports(uint32_t cap)
 int of_emit_gpu_ready(void)
 {
     return of_emit_ready;
-}
-
-void of_emit_prof_frame_start(void)
-{
-    if (!of_emit_ready)
-        return;
-
-    pq_gpu_batch_flushes_frame = 0;
-    pq_gpu_batch_spans_frame = 0;
-    pq_gpu_batch_words_frame = 0;
-    pq_gpu_cmd_dma_flushes_frame = 0;
-    pq_gpu_dma_waits_frame = 0;
-    pq_gpu_dma_spin_iters_frame = 0;
-    pq_gpu_ring_waits_frame = 0;
-    pq_gpu_ring_spin_iters_frame = 0;
-    pq_gpu_min_ring_free_frame = 0;
-    pq_gpu_ring_free_frame = 0;
-    pq_gpu_status_frame = 0;
-    pq_gpu_rdptr_frame = 0;
-    pq_gpu_wrptr_frame = 0;
-    pq_gpu_fence_frame = 0;
-    pq_gpu_tex_req_frame = 0;
-    pq_gpu_tex_miss_frame = 0;
-    pq_gpu_stall_total_frame = 0;
-    pq_gpu_param_zwrite_spans_frame = 0;
-    pq_gpu_param_ztest_spans_frame = 0;
-
-    of_gpu_debug_snapshot(&gpu_prof_start_snap, 1);
-}
-
-void of_emit_prof_frame_end(void)
-{
-    of_gpu_debug_snapshot_t snap;
-
-    if (!of_emit_ready)
-        return;
-
-    of_gpu_debug_snapshot(&snap, 0);
-
-    pq_gpu_status_frame = snap.status;
-    pq_gpu_rdptr_frame = snap.rdptr;
-    pq_gpu_wrptr_frame = snap.wrptr;
-    pq_gpu_fence_frame = snap.fence_reached;
-    pq_gpu_dma_waits_frame = snap.dma_waits;
-    pq_gpu_dma_spin_iters_frame = snap.dma_spin_iters;
-    pq_gpu_ring_waits_frame = snap.ring_waits;
-    pq_gpu_ring_spin_iters_frame = snap.ring_spin_iters;
-    pq_gpu_min_ring_free_frame = snap.min_ring_free;
-    pq_gpu_ring_free_frame = snap.ring_free;
-
-#if PQ_GPU_HAVE_HW_TEX_STALL_COUNTERS
-    pq_gpu_tex_req_frame =
-        (snap.tex_req_count - gpu_prof_start_snap.tex_req_count) &
-        OF_GPU_TEX_DBG_COUNTER_MASK;
-    pq_gpu_tex_miss_frame =
-        (snap.tex_miss_count - gpu_prof_start_snap.tex_miss_count) &
-        OF_GPU_TEX_DBG_COUNTER_MASK;
-
-    for (uint32_t i = 0; i < OF_GPU_STALL_COUNT; i++)
-        pq_gpu_stall_total_frame +=
-            snap.stall_count[i] - gpu_prof_start_snap.stall_count[i];
-#else
-    pq_gpu_tex_req_frame = 0;
-    pq_gpu_tex_miss_frame = 0;
-    pq_gpu_stall_total_frame = 0;
-#endif
 }
 
 void of_emit_init(void)
@@ -908,15 +766,9 @@ void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
 void of_emit_finish(void)
 {
     flush_span_batch();
-    /* Bracket the GPU drain itself.  flush_span_batch only submits any
-     * queued command-DMA work; of_gpu_finish() is where the CPU waits
-     * until every submitted raster command has retired. */
-    extern unsigned int pq_prof_gpu_wait_cycles;
-    extern cvar_t       pq_cycleprof;
-    int profiling = (int)pq_cycleprof.value;
-    unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
+    /* of_gpu_finish() is where the CPU waits until every submitted
+     * raster command has retired. */
     of_gpu_finish();
-    if (profiling) pq_prof_gpu_wait_cycles += SYS_CYCLE_LO - t0;
     of_emit_cpu_sync_needed = 0;
 }
 
@@ -1182,20 +1034,13 @@ int of_emit_param_span_list(const of_emit_param_span_list_t *params,
         if (chunk > OF_GPU_PARAM_SPAN_MAX_RECORDS)
             chunk = OF_GPU_PARAM_SPAN_MAX_RECORDS;
 
-        of_gpu_param_span_list_t gp;
-        memcpy(&gp, params, sizeof(gp));
-
-        pq_gpu_batch_flushes_frame++;
-        pq_gpu_batch_spans_frame += chunk;
-        pq_gpu_batch_words_frame += 1u + OF_GPU_PARAM_SPAN_LIST_WORDS(chunk);
-        if (params->z_mode == OF_EMIT_PARAM_Z_WRITE_ZI ||
-            params->z_mode == OF_EMIT_PARAM_Z_TEST_WRITE)
-            pq_gpu_param_zwrite_spans_frame += chunk;
-        if (params->z_mode == OF_EMIT_PARAM_Z_TEST_ZI ||
-            params->z_mode == OF_EMIT_PARAM_Z_TEST_WRITE)
-            pq_gpu_param_ztest_spans_frame += chunk;
+        /* of_emit_param_span_list_t mirrors of_gpu_param_span_list_t
+         * field-for-field (the records cast below relies on the same
+         * contract), so hand the caller's struct straight down instead
+         * of staging a ~100-byte copy per surface. */
         of_emit_cpu_sync_needed = 1;
-        of_gpu_draw_param_span_list(&gp,
+        of_gpu_draw_param_span_list(
+            (const of_gpu_param_span_list_t *)params,
             (const of_gpu_param_span_record_t *)records, chunk);
 
         submitted += chunk;
@@ -1412,10 +1257,6 @@ void VID_Update(vrect_t *rects)
 {
     (void)rects;
 
-    extern cvar_t pq_cycleprof;
-    int profiling = (int)pq_cycleprof.value;
-    unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
-
     if (of_emit_supports(OF_EMIT_CAP_FLIP)) {
         /* Runtime-advertised CMD_FLIP path: render commands and the page
          * swap stay ordered in the GPU ring.  Triple buffering lets the next
@@ -1423,10 +1264,7 @@ void VID_Update(vrect_t *rects)
          * only block before queuing another flip. */
         flush_span_batch();
         if (flip_present_pending) {
-            t0 = profiling ? SYS_CYCLE_LO : 0;
             of_video_wait_flip();
-            if (profiling)
-                pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
             flip_present_pending = 0;
         }
 
@@ -1444,9 +1282,7 @@ void VID_Update(vrect_t *rects)
     of_emit_finish();
     of_emit_texture_cache_flush();
 
-    t0 = profiling ? SYS_CYCLE_LO : 0;
     of_video_flip();
-    if (profiling) pq_prof_video_flip_cycles = SYS_CYCLE_LO - t0;
 
     vid.buffer = vid.conbuffer = vid_uncached_for_surface(of_video_surface());
     of_emit_kick();
@@ -1457,18 +1293,11 @@ void VID_WaitSync(void)
     if (!of_emit_supports(OF_EMIT_CAP_FLIP) || pending_flip_idx < 0)
         return;
 
-    extern cvar_t pq_cycleprof;
-    int profiling = (int)pq_cycleprof.value;
-    unsigned int t0 = profiling ? SYS_CYCLE_LO : 0;
-
     /* Wait only until CMD_FLIP reaches the display side-port.  The returned
      * buffer is the third slot: not current scanout and not queued for the
      * next vsync.  The actual present wait is deferred to VID_Update(), just
      * before the next CMD_FLIP, so rendering can overlap scanout. */
     draw_idx = of_video_acquire_next(pending_flip_idx, pending_flip_token);
-
-    if (profiling)
-        pq_prof_video_flip_cycles += SYS_CYCLE_LO - t0;
 
     of_emit_cpu_sync_needed = 0;
     of_emit_texture_cache_flush();

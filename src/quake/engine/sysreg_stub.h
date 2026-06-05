@@ -1,7 +1,7 @@
 /*
  * sysreg_stub.h -- stand-ins for Quake sysreg MMIO.
  *
- * The engine's pq_cycleprof / HW performance-counter code reads
+ * Retired HW performance-counter experiments read
  * SYS_CYCLE_LO and a bunch of SYS_PERF_* and SPAN_PERF_* registers to
  * build the in-game profiler overlay. Those MMIOs don't exist on
  * openfpgaOS.  SYS_CYCLE_LO is synthesised from of_time_us() so the

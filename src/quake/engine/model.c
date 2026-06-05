@@ -26,8 +26,6 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_local.h"
 #include "of_emit.h"
 
-extern volatile unsigned int pq_dbg_stage;
-extern volatile unsigned int pq_dbg_info;
 
 model_t	*loadmodel;
 char	loadname[32];	// for hunk tags
@@ -273,8 +271,6 @@ model_t *Mod_LoadModel (model_t *mod, qboolean crash)
 	unsigned *buf;
 	byte	stackbuf[1024];		// avoid dirtying the cache heap
 
-	pq_dbg_stage = 0x4000;
-	pq_dbg_info = Mod_NameTag(mod ? mod->name : NULL);
 
 	if (mod->type == mod_alias)
 	{
@@ -298,7 +294,6 @@ model_t *Mod_LoadModel (model_t *mod, qboolean crash)
 // load the file
 //
 	buf = (unsigned *)COM_LoadStackFile (mod->name, stackbuf, sizeof(stackbuf));
-	pq_dbg_stage = 0x4001;
 	if (!buf)
 	{
 		if (crash)
@@ -323,25 +318,18 @@ model_t *Mod_LoadModel (model_t *mod, qboolean crash)
 	switch (LittleLong(*(unsigned *)buf))
 	{
 	case IDPOLYHEADER:
-		pq_dbg_stage = 0x4010;
 		Mod_LoadAliasModel (mod, buf);
-		pq_dbg_stage = 0x4011;
 		break;
 
 	case IDSPRITEHEADER:
-		pq_dbg_stage = 0x4020;
 		Mod_LoadSpriteModel (mod, buf);
-		pq_dbg_stage = 0x4021;
 		break;
 
 	default:
-		pq_dbg_stage = 0x4030;
 		Mod_LoadBrushModel (mod, buf);
-		pq_dbg_stage = 0x4031;
 		break;
 	}
 
-	pq_dbg_stage = 0x40FF;
 	return mod;
 }
 

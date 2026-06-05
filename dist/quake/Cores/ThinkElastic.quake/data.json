@@ -99,7 +99,16 @@
                 "parameters": 0,
                 "extensions": ["mid", "dat", "png", "bin", "grp", "pak", "wad", "rom", "nes"],
                 "deferload": true
-            }
+            },
+            { "id": 23, "name": "CD Track 03", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 24, "name": "CD Track 04", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 25, "name": "CD Track 05", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 26, "name": "CD Track 06", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 27, "name": "CD Track 07", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 28, "name": "CD Track 08", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 29, "name": "CD Track 09", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 30, "name": "CD Track 10", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true },
+            { "id": 31, "name": "CD Track 11", "required": false, "parameters": 0, "extensions": ["bin"], "deferload": true }
         ]
     }
 }

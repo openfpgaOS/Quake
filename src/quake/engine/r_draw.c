@@ -254,10 +254,9 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 		pcheck->next = edge;
 	}
 
-	edge->nextremove = removeedges[v2];
-	removeedges[v2] = edge;
-
-	// Store v_end in edge->prev (unused by array-based AET, same cache line)
+	// Store v_end (the scanline this edge is removed on) in edge->prev —
+	// unused by the array-based AET, same cache line.  R_InsertNewEdges_Array
+	// copies it into aet_v_end[]; R_StepRemoveEdges_Array compacts on it.
 	edge->prev = (edge_t *)(unsigned long)(unsigned short)v2;
 }
 

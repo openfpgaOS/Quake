@@ -81,9 +81,6 @@ void R_BspCache_Init(void)
 // near BSP planes to end up on the wrong side, corrupting bmodel clipping.
 #define BMODEL_CLIP_EPSILON  0.1f
 
-/* Sub-profiling: R_RenderFace time within R_RecursiveWorldNode */
-unsigned int pq_prof_rw_renderface_cycles;
-extern cvar_t pq_cycleprof;
 extern cvar_t r_gpuworld;
 int r_gpu_world_direct_active;
 
@@ -549,8 +546,6 @@ static void R_RecursiveWorldNodeGpu (mnode_t *node, int clipflags)
 	msurface_t	*surf;
 	mleaf_t		*pleaf;
 	float		d, dot;
-	int			profiling = (int)pq_cycleprof.value;
-	unsigned int prof_t;
 
 	if (node->contents == CONTENTS_SOLID)
 		return;
@@ -662,7 +657,6 @@ static void R_RecursiveWorldNodeGpu (mnode_t *node, int clipflags)
 	{
 		surf = cl.worldmodel->surfaces + node->firstsurface;
 
-		if (profiling) prof_t = SYS_CYCLE_LO;
 
 		if (dot < -BACKFACE_EPSILON)
 		{
@@ -682,9 +676,6 @@ static void R_RecursiveWorldNodeGpu (mnode_t *node, int clipflags)
 				surf++;
 			} while (--c);
 		}
-
-		if (profiling)
-			pq_prof_rw_renderface_cycles += SYS_CYCLE_LO - prof_t;
 
 		r_currentkey++;
 	}
@@ -706,8 +697,6 @@ PQ_FASTTEXT void R_RecursiveWorldNode (mnode_t *node, int clipflags)
 	msurface_t	*surf, **mark;
 	mleaf_t		*pleaf;
 	float		d, dot;
-	int			profiling = (int)pq_cycleprof.value;
-	unsigned int prof_t;
 
 	if (node->contents == CONTENTS_SOLID)
 		return;		// solid
@@ -851,7 +840,6 @@ PQ_FASTTEXT void R_RecursiveWorldNode (mnode_t *node, int clipflags)
 		{
 			surf = cl.worldmodel->surfaces + node->firstsurface;
 
-			if (profiling) prof_t = SYS_CYCLE_LO;
 
 			/* SoA reads: visframe/flags packed into parallel arrays,
 			 * so the predicate evaluates without pulling the full
@@ -888,7 +876,6 @@ PQ_FASTTEXT void R_RecursiveWorldNode (mnode_t *node, int clipflags)
 				} while (--c);
 			}
 
-			if (profiling) pq_prof_rw_renderface_cycles += SYS_CYCLE_LO - prof_t;
 
 		// all surfaces on the same node share the same sequence number
 			r_currentkey++;

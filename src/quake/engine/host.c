@@ -60,7 +60,6 @@ cvar_t	host_framerate = {"host_framerate","0"};	// set for slow motion
 cvar_t	host_speeds = {"host_speeds","0"};			// set for running times
 
 cvar_t	sys_ticrate = {"sys_ticrate","0.05"};
-cvar_t	serverprofile = {"serverprofile","0"};
 
 cvar_t	fraglimit = {"fraglimit","0",false,true};
 cvar_t	timelimit = {"timelimit","0",false,true};
@@ -239,8 +238,19 @@ void Host_InitLocal (void)
 	Cvar_RegisterVariable (&host_framerate);
 	Cvar_RegisterVariable (&host_speeds);
 
+	/* Allow enabling the render trace from quake.ini
+	 * ([quake] HOST_SPEEDS=1) — the handheld has no easy console input.
+	 * Any non-zero value emits the once/second averaged trace to UART. */
+	{
+		extern int Sys_IniGetInt(const char *key, int def);
+		Cvar_SetValue ("host_speeds", Sys_IniGetInt("HOST_SPEEDS", 0));
+		if (host_speeds.value)
+			Con_Printf ("[quake] host_speeds=%d (render trace -> UART; "
+			            "set [quake] HOST_SPEEDS in quake.ini)\n",
+			            (int)host_speeds.value);
+	}
+
 	Cvar_RegisterVariable (&sys_ticrate);
-	Cvar_RegisterVariable (&serverprofile);
 
 	Cvar_RegisterVariable (&fraglimit);
 	Cvar_RegisterVariable (&timelimit);
@@ -663,26 +673,26 @@ Runs all active servers
 */
 void _Host_Frame (float time)
 {
-	extern volatile unsigned int pq_dbg_stage;
-	extern volatile unsigned int pq_dbg_info;
 	static float		time1 = 0;
 	static float		time2 = 0;
 	static float		time3 = 0;
-	int			pass1, pass2, pass3;
-#ifdef QUAKE_OPENFPGA
-	static int          live_hb = 0;
-#endif
+	/* host_speeds: per-second averaged render trace to UART (us/frame) */
+	static double		perf_srv = 0, perf_gfx = 0, perf_tot = 0;
+	static double		perf_gwait = 0, perf_gworld = 0, perf_g2d = 0, perf_gpresent = 0;
+	static double		perf_setup = 0, perf_redge = 0, perf_ralias = 0, perf_rview = 0, perf_rpart = 0, perf_rwarp = 0;
+	static double		perf_rworld = 0, perf_bent = 0, perf_scan = 0, perf_surf = 0;
+	static double		perf_scache = 0, perf_sz = 0, perf_ssky = 0, perf_sturb = 0;
+	static double		perf_smiss = 0;
+	static int		perf_frames = 0;
+	static float		perf_anchor = 0;
+	extern float		scr_t_wait, scr_t_world, scr_t_2d, scr_t_present;
+	extern float		r_t_setup, r_t_edges, r_t_alias, r_t_view, r_t_part, r_t_warp;
+	extern float		r_t_rworld, r_t_bent, r_t_scan, r_t_surf;
+	extern float		r_t_surfcache, r_t_surfz, r_t_surfsky, r_t_surfturb;
+	extern int		r_c_surfmiss;
 
 	if (setjmp (host_abortserver) )
 		return;			// something bad happened, or the server disconnected
-	pq_dbg_stage = 0x2001;
-
-	/* VRAM row 26: Host_Frame stage tracker (survives SDRAM hangs) */
-	{
-		volatile char *v = (volatile char *)0x20000000;
-		v[26 * 40 + 0] = 'S';  /* Stage */
-		v[26 * 40 + 1] = '0';  /* will update at each stage */
-	}
 
 // keep the random time dependent
 	rand ();
@@ -690,27 +700,21 @@ void _Host_Frame (float time)
 // decide the simulation time
 	if (!Host_FilterTime (time))
 		return;			// don't run too fast, or packets will flood out
-	pq_dbg_stage = 0x2002;
 
 // get new key events
 	Sys_SendKeyEvents ();
-	pq_dbg_stage = 0x2003;
 
 // allow mice or other external controllers to add commands
 	IN_Commands ();
-	pq_dbg_stage = 0x2004;
 
 // process console commands
 	Cbuf_Execute ();
-	pq_dbg_stage = 0x2005;
 
 	NET_Poll();
-	pq_dbg_stage = 0x2006;
 
 // if running the server locally, make intentions now
 	if (sv.active)
 		CL_SendCmd ();
-	pq_dbg_stage = 0x2007;
 	
 //-------------------
 //
@@ -720,13 +724,9 @@ void _Host_Frame (float time)
 
 // check for commands typed to the host
 	Host_GetConsoleCommands ();
-	pq_dbg_stage = 0x2008;
 	
-	((volatile char *)0x20000000)[26 * 40 + 1] = '3';  /* before ServerFrame */
 	if (sv.active)
 		Host_ServerFrame ();
-	((volatile char *)0x20000000)[26 * 40 + 1] = '4';  /* after ServerFrame */
-	pq_dbg_stage = 0x2009;
 
 //-------------------
 //
@@ -738,99 +738,105 @@ void _Host_Frame (float time)
 // the incoming messages have been read
 	if (!sv.active)
 		CL_SendCmd ();
-	pq_dbg_stage = 0x200A;
 
 	host_time += host_frametime;
-	pq_dbg_stage = 0x200B;
 
 // fetch results from server
 	if (cls.state == ca_connected)
 	{
-		pq_dbg_stage = 0x200C;
 		CL_ReadFromServer ();
 	}
-	pq_dbg_stage = 0x200D;
 
 // update video
 	if (host_speeds.value)
 		time1 = Sys_FloatTime ();
 		
-	((volatile char *)0x20000000)[26 * 40 + 1] = '5';  /* before SCR_UpdateScreen */
 	SCR_UpdateScreen ();
-	((volatile char *)0x20000000)[26 * 40 + 1] = '6';  /* after SCR_UpdateScreen */
-	pq_dbg_stage = 0x200E;
 
 	if (host_speeds.value)
 		time2 = Sys_FloatTime ();
 		
 // update audio
-	((volatile char *)0x20000000)[26 * 40 + 1] = '7';  /* before S_Update */
 	if (cls.signon == SIGNONS)
 	{
-		pq_dbg_stage = 0x200F;
 		S_Update (r_origin, vpn, vright, vup);
 		CL_DecayLights ();
 	}
 	else
 		S_Update (vec3_origin, vec3_origin, vec3_origin, vec3_origin);
-	pq_dbg_stage = 0x2010;
 	
-	((volatile char *)0x20000000)[26 * 40 + 1] = '8';  /* after S_Update */
 	CDAudio_Update();
-	pq_dbg_info = host_framecount;
-	pq_dbg_stage = 0x2011;
 
 	if (host_speeds.value)
 	{
-		pass1 = (time1 - time3)*1000;
-		time3 = Sys_FloatTime ();
-		pass2 = (time2 - time1)*1000;
-		pass3 = (time3 - time2)*1000;
-		Con_Printf ("%3i tot %3i server %3i gfx %3i snd\n",
-					pass1+pass2+pass3, pass1, pass2, pass3);
+		float	fsrv, fgfx, fnow, ftot;
+
+		fsrv = time1 - time3;		/* time3 = previous frame end */
+		fnow = Sys_FloatTime ();
+		ftot = fnow - time3;		/* whole frame */
+		time3 = fnow;
+		fgfx = time2 - time1;		/* SCR_UpdateScreen (render) */
+
+		{
+			/* Accumulate; emit once per ~second so the UART stays readable. */
+			perf_srv += fsrv * 1.0e6; perf_gfx += fgfx * 1.0e6;
+			perf_tot += ftot * 1.0e6;
+			perf_gwait += scr_t_wait * 1.0e6; perf_gworld += scr_t_world * 1.0e6;
+			perf_g2d += scr_t_2d * 1.0e6; perf_gpresent += scr_t_present * 1.0e6;
+			perf_setup += r_t_setup * 1.0e6;
+			perf_redge += r_t_edges * 1.0e6; perf_ralias += r_t_alias * 1.0e6;
+			perf_rview += r_t_view * 1.0e6;  perf_rpart += r_t_part * 1.0e6;
+			perf_rwarp += r_t_warp * 1.0e6;
+			perf_rworld += r_t_rworld * 1.0e6; perf_bent += r_t_bent * 1.0e6;
+			perf_scan += r_t_scan * 1.0e6;     perf_surf += r_t_surf * 1.0e6;
+			perf_scache += r_t_surfcache * 1.0e6; perf_sz += r_t_surfz * 1.0e6;
+			perf_ssky += r_t_surfsky * 1.0e6;  perf_sturb += r_t_surfturb * 1.0e6;
+			perf_smiss += (double)r_c_surfmiss;
+			perf_frames++;
+			if (fnow - perf_anchor >= 1.0f && perf_frames > 0)
+			{
+				float	n = (float)perf_frames;
+				float	win = fnow - perf_anchor;
+				Con_Printf ("[perf] %4.1f fps | srv %5.0f gfx %5.0f tot %5.0f us/fr (avg %d fr)\n",
+					perf_frames / win, perf_srv / n, perf_gfx / n,
+					perf_tot / n, perf_frames);
+				Con_Printf ("[gfx]  wait %5.0f world %5.0f 2d %5.0f present %5.0f us/fr\n",
+					perf_gwait / n, perf_gworld / n, perf_g2d / n, perf_gpresent / n);
+				Con_Printf ("[wrld] setup %5.0f edges %5.0f alias %5.0f weap %5.0f part %5.0f warp %5.0f\n",
+					perf_setup / n, perf_redge / n, perf_ralias / n,
+					perf_rview / n, perf_rpart / n, perf_rwarp / n);
+				Con_Printf ("[edge] rworld %5.0f bent %5.0f scan %5.0f (surf %5.0f) us/fr\n",
+					perf_rworld / n, perf_bent / n, perf_scan / n, perf_surf / n);
+				/* emit = remainder of [surf]: D_CalcGradients + Q29 setup +
+				 * param-span submit + per-surface loop overhead.  Only the
+				 * rare paths are bracketed directly, so the common path adds
+				 * no measurement cost. */
+				{
+					double surf_other = (perf_surf - perf_scache - perf_sz
+						- perf_ssky - perf_sturb) / n;
+					if (surf_other < 0) surf_other = 0;
+					Con_Printf ("[surf] cache %5.0f emit %5.0f z %5.0f sky %5.0f turb %5.0f (miss %3.0f/fr)\n",
+						perf_scache / n, surf_other, perf_sz / n,
+						perf_ssky / n, perf_sturb / n, perf_smiss / n);
+				}
+				perf_srv = perf_gfx = perf_tot = 0;
+				perf_gwait = perf_gworld = perf_g2d = perf_gpresent = 0;
+				perf_setup = perf_redge = perf_ralias = perf_rview = perf_rpart = perf_rwarp = 0;
+				perf_rworld = perf_bent = perf_scan = perf_surf = 0;
+				perf_scache = perf_sz = perf_ssky = perf_sturb = perf_smiss = 0;
+				perf_frames = 0;
+				perf_anchor = fnow;
+			}
+		}
 	}
 	
 	host_framecount++;
 
-#ifdef QUAKE_OPENFPGA
-	/* Low-rate liveness marker: disabled (clutters terminal with debug output) */
-#endif
 }
 
 void Host_Frame (float time)
 {
-	float	time1, time2;
-	static float	timetotal;
-	static int		timecount;
-	int		i, c, m;
-
-	if (!serverprofile.value)
-	{
-		_Host_Frame (time);
-		return;
-	}
-	
-	time1 = Sys_FloatTime ();
 	_Host_Frame (time);
-	time2 = Sys_FloatTime ();	
-	
-	timetotal += time2 - time1;
-	timecount++;
-	
-	if (timecount < 1000)
-		return;
-
-	m = timetotal*1000/timecount;
-	timecount = 0;
-	timetotal = 0;
-	c = 0;
-	for (i=0 ; i<svs.maxclients ; i++)
-	{
-		if (svs.clients[i].active)
-			c++;
-	}
-
-	Con_Printf ("serverprofile: %2i clients %2i msec\n",  c,  m);
 }
 
 //============================================================================
@@ -937,80 +943,56 @@ void Host_Init (quakeparms_t *parms)
 	Sys_Printf("Host_InitVCR...");
 	Host_InitVCR (parms);
 	Sys_Printf("OK\n");
-	/* VRAM row 28 progress markers: single chars at fixed position,
-	 * visible even if terminal scroll is stuck. */
-	#define VRAM_PROGRESS(ch) ((volatile char *)0x20000000)[28*40] = (ch)
-
 	Sys_Printf("COM_Init...");
-	VRAM_PROGRESS('c');
 	COM_Init (parms->basedir);
-	VRAM_PROGRESS('C');
 	Sys_Printf("OK\n");
 	{ extern void Sys_PrintDmaStats(void); Sys_PrintDmaStats(); }
 	Sys_Printf("Host_InitLocal\n");
-	VRAM_PROGRESS('h');
 	Host_InitLocal ();
-	VRAM_PROGRESS('H');
 	Sys_Printf("W_LoadWadFile\n");
-	VRAM_PROGRESS('w');
 	W_LoadWadFile ("gfx.wad");
-	VRAM_PROGRESS('W');
 	Sys_Printf("Key_Init\n");
 	Key_Init ();
 	Sys_Printf("Con_Init\n");
-	VRAM_PROGRESS('o');
 	Con_Init ();
-	VRAM_PROGRESS('O');
 	Sys_Printf("M_Init\n");
 	M_Init ();
 	Sys_Printf("PR_Init\n");
-	VRAM_PROGRESS('p');
 	PR_Init ();
-	VRAM_PROGRESS('P');
 	Sys_Printf("Mod_Init\n");
 	Mod_Init ();
 	Sys_Printf("NET_Init\n");
 	NET_Init ();
 	Sys_Printf("SV_Init\n");
 	SV_Init ();
-	VRAM_PROGRESS('S');
 
 	Con_Printf ("Exe: "__TIME__" "__DATE__"\n");
 	Con_Printf ("%4.1f megabyte heap\n",parms->memsize/ (1024*1024.0));
 
 	R_InitTextures ();		// needed even for dedicated servers
-	VRAM_PROGRESS('t');
 
 	if (cls.state != ca_dedicated)
 	{
 		Sys_Printf("palette.lmp\n");
-		VRAM_PROGRESS('1');
 		host_basepal = (byte *)COM_LoadHunkFile ("gfx/palette.lmp");
 		if (!host_basepal)
 			Sys_Error ("Couldn't load gfx/palette.lmp");
-		VRAM_PROGRESS('2');
 		Sys_Printf("colormap.lmp\n");
 		host_colormap = (byte *)COM_LoadHunkFile ("gfx/colormap.lmp");
 		if (!host_colormap)
 			Sys_Error ("Couldn't load gfx/colormap.lmp");
-		VRAM_PROGRESS('3');
 
 #ifndef _WIN32 // on non win32, mouse comes before video for security reasons
 		IN_Init ();
 #endif
 		Sys_Printf("VID_Init\n");
-		VRAM_PROGRESS('v');
 		VID_Init (host_basepal);
-		VRAM_PROGRESS('V');
 
 		Sys_Printf("Draw_Init\n");
-		VRAM_PROGRESS('d');
 		Draw_Init ();
-		VRAM_PROGRESS('D');
 		Sys_Printf("SCR_Init\n");
 		SCR_Init ();
 		Sys_Printf("R_Init\n");
-		VRAM_PROGRESS('r');
 		R_Init ();
 #ifndef	_WIN32
 	// on Win32, sound initialization has to come before video initialization, so we
