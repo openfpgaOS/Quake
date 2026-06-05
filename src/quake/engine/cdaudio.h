@@ -27,3 +27,4 @@ void CDAudio_Shutdown(void);
 void CDAudio_Update(void);
 void CDAudio_DrainAsync(void);
 void CDAudio_PostponeResume(int ms);
+void CDAudio_NotifySlotWrite(void);

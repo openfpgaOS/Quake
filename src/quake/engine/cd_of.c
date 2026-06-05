@@ -110,6 +110,12 @@ static qboolean cd_looping;
 static qboolean cd_paused;
 static qboolean cd_menu_quiet;   /* music frozen while a menu is open */
 static uint32_t cd_quiet_until;  /* ms deadline: hold the freeze after slot writes */
+
+/* Track start requested while the bridge must stay quiet (level load,
+ * menu open, post-save hold).  CDAudio_Update starts it once clear. */
+static byte     cd_deferred_track;
+static qboolean cd_deferred_looping;
+static qboolean cd_deferred_valid;
 static qboolean cd_ended;      /* non-looping track hit EOF */
 static int    cd_silence_run;  /* frames of trailing silence emitted */
 static byte   cd_track;
@@ -479,10 +485,38 @@ static void CDAudio_StopVoices(void)
     if (cd_vR != OF_MIXER_HANDLE_INVALID) { of_mixer_stop_h(cd_vR); cd_vR = OF_MIXER_HANDLE_INVALID; }
 }
 
+/* True while music must not touch the data-slot bridge: mid level-load
+ * (svc_cdtrack arrives while the loader is still streaming pak data),
+ * menu open, or within a post-save/load quiet hold. */
+static int CDAudio_MustStayQuiet(void)
+{
+    extern qboolean scr_disabled_for_loading;
+
+    if (scr_disabled_for_loading)
+        return 1;
+    if (key_dest == key_menu)
+        return 1;
+    return cd_quiet_until != 0 &&
+           (int32_t)(of_time_ms() - cd_quiet_until) < 0;
+}
+
 void CDAudio_Play(byte track, qboolean looping)
 {
     if (!cd_enabled)
         return;
+
+    /* Starting a track is heavy: slot resolve, track open and a 345 KB
+     * ring prefill through the data-slot bridge.  Mid-load / in-menu /
+     * during a quiet hold that contends with the loader's own bridge
+     * traffic (the intermittent load-game hang), so defer the start —
+     * CDAudio_Update fires it once the world is up and the hold passed. */
+    if (track >= 2 && CDAudio_MustStayQuiet()) {
+        cd_deferred_track   = track;
+        cd_deferred_looping = looping;
+        cd_deferred_valid   = true;
+        return;
+    }
+    cd_deferred_valid = false;   /* a direct play supersedes any deferral */
 
     cd_menu_quiet = false;
 
@@ -571,6 +605,8 @@ void CDAudio_Stop(void)
     if (!cd_enabled)
         return;
 
+    cd_deferred_valid = false;   /* a stop cancels any deferred start */
+
     /* Let any in-flight DMA finish so the single-slot bridge is free for
      * the next track. */
     if (cd_async_pending)
@@ -645,36 +681,63 @@ void CDAudio_PostponeResume(int ms)
         cd_quiet_until = until ? until : 1;
 }
 
+/* Called after writing a save/config slot.  The kernel's nonvolatile
+ * slot writeback can keep the data-slot DMA engine busy for an
+ * unbounded time afterwards, and an of_file_read_async issued into
+ * that state blocks inside the ecall — a hard freeze a few seconds
+ * after saving, when the ring wants its first post-save refill.
+ * Switch the refill to the synchronous fread path (plain file
+ * syscalls, no DMA engine) for the remainder of this track; the next
+ * track open re-evaluates async support from scratch. */
+void CDAudio_NotifySlotWrite(void)
+{
+    if (!cd_enabled)
+        return;
+
+    CDAudio_DrainAsync();           /* retire anything already in flight */
+    cd_async_pending = 0;
+
+    if (cd_async_ok && cd_file)
+        fseek(cd_file, cd_read_offset, SEEK_SET);  /* sync resumes here */
+    cd_async_ok = 0;
+}
+
 void CDAudio_Update(void)
 {
     int pos, consumed, vol;
 
-    if (!cd_enabled || !cd_playing)
+    if (!cd_enabled)
         return;
 
-    /* Silence music while any menu is up.  A mute is not enough: the
-     * streamer would keep issuing data-slot DMA reads, and save-slot
-     * file I/O from the load/save menus contends with those on the
-     * single-user bridge.  Freezing the voice rate stops consumption,
-     * which stops refills — the bridge stays idle for the whole menu
-     * session and the stream resumes exactly where it left off. */
-    {
-        int hold = cd_quiet_until != 0 &&
-                   (int32_t)(of_time_ms() - cd_quiet_until) < 0;
-        if (!hold)
-            cd_quiet_until = 0;
-
-        if (key_dest == key_menu || hold) {
-            if (!cd_menu_quiet) {
-                CDAudio_DrainAsync();           /* retire any in-flight read */
-                of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, 0);
-                of_mixer_set_rate_h(cd_vL, 0);  /* freeze play cursors */
-                of_mixer_set_rate_h(cd_vR, 0);
-                cd_menu_quiet = true;
-            }
-            return;                             /* no refills while quiet */
+    if (CDAudio_MustStayQuiet()) {
+        /* Silence music while a menu is up, a level loads, or a quiet
+         * hold is pending.  A mute is not enough: the streamer would
+         * keep issuing data-slot DMA reads, which contend with save /
+         * loader file I/O on the single-user bridge.  Freezing the
+         * voice rate stops consumption, which stops refills — the
+         * bridge stays idle and the stream resumes where it left off. */
+        if (cd_playing && !cd_menu_quiet) {
+            CDAudio_DrainAsync();           /* retire any in-flight read */
+            of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, 0);
+            of_mixer_set_rate_h(cd_vL, 0);  /* freeze play cursors */
+            of_mixer_set_rate_h(cd_vR, 0);
+            cd_menu_quiet = true;
         }
+        return;                             /* no refills while quiet */
     }
+    cd_quiet_until = 0;
+
+    /* All clear — start a track that was requested while quiet. */
+    if (cd_deferred_valid) {
+        byte     t = cd_deferred_track;
+        qboolean l = cd_deferred_looping;
+
+        cd_deferred_valid = false;
+        CDAudio_Play(t, l);
+    }
+
+    if (!cd_playing)
+        return;
     if (cd_menu_quiet) {
         of_mixer_set_rate_h(cd_vL, CD_SRC_RATE);
         of_mixer_set_rate_h(cd_vR, CD_SRC_RATE);

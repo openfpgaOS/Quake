@@ -797,11 +797,14 @@ void Host_Savegame_f (void)
 	for (i=0 ; i<sv.num_edicts ; i++)
 	{
 		ED_Write (f, EDICT_NUM(i));
-		fflush (f);
 	}
-	fclose (f);
-	/* fclose returns before the kernel/SD writeback necessarily settles;
-	 * don't let the music streamer touch the bridge until it has. */
+	fclose (f);	/* single flush of the tail — per-edict fflush was
+			 * hundreds of tiny kernel writes per save */
+	/* fclose returns before the kernel/SD writeback necessarily settles:
+	 * give the voices a settle margin AND retire the async DMA refill
+	 * path for this track — an async read issued after a slot write can
+	 * block forever inside the kernel (post-save freeze). */
+	CDAudio_NotifySlotWrite ();
 	CDAudio_PostponeResume (2000);
 	Con_Printf ("done.\n");
 }
@@ -972,6 +975,9 @@ void Host_Loadgame_f (void)
 		CL_EstablishConnection ("local");
 		Host_Reconnect_f ();
 	}
+	/* Give the kernel/SD a settle margin after the load's bridge burst
+	 * before (deferred) music is allowed to start streaming. */
+	CDAudio_PostponeResume (1500);
 	return;
 
 load_fail:

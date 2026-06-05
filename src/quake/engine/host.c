@@ -291,6 +291,7 @@ void Host_WriteConfiguration (void)
 	if (host_initialized & !isDedicated)
 	{
 		Sys_QuakeConfigPath(config_path, sizeof(config_path));
+		CDAudio_DrainAsync ();	/* free the slot bridge before a blocking open */
 		f = fopen (config_path, "w");
 		if (!f)
 		{
@@ -303,6 +304,7 @@ void Host_WriteConfiguration (void)
 		Cvar_WriteVariables (f);
 
 		fclose (f);
+		CDAudio_NotifySlotWrite ();	/* see post-save DMA wedge note */
 	}
 }
 
@@ -1055,9 +1057,12 @@ void Host_Shutdown(void)
 // keep Con_Printf from trying to update the screen
 	scr_disabled_for_loading = true;
 
-	Host_WriteConfiguration (); 
-
+	/* Stop the music stream (and drain its DMA) before the config write
+	 * touches the slot bridge — same single-user-bridge rule as saves. */
 	CDAudio_Shutdown ();
+
+	Host_WriteConfiguration ();
+
 	NET_Shutdown ();
 	S_Shutdown();
 	IN_Shutdown ();
