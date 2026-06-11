@@ -27,14 +27,17 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "of_cache.h"
 
 /* Alias rendering mode:
- *   2 = retired hardware triangle rasterizer experiment.
+ *   2 = hardware triangle edge walker (CMD_DRAW_PARAM_TRI): three
+ *       vertices per triangle, GPU walks the edges and z-tests against
+ *       the world's param-span depth. Runtime-gated on
+ *       OF_EMIT_CAP_TRIANGLES (+ CAP_PARAM_SPAN_ZTEST for world
+ *       aliases); falls through to the lower modes when the bitstream
+ *       doesn't advertise it.
  *   1 = CPU edge-walker with GPU affine span emit.
  *   0 = pure CPU scanline (slowest, portable).
- *
- * Mode 2 is no longer advertised by the current openfpgaOS SDK. Keep it
- * compiled out and use the supported span paths. */
+ */
 #ifndef D_USE_GPU_ALIAS
-#define D_USE_GPU_ALIAS 0
+#define D_USE_GPU_ALIAS 2
 #endif
 
 /* The viewmodel is rendered last through D_PolysetDrawSpans8_NoZ, so it does
@@ -51,12 +54,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  * overhead per (typically <16 px) span plus a full GPU drain every 128 spans,
  * dominating alias time on monster-heavy scenes. */
 
-/* Triangle path bisection toggles — kept around in case future
- * gateware regressions need re-testing. Defaults are ON; flip to 0
- * to disable the corresponding GPU feature on the engine side. */
-#ifndef D_ALIAS_PERSP
-#define D_ALIAS_PERSP 1
-#endif
+/* Triangle path bisection toggle — flip to 0 to flatten alias lighting
+ * (colormap row 0) when bisecting gateware regressions. Perspective is
+ * structural in mode 2: the param-tri z plane derives from vertex w,
+ * so there is no affine toggle anymore. */
 #ifndef D_ALIAS_GOURAUD
 #define D_ALIAS_GOURAUD 1
 #endif
@@ -156,6 +157,29 @@ void D_PolysetScanLeftEdge (int height);
 int pq_noz_mode;
 extern cvar_t pq_gpu_zwrite;
 extern int pq_gpu_zwrite_pending;
+
+/*
+================
+D_PolysetHWTriangles
+
+True when alias triangles go to the hardware edge walker. World aliases
+z-test/write through the param z plane, so they additionally need the
+z-test cap; the viewmodel (pq_noz_mode) draws with z disabled. r_alias.c
+also keys recursive subdivision off this: subdivision exists to bound
+affine texture warp, and the walker interpolates true perspective.
+================
+*/
+int D_PolysetHWTriangles (void)
+{
+#if D_USE_GPU_ALIAS == 2
+	if (!of_emit_supports(OF_EMIT_CAP_TRIANGLES))
+		return 0;
+	return pq_noz_mode ||
+		of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_ZTEST);
+#else
+	return 0;
+#endif
+}
 
 
 #if	!id386
@@ -315,8 +339,10 @@ void D_DrawNonSubdiv (void)
 	    r_affinetridesc.skinwidth * r_affinetridesc.skinheight);
 
 #if D_USE_GPU_ALIAS == 2
-	if (of_emit_supports(OF_EMIT_CAP_TRIANGLES)) {
-		/* Retired triangle experiment: bind one alias skin per model. */
+	if (D_PolysetHWTriangles()) {
+		/* Hardware edge walker: bind one alias skin per model (the
+		 * param-tri header carries it; the bind also captures it for
+		 * the triangle lowering in vid_of.c). */
 		{
 			of_emit_texture_t skin = {
 				.addr   = (uint32_t)(uintptr_t)r_affinetridesc.pskin,
@@ -326,24 +352,14 @@ void D_DrawNonSubdiv (void)
 			of_emit_bind_texture(&skin);
 		}
 
-		/* Retired triangle experiment: keep batching code compiled out so it
-		 * does not affect the supported span renderer. */
-		#define BATCH_TRIS_MAX  224
+		/* One triangle = 37 ring words; kick every 96 so a batch
+		 * (3552 words) fits both the 16 KB ring and one command-DMA
+		 * pull while the GPU walks ahead of the CPU. */
+		#define BATCH_TRIS_MAX  96
 		static of_emit_vertex_t batch_buf[BATCH_TRIS_MAX * 3];
 		int batch_count = 0;
 
 		#define PACK_V(dst, src, sval) do {                                     \
-			int _z = (src)->v[5] >> 16;                                         \
-			if (_z > 0xFFFF) _z = 0xFFFF;                                       \
-			if (_z < 0)      _z = 0;                                            \
-			int _w;                                                             \
-			if (D_ALIAS_PERSP) {                                                \
-				_w = (src)->v[5] >> 15;                                         \
-				if (_w >= 0x10000) _w = 0xFFFF;                                 \
-				if (_w < 1)        _w = 1;                                      \
-			} else {                                                            \
-				_w = 0x10000;                                                   \
-			}                                                                   \
 			byte _l;                                                            \
 			if (D_ALIAS_GOURAUD) {                                              \
 				int _row = (src)->v[4] >> 8;                                    \
@@ -355,11 +371,12 @@ void D_DrawNonSubdiv (void)
 			}                                                                   \
 			(dst).x   = (int16_t)((src)->v[0] << 4);                            \
 			(dst).y   = (int16_t)((src)->v[1] << 4);                            \
-			(dst).z   = (uint16_t)_z;                                           \
+			(dst).z   = 0; /* unused: the z plane derives from w */             \
 			(dst).pad = 0;                                                      \
 			(dst).s   = (sval);                                                 \
 			(dst).t   = (src)->v[3];                                            \
-			(dst).w   = (int32_t)_w;                                            \
+			/* zi Q16.16 unclamped: persp divide + z plane source */            \
+			(dst).w   = (int32_t)((src)->v[5] >> 15);                           \
 			(dst).r = _l; (dst).g = _l; (dst).b = _l; (dst).a = 0xFF;           \
 		} while (0)
 
@@ -398,6 +415,12 @@ void D_DrawNonSubdiv (void)
 			of_emit_triangles_batch(batch_buf, batch_count * 3);
 			of_emit_kick();
 		}
+
+		/* World aliases co-wrote depth on the GPU; CPU z consumers
+		 * (particles, CPU sprite fallback) must drain first. The
+		 * viewmodel writes no z. */
+		if (!pq_noz_mode)
+			pq_gpu_zwrite_pending = 1;
 
 		#undef PACK_V
 		#undef BATCH_TRIS_MAX

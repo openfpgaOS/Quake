@@ -238,15 +238,17 @@ void Host_InitLocal (void)
 	Cvar_RegisterVariable (&host_framerate);
 	Cvar_RegisterVariable (&host_speeds);
 
-	/* Allow enabling the render trace from quake.ini
-	 * ([quake] HOST_SPEEDS=1) — the handheld has no easy console input.
-	 * Any non-zero value emits the once/second averaged trace to UART. */
+	/* Render trace defaults OFF. Enable from quake.ini ([quake]
+	 * HOST_SPEEDS=1) or the console (host_speeds 1) — the handheld has no
+	 * easy console input. When on, the once/second averaged
+	 * [perf]/[gfx]/[wrld]/[edge]/[surf] block goes to the system console
+	 * (UART) only, so it never disturbs the screen. */
 	{
 		extern int Sys_IniGetInt(const char *key, int def);
 		Cvar_SetValue ("host_speeds", Sys_IniGetInt("HOST_SPEEDS", 0));
 		if (host_speeds.value)
 			Con_Printf ("[quake] host_speeds=%d (render trace -> UART; "
-			            "set [quake] HOST_SPEEDS in quake.ini)\n",
+			            "set [quake] HOST_SPEEDS=0 in quake.ini to disable)\n",
 			            (int)host_speeds.value);
 	}
 
@@ -799,15 +801,18 @@ void _Host_Frame (float time)
 			{
 				float	n = (float)perf_frames;
 				float	win = fnow - perf_anchor;
-				Con_Printf ("[perf] %4.1f fps | srv %5.0f gfx %5.0f tot %5.0f us/fr (avg %d fr)\n",
+				/* Sys_Printf, not Con_Printf: the trace is on by
+				 * default and Con_Printf would park 5 notify lines on
+				 * screen every second.  UART/system console only. */
+				Sys_Printf ("[perf] %4.1f fps | srv %5.0f gfx %5.0f tot %5.0f us/fr (avg %d fr)\n",
 					perf_frames / win, perf_srv / n, perf_gfx / n,
 					perf_tot / n, perf_frames);
-				Con_Printf ("[gfx]  wait %5.0f world %5.0f 2d %5.0f present %5.0f us/fr\n",
+				Sys_Printf ("[gfx]  wait %5.0f world %5.0f 2d %5.0f present %5.0f us/fr\n",
 					perf_gwait / n, perf_gworld / n, perf_g2d / n, perf_gpresent / n);
-				Con_Printf ("[wrld] setup %5.0f edges %5.0f alias %5.0f weap %5.0f part %5.0f warp %5.0f\n",
+				Sys_Printf ("[wrld] setup %5.0f edges %5.0f alias %5.0f weap %5.0f part %5.0f warp %5.0f\n",
 					perf_setup / n, perf_redge / n, perf_ralias / n,
 					perf_rview / n, perf_rpart / n, perf_rwarp / n);
-				Con_Printf ("[edge] rworld %5.0f bent %5.0f scan %5.0f (surf %5.0f) us/fr\n",
+				Sys_Printf ("[edge] rworld %5.0f bent %5.0f scan %5.0f (surf %5.0f) us/fr\n",
 					perf_rworld / n, perf_bent / n, perf_scan / n, perf_surf / n);
 				/* emit = remainder of [surf]: D_CalcGradients + Q29 setup +
 				 * param-span submit + per-surface loop overhead.  Only the
@@ -817,7 +822,7 @@ void _Host_Frame (float time)
 					double surf_other = (perf_surf - perf_scache - perf_sz
 						- perf_ssky - perf_sturb) / n;
 					if (surf_other < 0) surf_other = 0;
-					Con_Printf ("[surf] cache %5.0f emit %5.0f z %5.0f sky %5.0f turb %5.0f (miss %3.0f/fr)\n",
+					Sys_Printf ("[surf] cache %5.0f emit %5.0f z %5.0f sky %5.0f turb %5.0f (miss %3.0f/fr)\n",
 						perf_scache / n, surf_other, perf_sz / n,
 						perf_ssky / n, perf_sturb / n, perf_smiss / n);
 				}

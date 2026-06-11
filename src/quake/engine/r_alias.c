@@ -801,8 +801,12 @@ PQ_HOT void R_AliasDrawModel (alight_t *plighting)
 	if (!currententity->colormap)
 		Sys_Error ("R_AliasDrawModel: !currententity->colormap");
 
+	/* Recursive subdivision exists to bound affine texture warp; the
+	 * hardware edge walker interpolates true perspective, so route
+	 * everything through D_DrawNonSubdiv (also skips the CPU
+	 * final-vert dot pass and its GPU drain). */
 	r_affinetridesc.drawtype = (currententity->trivial_accept == 3) &&
-			r_recursiveaffinetriangles;
+			r_recursiveaffinetriangles && !D_PolysetHWTriangles();
 
 	if (r_affinetridesc.drawtype)
 	{

@@ -1067,11 +1067,12 @@ SetVisibilityByPassages ();
 	S_ExtraUpdate();
 
 
-	if (pq_gpu_zwrite_pending)
-	{
-		of_emit_finish();
-		pq_gpu_zwrite_pending = 0;
-	}
+	/* No global drain before entities: every CPU consumer inside this
+	 * phase self-drains on pq_gpu_zwrite_pending (D_PolysetDrawSpans8,
+	 * D_PolysetDrawFinalVerts, D_DrawSubdiv, the sprite CPU fallback in
+	 * D_SpriteDrawSpans), and the GPU paths (param-tri aliases, param-z
+	 * sprites) are ring-ordered after the world's z writes. Entity
+	 * transform/cull/pack overlaps the GPU world fill instead. */
 
 	if (R_PROF) r_prof_t0 = Sys_FloatTime ();
 	R_DrawEntitiesOnList ();

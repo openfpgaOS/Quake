@@ -102,21 +102,23 @@ typedef struct of_emit_param_span_list_s {
     int32_t  z_minor_step;
 } of_emit_param_span_list_t;
 
-/* ------- Retired triangle compatibility descriptors -----------------
+/* ------- Hardware triangle descriptors (CMD_DRAW_PARAM_TRI) ---------
  *
- * Current openfpgaOS SDKs expose the unified param-span command as the
- * supported draw path. These descriptors remain so old experimental world
- * triangle code can stay compiled out without dragging of_gpu.h into engine
- * files. vid_of.c treats triangle submission as a no-op unless a future SDK
- * grows an explicit supported path again.
+ * vid_of.c lowers each vertex triple to one GPU param-tri command: the
+ * same plane/control/z header as the param span list, with the GPU
+ * walking the three vertices itself (ceil fill on both edges,
+ * left-closed right-open — crack-free shared edges).  Gated on
+ * OF_EMIT_CAP_TRIANGLES; alias models are the only client (d_polyse.c).
  */
 
 typedef struct of_emit_vertex_s {
     int16_t  x, y;   /* screen position, 12.4 fixed-point */
-    uint16_t z;      /* 16-bit depth, 0=near 0xFFFF=far   */
+    uint16_t z;      /* unused by the param-tri lowering (pack 0) — the
+                        z plane is rebuilt from w */
     uint16_t pad;
     int32_t  s, t;   /* texture coords, 16.16 fixed-point */
-    int32_t  w;      /* 1/W for perspective (0x10000 = affine) */
+    int32_t  w;      /* zi in Q16.16 (v[5]>>15); feeds the persp divide
+                        and the z plane (z window stores w>>1) */
     uint8_t  r, g, b, a;  /* vertex colour / light / alpha */
 } of_emit_vertex_t;
 
@@ -164,7 +166,9 @@ void of_emit_depth_test(of_emit_depth_func_t func);
  * be checked before using newer commands. */
 #define OF_EMIT_CAP_SPAN       (1u << 0)
 #define OF_EMIT_CAP_PERSP      (1u << 1)
-#define OF_EMIT_CAP_TRIANGLES  (1u << 2) /* retired/inactive */
+#define OF_EMIT_CAP_TRIANGLES  (1u << 2) /* HW edge walker (PARAM_TRI);
+                                            z-tested flavor also needs
+                                            CAP_PARAM_SPAN_ZTEST */
 #define OF_EMIT_CAP_VCOLOR     (1u << 3) /* vertex color cap without draw API */
 #define OF_EMIT_CAP_FRAGPIPE   (1u << 4)
 #define OF_EMIT_CAP_ALPHA      (1u << 5)
@@ -207,7 +211,10 @@ void of_emit_blit(int dst_x, int dst_y,
                   int src_x, int src_y,
                   int skip_key_ff);
 
-/* Compatibility no-ops for disabled experimental triangle paths. */
+/* Hardware triangle submission (CMD_DRAW_PARAM_TRI).  Each vertex
+ * triple becomes one GPU command; no-ops unless OF_EMIT_CAP_TRIANGLES.
+ * World aliases z-test/write via the param z plane; the viewmodel
+ * (pq_noz_mode) draws with z disabled. */
 void of_emit_triangles(const of_emit_vertex_t *verts, uint32_t num_vertices);
 
 void of_emit_triangles_batch(const of_emit_vertex_t *verts,

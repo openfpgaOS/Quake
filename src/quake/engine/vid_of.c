@@ -35,7 +35,17 @@ extern cvar_t pq_gpu_safe_spans;
 #define ZBUFFER_MAX_WIDTH  320
 #define ZBUFFER_MAX_HEIGHT 240
 #define VIDEO_BUFFERS 3
-#define SURFCACHE_SIZE   (2 * 1024 * 1024)
+/* Surface cache: lit/mipped world-texture blocks. Misses force a CPU
+ * rebuild (the [surf] cache line in host_speeds — 26 ms / 40 misses per
+ * frame in busy multiplayer scenes at the old fixed 2 MB). Size it from
+ * available SDRAM at init instead: SURFCACHE_MIN is the guaranteed floor
+ * (a static array, so it can never fail to allocate and never regresses
+ * below the historical value); above that we malloc a fraction of the
+ * app heap up to SURFCACHE_MAX, which is enough to hold a heavy scene's
+ * texture working set so the miss rate falls toward zero. */
+#define SURFCACHE_MIN    (2 * 1024 * 1024)
+#define SURFCACHE_MAX    (8 * 1024 * 1024)
+#define SURFCACHE_HEAP_FRACTION 8   /* take up to heap_size/8 */
 #define PQ_GPU_SPAN_BATCH_MAX 256
 
 #ifndef PQ_GPU_VALIDATE_DEST
@@ -60,8 +70,12 @@ _Static_assert(OF_HW_GPU_PARAM_SPAN_ZTEST == (1u << 17),
                "OF_HW_GPU_PARAM_SPAN_ZTEST must remain runtime caps bit 17");
 _Static_assert(OF_HW_GPU_PARAM_SPAN_Q29_SCALE == (1u << 18),
                "OF_HW_GPU_PARAM_SPAN_Q29_SCALE must remain runtime caps bit 18");
+_Static_assert(OF_HW_GPU_PARAM_TRI == (1u << 19),
+               "OF_HW_GPU_PARAM_TRI must remain runtime caps bit 19");
 _Static_assert(GPU_CMD_DRAW_PARAM_SPAN_LIST == 0x48,
                "param span-list opcode must match openfpgaOS");
+_Static_assert(GPU_CMD_DRAW_PARAM_TRI == 0x49,
+               "param-tri opcode must match openfpgaOS");
 _Static_assert(OF_EMIT_PARAM_SPAN_MAX_RECORDS == OF_GPU_PARAM_SPAN_MAX_RECORDS,
                "param span-list max record count mismatch");
 _Static_assert(OF_EMIT_PARAM_ATTR_AFFINE == OF_GPU_PARAM_ATTR_AFFINE &&
@@ -106,6 +120,9 @@ static int     zbuffer_cpu_cached;
 static uint32_t of_emit_caps;
 static int     of_emit_ready;
 static int     of_emit_cpu_sync_needed;
+/* OF_HW_GPU_VERT_TRI: GPU derives the attribute planes from raw vertices
+ * (CMD_DRAW_VERT_TRI). Set in of_emit_init; selects the alias lowering. */
+static int     g_vert_tri;
 static uint8_t *vid_fb_raw[VIDEO_BUFFERS];
 static byte    *vid_fb_uncached[VIDEO_BUFFERS];
 static of_video_mode_t vid_mode;
@@ -130,7 +147,9 @@ static uint32_t of_emit_clean_once_next;
 #endif
 
 /* Surface cache in BSS (cacheable SDRAM). 2 MB bank. */
-static byte surfcache_storage[SURFCACHE_SIZE] __attribute__((aligned(64)));
+/* Floor allocation, always present. A larger cache (when SDRAM allows)
+ * is malloc'd over this at init; this static block is the fallback. */
+static byte surfcache_storage[SURFCACHE_MIN] __attribute__((aligned(64)));
 
 /* Keep enough z storage for the old default 320x240 fallback as well as
  * Quake's preferred 320x200 source mode. */
@@ -739,6 +758,20 @@ void of_emit_init(void)
     if ((hw & (OF_HW_GPU_PARAM_SPAN_LIST | OF_HW_GPU_PARAM_SPAN_Q29_SCALE)) ==
         (OF_HW_GPU_PARAM_SPAN_LIST | OF_HW_GPU_PARAM_SPAN_Q29_SCALE))
         of_emit_caps |= OF_EMIT_CAP_Q29_SCALE;
+    /* Hardware triangle edge walker (CMD_DRAW_PARAM_TRI). Shares the
+     * param-span plane/z header, so it is only meaningful with the
+     * span-list command present. The z-tested alias flavor additionally
+     * requires OF_EMIT_CAP_PARAM_SPAN_ZTEST at the call site. */
+    if ((hw & (OF_HW_GPU_PARAM_TRI | OF_HW_GPU_PARAM_SPAN_LIST)) ==
+        (OF_HW_GPU_PARAM_TRI | OF_HW_GPU_PARAM_SPAN_LIST))
+        of_emit_caps |= OF_EMIT_CAP_TRIANGLES;
+    /* Hardware plane derivation (CMD_SET_TRI_STATE/DRAW_VERT_TRI): the
+     * GPU forms the s*zi/t*zi/zi/light planes from raw per-vertex values,
+     * so the alias lowering drops the per-triangle 2x2 solve + Q29
+     * escalation entirely. Bitstreams that ship it also ship PARAM_TRI
+     * (the 0x49 fallback), so gate the path on this flag and fall back
+     * otherwise. */
+    g_vert_tri = (hw & OF_HW_GPU_VERT_TRI) != 0;
     of_emit_caps |= OF_EMIT_CAP_SPAN_BATCH;
 
     /* of_gpu_init resolves the MMIO base from caps before any GPU_CTRL
@@ -1112,25 +1145,324 @@ void of_emit_blit(int dst_x, int dst_y,
     }
 }
 
-void of_emit_triangles(const of_emit_vertex_t *verts, uint32_t num_vertices)
+/* ---- Hardware triangles (CMD_DRAW_PARAM_TRI) ----------------------- */
+
+/* Set around R_DrawViewModel (r_main.c): the viewmodel renders last and
+ * neither reads nor writes depth. */
+extern int pq_noz_mode;
+
+/* Texture state captured for the triangle lowering: param headers carry
+ * the skin address/size explicitly (the GPU's sticky texture bind only
+ * serves the legacy scalar span path). */
+static of_emit_texture_t of_emit_tri_tex;
+
+/*
+ * Lower one alias triangle to CMD_DRAW_PARAM_TRI.
+ *
+ * Attribute planes are solved in screen space through the three vertex
+ * values (one reciprocal of the signed area, reused for every plane):
+ *
+ *   world aliases  — attr_mode PERSP, z_mode Z_TEST_WRITE:
+ *     attr0 = s_tex * zi * 2^16, attr1 = t_tex * zi * 2^16, attr2 = zi
+ *     in Q16.16 — the plain-PERSP RTL contract is "s/z, t/z, 1/z all in
+ *     16.16" (only the Q29 mode uses the 2^13 numerator convention).
+ *     The z window (attr2[16:1]) then stores zi*2^15 = v[5]>>16,
+ *     byte-identical to the CPU writer in D_PolysetDrawFinalVerts,
+ *     GEQUAL test.
+ *   viewmodel      — same planes, z_mode NONE (pq_noz_mode).
+ *
+ * Everything is rebased to the triangle's bbox corner: fb/z bases are
+ * offset, vertices and the clip rect shifted. This keeps the plane
+ * origins evaluated inside the triangle — the light plane is decoded
+ * from 24 bits (signed Q6.16) and would truncate if anchored at screen
+ * (0,0) with a steep gradient.
+ */
+static void of_emit_tri_one(of_gpu_param_span_list_t *p,
+                            const of_emit_vertex_t *v0,
+                            const of_emit_vertex_t *v1,
+                            const of_emit_vertex_t *v2,
+                            int use_z,
+                            int16_t cx0, int16_t cx1,
+                            int16_t cy0, int16_t cy1)
 {
-    (void)verts;
-    (void)num_vertices;
-    /* Retired SDK triangle commands are intentionally not reached from the
-     * current openfpgaOS API. World and alias GPU acceleration uses spans. */
+    of_gpu_tri_vert_t tv[3];
+    float x0, y0, x1f, y1f, x2f, y2f, det, inv;
+    float a0[4], a1[4], a2[4];      /* s*zi, t*zi, zi, light */
+    float org[4], du[4], dv[4];
+    int bx, by, i;
+
+    /* Q12.4 x, Q12.4 y (low bits zero — projected verts are integer). */
+    x0  = (float)v0->x * (1.0f / 16.0f);
+    y0  = (float)v0->y * (1.0f / 16.0f);
+    x1f = (float)v1->x * (1.0f / 16.0f);
+    y1f = (float)v1->y * (1.0f / 16.0f);
+    x2f = (float)v2->x * (1.0f / 16.0f);
+    y2f = (float)v2->y * (1.0f / 16.0f);
+
+    det = (x1f - x0) * (y2f - y0) - (x2f - x0) * (y1f - y0);
+    if (det == 0.0f)
+        return;                     /* degenerate sliver */
+    inv = 1.0f / det;
+
+    /* bbox corner anchor (any in-triangle-adjacent point works) —
+     * integer min on the raw Q12.4 coords, no float round trip */
+    bx = v0->x;
+    if (v1->x < bx) bx = v1->x;
+    if (v2->x < bx) bx = v2->x;
+    bx >>= 4;
+    by = v0->y;
+    if (v1->y < by) by = v1->y;
+    if (v2->y < by) by = v2->y;
+    by >>= 4;
+
+    /* Vertex attribute values.  v->s/t are 16.16 texels, v->w is zi in
+     * Q16.16 (v[5] >> 15, ziscale 2^31 source).  Plain ATTR_PERSP is
+     * NOT scale-free: the RTL expects sZ/tZ as "s/z in 16.16" and zinv
+     * as "1/z in 16.16" (gpu_core.v sp_sZ/sp_zinv; the sprite path
+     * ships the same 2^16 on all three).  s*zi*2^16 =
+     * s_16.16 * w_16.16 * 2^-16. */
+    a0[0] = (float)v0->s * (float)v0->w * (1.0f / 65536.0f);
+    a1[0] = (float)v1->s * (float)v1->w * (1.0f / 65536.0f);
+    a2[0] = (float)v2->s * (float)v2->w * (1.0f / 65536.0f);
+    a0[1] = (float)v0->t * (float)v0->w * (1.0f / 65536.0f);
+    a1[1] = (float)v1->t * (float)v1->w * (1.0f / 65536.0f);
+    a2[1] = (float)v2->t * (float)v2->w * (1.0f / 65536.0f);
+    a0[2] = (float)v0->w;
+    a1[2] = (float)v1->w;
+    a2[2] = (float)v2->w;
+    a0[3] = (float)(v0->r << 16);   /* colormap row, Q6.16 */
+    a1[3] = (float)(v1->r << 16);
+    a2[3] = (float)(v2->r << 16);
+
+    {
+        const float dx10 = x1f - x0, dy10 = y1f - y0;
+        const float dx20 = x2f - x0, dy20 = y2f - y0;
+        const float rx0 = x0 - (float)bx, ry0 = y0 - (float)by;
+
+        for (i = 0; i < 4; i++) {
+            float d10 = a1[i] - a0[i];
+            float d20 = a2[i] - a0[i];
+
+            du[i]  = (d10 * dy20 - d20 * dy10) * inv;
+            dv[i]  = (d20 * dx10 - d10 * dx20) * inv;
+            org[i] = a0[i] - rx0 * du[i] - ry0 * dv[i];
+        }
+    }
+
+    /* int32 plane headroom. Sliver triangles (det of a few px² with a
+     * large s·zi delta — the close, 3x-zi viewmodel is the worst case)
+     * overflow the plain Q16.16-scale planes. NEVER drop them: a
+     * dropped triangle reads as a crack between its neighbours.
+     * Rescale into PERSP_Q29 with a per-triangle dynamic shift instead
+     * (the world path's trick; z restores to the same zi*2^15 the
+     * plain mode stores, so depth stays consistent). */
+    {
+        float fmax = 0.0f, c;
+
+        for (i = 0; i < 3; i++) {
+            c = fabsf(org[i]); if (c > fmax) fmax = c;
+            c = fabsf(du[i]);  if (c > fmax) fmax = c;
+            c = fabsf(dv[i]);  if (c > fmax) fmax = c;
+        }
+
+        if (fmax < 1073741824.0f) {
+            p->attr_mode      = OF_GPU_PARAM_ATTR_PERSP;
+            p->q29_attr_shift = 0;
+        } else {
+            /* value units = Q16.16-scale floats / 2^16; pick sh so the
+             * scaled attrs stay < 2^30 (one headroom bit), exactly like
+             * the world emission. */
+            union { float f; uint32_t u; } mb, sb;
+            float scale;
+            int sh;
+
+            if (!of_emit_supports(OF_EMIT_CAP_Q29_SCALE))
+                return;             /* no dynamic scale: drop (unreachable
+                                     * on bitstreams that ship PARAM_TRI) */
+
+            mb.f = fmax * (1.0f / 65536.0f);
+            sh = (int)((mb.u >> 23) & 0xFFu) - 126 - 1;
+            if (sh < 0)
+                sh = 0;
+            else if (sh > 31)
+                sh = 31;
+            sb.u = (uint32_t)(127 + 29 - sh) << 23;     /* 2^(29-sh) */
+            scale = sb.f * (1.0f / 65536.0f);
+
+            for (i = 0; i < 3; i++) {
+                org[i] *= scale;
+                du[i]  *= scale;
+                dv[i]  *= scale;
+            }
+            p->attr_mode      = OF_GPU_PARAM_ATTR_PERSP_Q29;
+            p->q29_attr_shift = (uint8_t)sh;
+        }
+    }
+
+    /* The light plane decodes from 24 bits (signed Q6.16) and has no
+     * dynamic-scale mode — saturate sliver gradients rather than drop;
+     * a wrong shade on a 1-2 px strip is invisible, a hole is not. */
+    if (org[3] > 8388607.0f)  org[3] = 8388607.0f;
+    if (org[3] < -8388608.0f) org[3] = -8388608.0f;
+    if (du[3] > 8388607.0f)   du[3] = 8388607.0f;
+    if (du[3] < -8388608.0f)  du[3] = -8388608.0f;
+    if (dv[3] > 8388607.0f)   dv[3] = 8388607.0f;
+    if (dv[3] < -8388608.0f)  dv[3] = -8388608.0f;
+
+    /* Constant header fields (tex, flags, modes, clamps, z steps) are
+     * prebuilt per batch by the caller; patch only what varies. */
+    p->fb_base = (uint32_t)(uintptr_t)
+        (d_viewbuffer + by * screenwidth + bx);
+    for (i = 0; i < 3; i++) {
+        p->attr_origin[i] = (int32_t)org[i];
+        p->attr_du[i]     = (int32_t)du[i];
+        p->attr_dv[i]     = (int32_t)dv[i];
+    }
+    p->light_origin = (int32_t)org[3];
+    p->light_du     = (int32_t)du[3];
+    p->light_dv     = (int32_t)dv[3];
+    if (use_z) {
+        p->z_base = (uint32_t)(uintptr_t)
+            (d_pzbuffer + by * d_zwidth + bx);
+    }
+
+    tv[0].x = (int16_t)(v0->x - (bx << 4));
+    tv[0].y = (int16_t)((v0->y >> 4) - by);
+    tv[1].x = (int16_t)(v1->x - (bx << 4));
+    tv[1].y = (int16_t)((v1->y >> 4) - by);
+    tv[2].x = (int16_t)(v2->x - (bx << 4));
+    tv[2].y = (int16_t)((v2->y >> 4) - by);
+
+    of_gpu_draw_param_tri(p, tv,
+                          (int16_t)(cx0 - bx), (int16_t)(cx1 - bx),
+                          (int16_t)(cy0 - by), (int16_t)(cy1 - by));
 }
 
 void of_emit_triangles_batch(const of_emit_vertex_t *verts,
                              uint32_t num_vertices)
 {
-    (void)verts;
-    (void)num_vertices;
-    /* Compatibility no-op for disabled experimental triangle paths. */
+    of_gpu_param_span_list_t p;
+    int16_t cx0, cx1, cy0, cy1;
+    int use_z;
+    uint32_t t;
+
+    if (!verts || num_vertices < 3 ||
+        !of_emit_supports(OF_EMIT_CAP_TRIANGLES))
+        return;
+
+    use_z = !pq_noz_mode;
+    if (use_z && (!of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_ZTEST) ||
+                  !d_pzbuffer || d_zwidth <= 0))
+        return;                     /* caller gates on this too */
+
+    /* Refresh window, right/bottom exclusive (the walker's fill rule
+     * already excludes the bottom/right clip edges like the CPU). */
+    cx0 = (int16_t)r_refdef.vrect.x;
+    cy0 = (int16_t)r_refdef.vrect.y;
+    cx1 = (int16_t)(r_refdef.vrect.x + r_refdef.vrect.width);
+    cy1 = (int16_t)(r_refdef.vrect.y + r_refdef.vrect.height);
+
+    flush_span_batch();
+    of_emit_cpu_sync_needed = 1;
+
+    if (g_vert_tri) {
+        /* Hardware plane derivation. The GPU anchors each triangle
+         * internally, so there is NO bbox rebase: fb/z bases are the
+         * screen origin, the clip is the raw refresh window, and every
+         * per-triangle field is batch-constant. One sticky state per
+         * surface, then 14-word raw-vertex triangles — no CPU plane
+         * solve, no Q29 escalation, no overflow handling.
+         *
+         * Sticky-state safety: nothing between this set_tri_state and
+         * the draws below emits a 0x48/0x49 param command (the only
+         * things that share — and would clobber — the staging the
+         * sticky state lives in). flush_span_batch() ran above; the
+         * per-batch re-arm also covers the of_emit_kick() d_polyse.c
+         * issues between batches. */
+        of_gpu_tri_state_t st;
+
+        memset(&st, 0, sizeof(st));
+        st.fb_base       = (uint32_t)(uintptr_t)d_viewbuffer;
+        st.fb_major_step = screenwidth;
+        st.fb_minor_step = 1;
+        st.tex_addr      = of_emit_tri_tex.addr;
+        st.tex_width     = of_emit_tri_tex.width;
+        /* masks 0 = no wrap; the clamps below bound s,t to the skin */
+        st.flags         = OF_EMIT_COLORMAP;
+        st.colormap_id   = 0;
+        st.z_mode        = use_z ? OF_GPU_PARAM_Z_TEST_WRITE
+                                 : OF_GPU_PARAM_Z_NONE;
+        st.clamp_min[0]  = 0;
+        st.clamp_max[0]  = ((int32_t)of_emit_tri_tex.width  - 1) << 16;
+        st.clamp_min[1]  = 0;
+        st.clamp_max[1]  = ((int32_t)of_emit_tri_tex.height - 1) << 16;
+        if (use_z) {
+            st.z_base       = (uint32_t)(uintptr_t)d_pzbuffer;
+            st.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
+            st.z_minor_step = (int32_t)sizeof(short);
+        }
+        st.clip_x0 = cx0; st.clip_x1 = cx1;
+        st.clip_y0 = cy0; st.clip_y1 = cy1;
+        of_gpu_set_tri_state(&st);
+
+        for (t = 0; t + 3 <= num_vertices; t += 3) {
+            const of_emit_vertex_t *a = &verts[t];
+            const of_emit_vertex_t *b = &verts[t + 1];
+            const of_emit_vertex_t *c = &verts[t + 2];
+            /* x Q12.4 raw; y Q12.4 -> integer scanline (>>4, matching
+             * the 0x49 lowering); s,t,zi raw Q16.16; light 6-bit row. */
+            const int16_t vx[3]  = { a->x, b->x, c->x };
+            const int16_t vy[3]  = { (int16_t)(a->y >> 4),
+                                     (int16_t)(b->y >> 4),
+                                     (int16_t)(c->y >> 4) };
+            const int32_t vs[3]  = { a->s, b->s, c->s };
+            const int32_t vt[3]  = { a->t, b->t, c->t };
+            const int32_t vzi[3] = { a->w, b->w, c->w };
+            const uint8_t vl[3]  = { a->r, b->r, c->r };
+
+            of_gpu_draw_vert_tri(vx, vy, vs, vt, vzi, vl);
+        }
+        return;
+    }
+
+    /* Fallback (no OF_HW_GPU_VERT_TRI): CPU-solved planes via
+     * CMD_DRAW_PARAM_TRI (0x49). Header template built once per batch;
+     * of_emit_tri_one patches the per-triangle fields (fb/z base, attr +
+     * light planes). */
+    memset(&p, 0, sizeof(p));
+    p.fb_major_step = screenwidth;
+    p.fb_minor_step = 1;
+    p.tex_addr  = of_emit_tri_tex.addr;
+    p.tex_width = of_emit_tri_tex.width;
+    p.flags     = OF_EMIT_COLORMAP;
+    p.attr_mode = OF_GPU_PARAM_ATTR_PERSP;
+    p.span_axis = OF_GPU_PARAM_AXIS_X;
+    p.z_mode    = use_z ? OF_GPU_PARAM_Z_TEST_WRITE : OF_GPU_PARAM_Z_NONE;
+    /* Perspective interpolation can overshoot the skin rect by a hair
+     * at triangle edges; clamp s,t (post-divide 16.16 texels). */
+    p.clamp_min[0] = 0;
+    p.clamp_max[0] = ((int32_t)of_emit_tri_tex.width - 1) << 16;
+    p.clamp_min[1] = 0;
+    p.clamp_max[1] = ((int32_t)of_emit_tri_tex.height - 1) << 16;
+    if (use_z) {
+        p.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
+        p.z_minor_step = (int32_t)sizeof(short);
+    }
+
+    for (t = 0; t + 3 <= num_vertices; t += 3)
+        of_emit_tri_one(&p, &verts[t], &verts[t + 1], &verts[t + 2],
+                        use_z, cx0, cx1, cy0, cy1);
+}
+
+void of_emit_triangles(const of_emit_vertex_t *verts, uint32_t num_vertices)
+{
+    of_emit_triangles_batch(verts, num_vertices);
 }
 
 void of_emit_bind_texture(const of_emit_texture_t *tex)
 {
     flush_span_batch();
+    of_emit_tri_tex = *tex;
     of_gpu_texture_t gt = {
         .addr   = tex->addr,
         .width  = tex->width,
@@ -1195,7 +1527,34 @@ void VID_Init(unsigned char *palette)
     d_pzbuffer = zbuffer_cpu_cached ? zbuffer_storage
                                     : (short *)of_uncached(zbuffer_storage);
 
-    D_InitCaches(surfcache_storage, SURFCACHE_SIZE);
+    /* Grow the surface cache with available SDRAM. Target a fraction of
+     * the app heap, clamped to [MIN, MAX] and rounded to whole MB; malloc
+     * from what's left after Quake's zone/hunk pool (already reserved in
+     * main() before this runs). On any failure, fall back to the static
+     * floor — no regression, no hard dependency on heap headroom. */
+    {
+        const struct of_capabilities *caps = of_get_caps();
+        byte    *sc_ptr  = surfcache_storage;
+        uint32_t sc_size = SURFCACHE_MIN;
+        uint32_t target  = caps ? caps->heap_size / SURFCACHE_HEAP_FRACTION : 0;
+
+        if (target > SURFCACHE_MAX) target = SURFCACHE_MAX;
+        target &= ~((uint32_t)0xFFFFF);          /* whole MB */
+
+        if (target > SURFCACHE_MIN) {
+            byte *p = NULL;
+            /* Step down by 1 MB until the heap can satisfy it. */
+            for (uint32_t want = target; want > SURFCACHE_MIN;
+                 want -= 1u * 1024u * 1024u) {
+                p = (byte *)malloc(want);
+                if (p) { sc_ptr = p; sc_size = want; break; }
+            }
+        }
+
+        D_InitCaches(sc_ptr, (int)sc_size);
+        Sys_Printf("Surface cache: %u KB (%s)\n", sc_size / 1024u,
+                   sc_ptr == surfcache_storage ? "static floor" : "SDRAM");
+    }
 
     Sys_Printf("Video mode: %ux%u stride=%u\n",
                vid_mode.width, vid_mode.height, vid_mode.stride);
