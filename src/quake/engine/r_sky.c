@@ -31,6 +31,7 @@ float	skyspeed, skyspeed2;
 float		skytime;
 
 byte		*r_skysource;
+unsigned	r_sky_gpu_addr;		/* sky source's GPU base address (dynamic texture) */
 
 int r_skymade;
 int r_skydirect;		// not used?
@@ -86,6 +87,15 @@ void R_InitSky (texture_t *mt)
 	}
 	
 	r_skysource = newsky;
+
+	/* Register the sky as a dynamic (in-place) texture with the manager;
+	 * R_MakeSky refreshes its bytes each tick.  Its GPU base address is constant
+	 * for the level. */
+	{
+		extern unsigned of_emit_sky_create(void *pixels,
+		                                   unsigned short w, unsigned short h);
+		r_sky_gpu_addr = of_emit_sky_create(r_skysource, SKYSIZE, SKYSIZE);
+	}
 }
 
 
@@ -151,13 +161,11 @@ void R_MakeSky (void)
 
 	r_skymade = 1;
 
-	/* Flush the composited sky to SDRAM so the GPU's AXI reads see
-	 * fresh bytes when D_DrawSkyScans8 emits SPAN-path draws. Once
-	 * per skytime tick — cheap. */
+	/* Publish the freshly-composited sky bytes to the GPU (the manager does the
+	 * cache clean).  Once per skytime tick — cheap, no re-upload. */
 	{
-		extern void of_emit_cache_clean(const void *addr,
-		                                unsigned int size);
-		of_emit_cache_clean(r_skysource, SKYSIZE * SKYSIZE * 2);
+		extern void of_emit_sky_update(unsigned nbytes);
+		of_emit_sky_update(SKYSIZE * SKYSIZE * 2);
 	}
 }
 

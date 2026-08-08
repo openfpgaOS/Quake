@@ -132,6 +132,43 @@ typedef struct of_emit_texture_s {
 
 void of_emit_bind_texture(const of_emit_texture_t *tex);
 
+/* ------- Texture store (portable, target-agnostic) -----------------
+ *
+ * Thin wrappers over the openfpgaOS texture manager (driven entirely inside
+ * vid_of.c).  The engine deals only in opaque GPU addresses + two domain binds;
+ * which memory a texture lives in, the upload, the fetch-domain switch and the
+ * colormap co-location are all hidden.  Same calls on Pocket and MiSTer. */
+
+/* Reset the manager on level change (then re-create textures + colormap). */
+void of_emit_tex_reset(void);
+
+/* 1 if the target has a dedicated fast texture tier (for diagnostics). */
+int of_emit_has_fast_mem(void);
+
+/* 1 when world textures are resident in the fast tier this map: the world span
+ * path must bind each surface's CRAM1 offset (texture_t.gpu_tex_addr) and wrap
+ * the world pass in the fast fetch domain. */
+int of_emit_fasttex_active(void);
+
+/* Create a STATIC texture (world miptex, alias skin, …) from `pixels`; returns
+ * its GPU base address.  For a given mip add the intra-texture byte offset. */
+uint32_t of_emit_tex_create(const void *pixels, uint16_t w, uint16_t h, uint32_t nbytes);
+
+/* Register the animated sky as a DYNAMIC (in-place) texture; returns its GPU
+ * base address.  Call of_emit_sky_update() after each rebuild. */
+uint32_t of_emit_sky_create(void *pixels, uint16_t w, uint16_t h);
+void     of_emit_sky_update(uint32_t nbytes);
+
+/* GPU base address of an SDRAM source the GPU samples in place (turbulent
+ * scratch rows): memory-agnostic, matches the texture manager's addressing. */
+uint32_t of_emit_tex_source_addr(const void *src);
+
+/* Set the GPU fetch domain for the next batch (flips + drains only on change;
+ * flush pending batched geometry first).  static = world textures' tier;
+ * dynamic = SDRAM (sky, turbulent, alias, sprites, HUD). */
+void of_emit_bind_static(void);
+void of_emit_bind_dynamic(void);
+
 /* ------- Enumerations matching of_gpu.h ----------------------------- */
 
 typedef enum {
@@ -149,6 +186,11 @@ typedef enum {
 
 void of_emit_init(void);
 void of_emit_upload_colormap(const unsigned char *cm, uint32_t size);
+/* Fast-tier accounting (spill diagnostic): total bytes, bytes still free, and the
+ * count of world textures that overflowed the tier (placed in SDRAM instead). */
+uint32_t of_emit_fasttex_size(void);
+uint32_t of_emit_fasttex_budget_free(void);
+int      of_emit_fasttex_spill_count(void);
 void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
                      uint32_t zb_addr, int zb_stride_bytes);
 void of_emit_finish(void);

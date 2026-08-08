@@ -6,14 +6,18 @@
 # engine and SDK shims — so every rebuild picks up every change.
 
 APP       = quake
-TARGET    = pocket
+TARGET   ?= pocket
+MISTER_IP ?= mister.local
 SDK_DIR   = ../sdk
 ROOT      = $(realpath $(CURDIR)/../..)
 OBJ_DIR   = $(ROOT)/.obj/$(APP)
 BUILD_DIR = $(OBJ_DIR)
 DIST      = $(ROOT)/dist/$(APP)
-OUT       = $(ROOT)/build/$(APP)
+OUT       = $(ROOT)/build/$(TARGET)/$(APP)
 RUNTIME   = $(ROOT)/runtime
+# Game data files shipped into the per-target deliverable, when present
+# alongside the Makefile (PAKs etc. are usually user-supplied).
+GAME_ASSETS = $(wildcard *.wad *.pak *.dat *.png)
 
 SRCS        = $(wildcard engine/*.c)
 SRCS_CXX    =
@@ -51,22 +55,17 @@ include $(SDK_DIR)/sdk.mk
 all: $(OBJ_DIR)/app.elf release
 	@$(SIZE) $<
 
+# Per-target deliverable: pocket = APF SD tree, mister = disk image.
+# The platform owns the layout (image.sh); this rule names no target.
 release: $(OBJ_DIR)/app.elf
-	@rm -rf $(OUT)
-	@mkdir -p $(dir $(OUT))
-	@cp -r $(DIST) $(OUT)
-	@cp $(RUNTIME)/bitstream.rbf_r $(RUNTIME)/loader.bin $$(ls -d $(OUT)/Cores/*/)/
-	@mkdir -p $$(ls -d $(OUT)/Assets/*/)/common
-	@cp $(RUNTIME)/os.bin $$(ls -d $(OUT)/Assets/*/)/common/
-	@cp $< $$(ls -d $(OUT)/Assets/*/)/common/$(APP).elf
-	@for f in *.wad *.pak *.dat *.png; do [ -f "$$f" ] && cp "$$f" $$(ls -d $(OUT)/Assets/*/)/common/; done 2>/dev/null; true
-	@echo "Ready: build/$(APP)/"
+	@$(SDK_DIR)/platforms/$(TARGET)/image.sh "$(APP)" "$(OBJ_DIR)/app.elf" "$(ROOT)" "$(DIST)" $(GAME_ASSETS)
 
 debug: all
-	@$(ROOT)/scripts/debug.sh "$$(ls -d $(OUT)/Assets/*/common)/$(APP).elf"
+	@$(ROOT)/scripts/debug.sh "$$(ls -d $(OUT)/Assets/*/common 2>/dev/null)/$(APP).elf"
 
+# MISTER_IP rides the environment so the same call serves every platform.
 copy: all
-	@$(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$$(ls -d $(OUT)/Assets/*/common)/$(APP).elf"
+	@MISTER_IP="$(MISTER_IP)" $(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$(OBJ_DIR)/app.elf"
 
 package: all
 	@$(ROOT)/scripts/package.sh $(APP)

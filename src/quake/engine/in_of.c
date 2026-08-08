@@ -20,6 +20,7 @@
  *   R1 + Y             -> previous weapon
  *   Start              -> menu
  *   Select             -> automap/status overlay
+ *   Dock mouse         -> look + MOUSE1..3 (see read_mouse / IN_MouseMove)
  */
 
 #include "quakedef.h"
@@ -89,6 +90,13 @@ static int pad_analog_seen;
  * mask every default change (which is exactly what happened during
  * the joy_docksens era). */
 cvar_t joy_docklook = {"joy_docklook", "0.8", false};
+
+/* A dock mouse aims by default, without holding +mlook — the same feel
+ * as the right stick, which already pitches the view directly.  Set
+ * "freelook 0" for the vanilla scheme, where mouse forward/back walks
+ * and only +mlook (MOUSE3 in the stock binds) looks up and down.
+ * Archived: this is a player preference, not a tuning default. */
+cvar_t freelook = {"freelook", "1", true};
 
 /* True when P1's analog axes come from a SNAC PSX-Analog pad rather
  * than the dock/Bluetooth controller. */
@@ -199,9 +207,147 @@ static void clear_game_actions(void)
     y_chord_fired = false;
 }
 
+/* ---- Dock mouse ------------------------------------------------------ */
+
+/* A USB mouse on the Analogue Dock aims alongside the pad, which keeps
+ * doing everything else.  The three buttons arrive as MOUSE1..MOUSE3 so
+ * the stock binds and the key menu own them; motion is banked here and
+ * spent in IN_MouseMove.  With no mouse plugged in nothing is posted and
+ * input behaves exactly as before. */
+
+#define MOUSE_BUTTON_COUNT 3
+#define MOUSE_ACCUM_LIMIT  32767
+
+static uint16_t mouse_buttons;
+static int mouse_accum_x, mouse_accum_y;
+
+/* From caps v4 on the OS hands us decoded mouse counts; older firmware
+ * passes the Pocket dock's packed int8 sample pairs {a<<8 | b} through
+ * raw, where the true delta is the sum of the two halves. */
+static int mouse_counts(int32_t v)
+{
+    static int raw_pairs = -1;
+
+    if (raw_pairs < 0) {
+        const struct of_capabilities *caps = of_get_caps();
+
+        raw_pairs = caps != NULL
+                 && caps->platform_id == OF_PLATFORM_POCKET
+                 && (caps->version < 4
+                  || !(caps->os_features & OF_OS_FEAT_MOUSE_COUNTS));
+    }
+
+    if (!raw_pairs)
+        return v;
+
+    return (int8_t)(v >> 8) + (int8_t)v;
+}
+
+static void mouse_accumulate(int *accum, int delta)
+{
+    int v = *accum + delta;
+
+    if (v > MOUSE_ACCUM_LIMIT)
+        v = MOUSE_ACCUM_LIMIT;
+    else if (v < -MOUSE_ACCUM_LIMIT)
+        v = -MOUSE_ACCUM_LIMIT;
+    *accum = v;
+}
+
+static void release_mouse_buttons(void)
+{
+    for (int i = 0; i < MOUSE_BUTTON_COUNT; i++) {
+        if (mouse_buttons & (1u << i))
+            Key_Event(K_MOUSE1 + i, false);
+    }
+    mouse_buttons = 0;
+}
+
+/* of_input_mouse_state() consumes the motion and button edges the
+ * firmware accumulated since the previous read, so this must stay its
+ * only caller.  Called once per pass over the input, before the
+ * menu/console early-out: button releases have to reach Key_Event even
+ * when a menu opens mid-click, or the bound "+" action stays stuck. */
+static void read_mouse(void)
+{
+    of_mouse_state_t ms;
+    uint16_t changed;
+
+    of_input_mouse_state(&ms);
+
+    if (!ms.present) {
+        release_mouse_buttons();     /* unplugged mid-click */
+        mouse_accum_x = mouse_accum_y = 0;
+        return;
+    }
+
+    changed = (uint16_t)(ms.buttons ^ mouse_buttons);
+    mouse_buttons = ms.buttons;
+
+    for (int i = 0; i < MOUSE_BUTTON_COUNT; i++) {
+        if (changed & (1u << i))
+            Key_Event(K_MOUSE1 + i, (ms.buttons & (1u << i)) != 0);
+    }
+
+    /* Only a live game spends banked motion — IN_Move runs from
+     * CL_SendCmd, which bails unless the client is connected and past
+     * the signon.  Dropping it in every other state keeps a menu visit
+     * or a level load from ending in a view lurch. */
+    if (key_dest != key_game || cls.state != ca_connected ||
+        cls.signon != SIGNONS) {
+        mouse_accum_x = mouse_accum_y = 0;
+        return;
+    }
+
+    mouse_accumulate(&mouse_accum_x, mouse_counts(ms.dx));
+    mouse_accumulate(&mouse_accum_y, mouse_counts(ms.dy));
+}
+
+/* Vanilla IN_MouseMove, with freelook standing in for a held +mlook. */
+static void IN_MouseMove(usercmd_t *cmd)
+{
+    qboolean mlook;
+    qboolean strafe;
+    float mouse_x, mouse_y;
+
+    if (!mouse_accum_x && !mouse_accum_y)
+        return;
+
+    mouse_x = (float)mouse_accum_x * sensitivity.value;
+    mouse_y = (float)mouse_accum_y * sensitivity.value;
+    mouse_accum_x = mouse_accum_y = 0;
+
+    mlook = (in_mlook.state & 1) || freelook.value != 0.0f;
+    strafe = (in_strafe.state & 1) != 0;
+
+    if (strafe || (lookstrafe.value && mlook)) {
+        cmd->sidemove += m_side.value * mouse_x;
+    } else {
+        cl.viewangles[YAW] -= m_yaw.value * mouse_x;
+        cl.viewangles[YAW] = anglemod(cl.viewangles[YAW]);
+    }
+
+    if (mlook)
+        V_StopPitchDrift();
+
+    if (mlook && !strafe) {
+        cl.viewangles[PITCH] += m_pitch.value * mouse_y;
+        if (cl.viewangles[PITCH] > 80)
+            cl.viewangles[PITCH] = 80;
+        if (cl.viewangles[PITCH] < -70)
+            cl.viewangles[PITCH] = -70;
+    } else if (strafe && noclip_anglehack) {
+        cmd->upmove -= m_forward.value * mouse_y;
+    } else {
+        cmd->forwardmove -= m_forward.value * mouse_y;
+    }
+}
+
 void IN_ClearStates(void)
 {
     clear_game_actions();
+    release_mouse_buttons();
+    mouse_accum_x = mouse_accum_y = 0;
     prev_buttons = 0;
     pad_analog_seen = 0;
 }
@@ -209,6 +355,7 @@ void IN_ClearStates(void)
 void IN_Init(void)
 {
     Cvar_RegisterVariable (&joy_docklook);
+    Cvar_RegisterVariable (&freelook);
     IN_ClearStates();
 }
 void IN_Shutdown(void){ IN_ClearStates(); }
@@ -338,6 +485,8 @@ void IN_SendKeyEvents(void)
     of_input_state_t st;
     of_input_state(0, &st);
 
+    read_mouse();
+
     uint32_t buttons = st.buttons;
     uint32_t changed = buttons ^ prev_buttons;
 
@@ -456,5 +605,6 @@ void IN_Move(usercmd_t *cmd)
             V_StopPitchDrift();
         }
 
+        IN_MouseMove(cmd);
     }
 }

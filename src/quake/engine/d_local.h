@@ -84,11 +84,13 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspans);
 void D_DrawSpans16 (espan_t *pspans);
 PQ_FASTTEXT void D_DrawZSpans (espan_t *pspans);
 
-/* Experimental world-triangle path.  The shipped LITE GPU has no
- * triangle rasterizer, so keep this out of the default build and run
- * the supported span path explicitly. */
+/* World-triangle path: tessellate world surfaces into GPU triangles that
+ * sample the raw miptex directly (the only path that feeds from the fast memory
+ * texture store).  Requires the HW edge walker — guarded at runtime by
+ * of_emit_supports(OF_EMIT_CAP_TRIANGLES), so it falls back to the span path
+ * on a GPU without triangles.  Default on; override to 0 to force spans. */
 #ifndef D_GPU_WORLD_TRIS
-#define D_GPU_WORLD_TRIS 0
+#define D_GPU_WORLD_TRIS 1
 #endif
 
 /* Direct BSP-to-triangle path. Retired on current openfpgaOS SDKs; keep the
@@ -96,6 +98,19 @@ PQ_FASTTEXT void D_DrawZSpans (espan_t *pspans);
 #ifndef D_GPU_WORLD_DIRECT
 #define D_GPU_WORLD_DIRECT 0
 #endif
+
+/* World textures, given to the portable texture manager once per map by
+ * R_CreateWorldTextures(): texture_t.gpu_tex_addr holds each texture's GPU base
+ * address (the manager picks the memory).  r_sky_gpu_addr is the animated sky's
+ * GPU base address (a dynamic texture; see r_sky.c). */
+extern unsigned r_sky_gpu_addr;
+void R_CreateWorldTextures (void);
+
+/* Runtime world draw-path selector, set from the GPU caps in R_CreateWorldTextures:
+ * 1 = HW edge walker present (+ z-test) -> GPU triangles sampling raw miptex;
+ * 0 = fall back to the CPU surface-cache span path.  Some bitstreams ship the
+ * triangle path, some don't — never force it. */
+extern int r_world_tris;
 
 struct msurface_s;
 void R_DrawSurfaceTris (struct msurface_s *fa, int miplevel);

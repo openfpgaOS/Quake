@@ -183,6 +183,10 @@ PQ_HOT void D_DrawSurfaces (void)
 	VectorCopy (transformed_modelorg, world_transformed_modelorg);
 
 
+	/* World textures resident in the fast tier this map: the world surface pass
+	 * samples CRAM1 and must be wrapped in the fast fetch domain. */
+	int fasttex = of_emit_fasttex_active ();
+
 // TODO: could preset a lot of this at mode set time
 	if (r_drawflat.value)
 	{
@@ -202,6 +206,12 @@ PQ_HOT void D_DrawSurfaces (void)
 	else
 	{
 		entity_t *last_bmodel_entity = NULL;
+		/* World draw path: GPU triangles when r_world_tris (HW edge walker +
+		 * z-test), else the raw-miptex / surface-cache span path.  When fasttex,
+		 * the world surfaces sample CRAM1 — bind the fast fetch domain for them
+		 * and flip back to SDRAM for sky/turbulent/alias/HUD.  tex_domain tracks
+		 * that domain across the solid<->dynamic transitions. */
+		int tex_domain = -1;	/* -1 unset, 0 dynamic (SDRAM), 1 static (fast) */
 
 		for (s = &surfaces[1] ; s<surface_p ; s++)
 		{
@@ -216,6 +226,11 @@ PQ_HOT void D_DrawSurfaces (void)
 
 			if (s->flags & SURF_DRAWSKY)
 			{
+				if (fasttex && tex_domain != 0) {
+					R_FlushWorldTriBatch ();
+					of_emit_bind_dynamic ();
+					tex_domain = 0;
+				}
 				if (!r_skymade)
 				{
 					R_MakeSky ();
@@ -237,6 +252,11 @@ PQ_HOT void D_DrawSurfaces (void)
 			}
 			else if (s->flags & SURF_DRAWTURB)
 			{
+				if (fasttex && tex_domain != 0) {
+					R_FlushWorldTriBatch ();
+					of_emit_bind_dynamic ();
+					tex_domain = 0;
+				}
 				pface = s->data;
 				miplevel = 0;
 				cacheblock = (pixel_t *)
@@ -337,15 +357,16 @@ PQ_HOT void D_DrawSurfaces (void)
 				* pface->texinfo->mipadjust);
 
 #if D_GPU_WORLD_LIGHT
-				int gpu_light_mode = (int)pq_gpu_world_light.value;
-				if (gpu_light_mode != 1)
-					gpu_light_mode = 0;
+				/* The triangle path requires per-vertex GPU light (no surface
+				 * cache).  On the span path honor pq_gpu_world_light: 1 = sample
+				 * the raw miptex with per-pixel GPU lighting (no surface cache),
+				 * 0 = build the CPU surface cache. */
+				int gpu_light_mode = (r_world_tris || fasttex)
+					? 1
+					: ((int)pq_gpu_world_light.value == 1);
 
 				if (gpu_light_mode)
 				{
-					/* Optional raw-texture GPU lighting path.  Keep it
-					 * opt-in until the GPU perspective path is exact with
-					 * large absolute texture coordinates. */
 					pq_world_light_mode = gpu_light_mode;
 					pq_world_light = D_GpuLightSurface (pface, miplevel);
 					(void)pcurrentcache;
@@ -364,20 +385,20 @@ PQ_HOT void D_DrawSurfaces (void)
 					pq_world_tex_t_offset = 0;
 				}
 
-	#if D_GPU_WORLD_TRIS && !D_GPU_WORLD_DIRECT
-				/* T6 better: tessellate the surface into GPU triangles
-				 * with per-vertex Gouraud light from blocklights[]
-				 * (populated by D_GpuLightSurface above).  Replaces
-				 * D_CalcGradients + (*d_drawspans) — gradients are
-				 * computed per-vertex by R_PackTriVert and the GPU's
-				 * triangle rasteriser does perspective + per-pixel
-				 * colormap lookup. */
-				R_DrawSurfaceTris (pface, miplevel);
-#else
-				D_CalcGradients (pface);
-
-				(*d_drawspans) (s->spans);
-#endif
+				/* World surfaces sample the fast tier: route the fetch domain to it. */
+				if (fasttex && tex_domain != 1) {
+					of_emit_bind_static ();
+					tex_domain = 1;
+				}
+				if (r_world_tris)
+				{
+					R_DrawSurfaceTris (pface, miplevel);
+				}
+				else
+				{
+					D_CalcGradients (pface);
+					(*d_drawspans) (s->spans);
+				}
 
 				/* CPU-side z-fill for sprite/alias depth occlusion when the
 				 * selected world draw path did not co-write compatible z. */
@@ -402,12 +423,11 @@ PQ_HOT void D_DrawSurfaces (void)
 		}
 	}
 
-#if D_GPU_WORLD_TRIS
-	/* Drain any triangles still pending from the texture-bucketed
-	 * batch.  R_DrawSurfaceTris accumulates across consecutive
-	 * same-texture surfaces; this flush guarantees the batch is
-	 * empty before the caller (R_ScanEdges) potentially proceeds
-	 * to other GPU work. */
-	R_FlushWorldTriBatch ();
-#endif
+	if (fasttex)
+	{
+		/* Drain pending world geometry, then leave the GPU in the dynamic fetch
+		 * domain for everything drawn after the world (alias, sprites, HUD). */
+		R_FlushWorldTriBatch ();
+		of_emit_bind_dynamic ();
+	}
 }

@@ -113,6 +113,7 @@ mleaf_t		*r_viewleaf, *r_oldviewleaf;
 
 texture_t	*r_notexture_mip;
 
+
 float		r_aliastransition, r_resfudge;
 
 int		d_lightstylevalue[256];	// 8.8 fraction of base light value
@@ -146,6 +147,16 @@ cvar_t	r_maxedges = {"r_maxedges", "0"};
 cvar_t	r_numedges = {"r_numedges", "0"};
 cvar_t	r_aliastransbase = {"r_aliastransbase", "200"};
 cvar_t	r_aliastransadj = {"r_aliastransadj", "100"};
+/* 1 = serve world textures (and their colormap) from the dedicated fast tier
+ * (CRAM1) via the raw-miptex span path, exactly like the Doom port; 0 = main
+ * memory.  Auto-falls back to main memory where there's no fast tier (MiSTer),
+ * so the same build runs on both.  Override with "r_fasttex 0". */
+cvar_t	r_fasttex = {"r_fasttex", "1"};
+/* 1 = GPU triangle world path; 0 = CPU surface-cache span renderer.  Default 0:
+ * the triangle edge-walker wedges the GPU on this bitstream (hangs at render
+ * start even with textures in main memory), so the known-good span path runs by
+ * default.  Set "r_worldtris 1" in config.cfg to retry the triangle path. */
+cvar_t	r_worldtris = {"r_worldtris", "0"};
 
 extern cvar_t	scr_fov;
 
@@ -232,6 +243,8 @@ void R_Init (void)
 	Cvar_RegisterVariable (&r_numedges);
 	Cvar_RegisterVariable (&r_aliastransbase);
 	Cvar_RegisterVariable (&r_aliastransadj);
+	Cvar_RegisterVariable (&r_fasttex);
+	Cvar_RegisterVariable (&r_worldtris);
 
 	Cvar_SetValue ("r_maxedges", (float)NUMSTACKEDGES);
 	Cvar_SetValue ("r_maxsurfs", (float)NUMSTACKSURFACES);
@@ -259,6 +272,76 @@ void R_Init (void)
 
 /*
 ===============
+R_CreateWorldTextures
+
+Hand every world miptex (all four mip levels, uploaded contiguously) to the
+texture manager, which places each in the best memory for the target and returns
+an opaque GPU base address.  Per-mip tex_addr is gpu_tex_addr + (offsets[mip] −
+offsets[0]), which stays inside the uploaded block.  Called once per map from
+R_NewMap after the BSP (and its textures) load.
+===============
+*/
+static unsigned R_MipBlockBytes (const texture_t *tx)
+{
+	/* mip0 + mip1 + mip2 + mip3 stored contiguously after the struct:
+	 * w*h*(1 + 1/4 + 1/16 + 1/64) = w*h*85/64.  Matches Mod_LoadTextures. */
+	return (tx->width * tx->height / 64) * 85;
+}
+
+int		r_world_tris;	// set from HW caps below
+
+void R_CreateWorldTextures (void)
+{
+	model_t		*m;
+	int			i;
+
+	/* New level: reset the manager (clears placement, re-applies the colormap,
+	 * latches of_emit_fasttex_active from r_fasttex), then re-create textures. */
+	of_emit_tex_reset ();
+
+	/* Select the world draw path: opt-in (r_worldtris) AND the runtime GPU caps
+	 * must advertise the HW triangle edge walker + param-span z-test.  Default
+	 * off, so a bitstream without the path (or with an unproven one) renders via
+	 * the span renderer instead of being forced onto a broken path.  Fast
+	 * textures (CRAM1) ride the span path independently. */
+	{
+		int tri_cap  = of_emit_gpu_ready () && of_emit_supports (OF_EMIT_CAP_TRIANGLES);
+		int z_cap    = of_emit_supports (OF_EMIT_CAP_PARAM_SPAN_ZTEST);
+		r_world_tris = (r_worldtris.value != 0) && tri_cap && z_cap;
+		Con_Printf ("world path: tri_cap=%d ztest_cap=%d fastmem=%d r_worldtris=%g "
+		            "r_fasttex=%g -> %s, fasttex=%s\n",
+		            tri_cap, z_cap, of_emit_has_fast_mem (),
+		            r_worldtris.value, r_fasttex.value,
+		            r_world_tris ? "GPU triangles" : "CPU spans",
+		            of_emit_fasttex_active () ? "CRAM1" : "main mem");
+	}
+
+	m = cl.worldmodel;
+	if (!m || !m->textures || m->numtextures <= 0)
+		return;
+
+	for (i = 0; i < m->numtextures; i++)
+	{
+		texture_t *tx = m->textures[i];
+		if (!tx)
+			continue;
+		tx->gpu_tex_addr = of_emit_tex_create(
+			(byte *)tx + tx->offsets[0],
+			(uint16_t)tx->width, (uint16_t)tx->height, R_MipBlockBytes(tx));
+	}
+	r_notexture_mip->gpu_tex_addr = of_emit_tex_create(
+		(byte *)r_notexture_mip + r_notexture_mip->offsets[0],
+		(uint16_t)r_notexture_mip->width, (uint16_t)r_notexture_mip->height,
+		R_MipBlockBytes(r_notexture_mip));
+
+	if (of_emit_fasttex_active ())
+		Con_Printf ("fastmem: %u KB total, %u KB free, %d world tex spilled to SDRAM\n",
+		            of_emit_fasttex_size () >> 10, of_emit_fasttex_budget_free () >> 10,
+		            of_emit_fasttex_spill_count ());
+}
+
+/*
+===============
 R_NewMap
 ===============
 */
@@ -278,6 +361,10 @@ void R_NewMap (void)
 	 * loaded, but before R_RenderWorld runs — R_NewMap is the
 	 * canonical hook. */
 	R_BspCache_Init();
+
+	/* Hand the world's textures to the texture manager for this level (it picks
+	 * the memory; the same call works on every target). */
+	R_CreateWorldTextures ();
 
 	r_viewleaf = NULL;
 	R_ClearParticles ();

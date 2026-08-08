@@ -340,6 +340,10 @@ void Host_EndGame (char *message, ...);
 void Host_Frame (float time);
 void Host_WriteSavegameHeader (FILE *f, char *comment);
 qboolean Host_ReadSavegameHeader (FILE *f, char *comment, qboolean *wrong_game);
+/* fprintf + savegame slot-capacity guard (256 KB fixed slots); counts bytes
+ * and goes dead (sticky) on overflow while armed by Host_Savegame_f, plain
+ * vfprintf passthrough otherwise.  All savegame writers must use this. */
+int Host_SavegamePrintf (FILE *f, const char *fmt, ...);
 void Host_Quit_f (void);
 void Host_ClientCommands (char *fmt, ...);
 void Host_ShutdownServer (qboolean crash);

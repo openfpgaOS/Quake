@@ -32,6 +32,12 @@ All game data goes into **`/Assets/quake/common/`** on the SD card. Filenames an
 
 Each entry is a separate "game" in the Pocket's library list — pick the one you want to launch. The registered `pak0.pak`/`PAK1.PAK` come from any classic Quake release (CD, Steam, GOG). Mission pack PAKs go into their own uppercase subdirectory as shown.
 
+### Using the 2021 re-release ("Quake Enhanced") data
+
+Each re-release folder holds one self-contained `pak0.pak`, so no `PAK1.PAK` is needed: copy `rerelease/id1/pak0.pak` → `pak0.pak`, `rerelease/hipnotic/pak0.pak` → `HIPNOTIC/PAK0.PAK`, and `rerelease/rogue/pak0.pak` → `ROGUE/PAK0.PAK`.
+
+The rest of that folder has no library entry. `rerelease/ctf/` (Threewave CTF) is deathmatch-only and this build has no networking. The MachineGames expansions — `dopa` (Dimension of the Past), `mg1` (Dimension of the Machine) and `mg3` — use the **BSP2** map format, and this engine is a vanilla WinQuake renderer that reads only BSP version 29. `mg1`/`mg3` are out of reach on the hardware regardless, at 16–35 MB per map against a 24 MB engine heap.
+
 ## Adding the soundtrack
 
 The Quake CD carries the game data on track 1 and Trent Reznor's soundtrack on audio tracks **2–11**. The core streams those audio tracks from raw CDDA files placed in **`/Assets/quake/common/cd/`**, named exactly:
@@ -95,6 +101,20 @@ Music is optional — the game runs silently without the `cd/` directory — and
 Buttons behave as in the digital table. In menus: d-pad to navigate, A/B to select, Start for back/escape.
 
 Dock/Bluetooth pads use a reduced look sensitivity (`joy_docklook` console cvar, 0–1, default 0.8) and a softened movement-stick response near the centre (full deflection still gives full speed). A SNAC DualShock (PSX Analog) runs 1:1 on both sticks.
+
+### Mouse
+
+A USB mouse on the Analogue Dock aims while the pad keeps doing everything else. Unplugged, nothing changes.
+
+| Input | Action |
+|---|---|
+| Move left / right | turn (sidestep while `+strafe` is held) |
+| Move up / down | look up / down |
+| Left button | fire |
+| Right button | walk forward |
+| Middle button | mouse look (`+mlook`) |
+
+The buttons are the stock `MOUSE1`–`MOUSE3` binds, so **Options → Customize controls** rebinds them like any other key, and **Options → Mouse Speed** / the `sensitivity` cvar sets the rate. Aiming is free-look by default (`freelook 1`); set `freelook 0` in the console for the vanilla scheme, where the mouse walks forward/back unless the middle button is held. `m_pitch`, `m_yaw`, `m_forward`, `m_side` and `lookstrafe` behave as in stock Quake.
 
 ## Analogizer
 

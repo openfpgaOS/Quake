@@ -582,12 +582,76 @@ void Host_SavegameComment (char *text)
 	text[SAVEGAME_COMMENT_LENGTH] = '\0';
 }
 
+/* Save-size capacity guard ------------------------------------------------
+ * The ten save slots are fixed 256 KB (0x40000) nonvolatile files; the
+ * kernel refuses/short-writes anything past that, so an oversize save used
+ * to truncate silently and only fail later, mid-parse, on load.  Every
+ * savegame byte goes through Host_SavegamePrintf, which keeps its own byte
+ * count (same fail-closed model as Duke3D's d3d_save.c write wrapper — the
+ * kernel restricts seeks on write handles, so ftell() is not an option
+ * here).  On overflow the writer goes dead (sticky), the save is aborted,
+ * and the slot is stamped with an invalid version so the loader and the
+ * save menu reject it up front instead of dying mid-parse.
+ *
+ * The guard is armed only inside Host_Savegame_f; when disarmed the
+ * wrapper is a plain vfprintf passthrough, so other ED_Write callers
+ * (e.g. the #ifdef QUAKE2 SaveGamestate path) are unaffected.  Saves that
+ * fit are byte-identical to the unguarded format. */
+#define SAVEGAME_SLOT_CAPACITY	0x40000
+
+static qboolean	savegame_guard_armed;
+static long		savegame_bytes_written;
+static qboolean	savegame_write_overflow;
+
+static void Host_SavegameWriteBegin (void)
+{
+	savegame_guard_armed = true;
+	savegame_bytes_written = 0;
+	savegame_write_overflow = false;
+}
+
+/* Disarm the guard; returns true if the save overflowed the slot. */
+static qboolean Host_SavegameWriteEnd (void)
+{
+	savegame_guard_armed = false;
+	return savegame_write_overflow;
+}
+
+int Host_SavegamePrintf (FILE *f, const char *fmt, ...)
+{
+	va_list	argptr;
+	int		n;
+
+	if (savegame_guard_armed && savegame_write_overflow)
+		return -1;		/* sticky: no more writes after overflow */
+
+	va_start (argptr, fmt);
+	n = vfprintf (f, fmt, argptr);
+	va_end (argptr);
+
+	if (!savegame_guard_armed)
+		return n;
+
+	if (n < 0)
+	{
+		savegame_write_overflow = true;
+		return -1;
+	}
+	savegame_bytes_written += n;
+	if (savegame_bytes_written > SAVEGAME_SLOT_CAPACITY)
+	{
+		savegame_write_overflow = true;
+		return -1;
+	}
+	return n;
+}
+
 void Host_WriteSavegameHeader (FILE *f, char *comment)
 {
-	fprintf (f, "%i\n", SAVEGAME_VERSION);
+	Host_SavegamePrintf (f, "%i\n", SAVEGAME_VERSION);
 	Host_SavegameComment (comment);
-	fprintf (f, "%s\n", comment);
-	fprintf (f, "%s %s\n", SAVEGAME_NAMESPACE_TAG, Host_SavegameNamespace ());
+	Host_SavegamePrintf (f, "%s\n", comment);
+	Host_SavegamePrintf (f, "%s %s\n", SAVEGAME_NAMESPACE_TAG, Host_SavegameNamespace ());
 }
 
 qboolean Host_ReadSavegameHeader (FILE *f, char *comment, qboolean *wrong_game)
@@ -713,6 +777,8 @@ void Host_Savegame_f (void)
 	char	name[256];
 	FILE	*f;
 	int		i;
+	int		slot;
+	qboolean	overflowed;
 	char	comment[SAVEGAME_COMMENT_LENGTH+1];
 
 	if (cmd_source != src_command)
@@ -757,39 +823,38 @@ void Host_Savegame_f (void)
 		}
 	}
 
+	slot = Host_SaveSlotForName (Cmd_Argv(1));
+	if (slot < 0)
 	{
-		int slot = Host_SaveSlotForName (Cmd_Argv(1));
-		if (slot < 0)
-		{
-			Con_Printf ("Saves use slots s0..s9 on this platform.\n");
-			return;
-		}
-		sprintf (name, "s%i.sav", slot);
-		Con_Printf ("Saving game to %s...\n", name);
-		CDAudio_PostponeResume (1000);	/* keep the slot bridge quiet for the write */
-		f = Sys_OpenSaveSlot (slot, "w");
+		Con_Printf ("Saves use slots s0..s9 on this platform.\n");
+		return;
 	}
+	sprintf (name, "s%i.sav", slot);
+	Con_Printf ("Saving game to %s...\n", name);
+	CDAudio_PostponeResume (1000);	/* keep the slot bridge quiet for the write */
+	f = Sys_OpenSaveSlot (slot, "w");
 	if (!f)
 	{
 		Con_Printf ("ERROR: couldn't open.\n");
 		return;
 	}
-	
+
+	Host_SavegameWriteBegin ();
 	Host_WriteSavegameHeader (f, comment);
 	for (i=0 ; i<NUM_SPAWN_PARMS ; i++)
-		fprintf (f, "%f\n", svs.clients->spawn_parms[i]);
-	fprintf (f, "%d\n", current_skill);
-	fprintf (f, "%s\n", sv.name);
-	fprintf (f, "%f\n",sv.time);
+		Host_SavegamePrintf (f, "%f\n", svs.clients->spawn_parms[i]);
+	Host_SavegamePrintf (f, "%d\n", current_skill);
+	Host_SavegamePrintf (f, "%s\n", sv.name);
+	Host_SavegamePrintf (f, "%f\n",sv.time);
 
 // write the light styles
 
 	for (i=0 ; i<MAX_LIGHTSTYLES ; i++)
 	{
 		if (sv.lightstyles[i])
-			fprintf (f, "%s\n", sv.lightstyles[i]);
+			Host_SavegamePrintf (f, "%s\n", sv.lightstyles[i]);
 		else
-			fprintf (f,"m\n");
+			Host_SavegamePrintf (f,"m\n");
 	}
 
 
@@ -797,16 +862,37 @@ void Host_Savegame_f (void)
 	for (i=0 ; i<sv.num_edicts ; i++)
 	{
 		ED_Write (f, EDICT_NUM(i));
+		if (savegame_write_overflow)
+			break;		/* writer is dead (sticky) — stop iterating */
 	}
 	fclose (f);	/* single flush of the tail — per-edict fflush was
 			 * hundreds of tiny kernel writes per save */
+	overflowed = Host_SavegameWriteEnd ();
+	if (overflowed)
+	{
+		/* The slot is a fixed 256 KB file and this save didn't fit: the
+		 * tail never made it to disk.  Fail closed — stamp the slot with
+		 * an invalid version line so Host_ReadSavegameHeader (loader and
+		 * save menu alike) rejects it immediately instead of the old
+		 * behavior of a silently truncated save exploding mid-parse. */
+		f = Sys_OpenSaveSlot (slot, "w");
+		if (f)
+		{
+			fprintf (f, "-1 oversize save aborted\n");
+			fclose (f);
+		}
+	}
 	/* fclose returns before the kernel/SD writeback necessarily settles:
 	 * give the voices a settle margin AND retire the async DMA refill
 	 * path for this track — an async read issued after a slot write can
 	 * block forever inside the kernel (post-save freeze). */
 	CDAudio_NotifySlotWrite ();
 	CDAudio_PostponeResume (2000);
-	Con_Printf ("done.\n");
+	if (overflowed)
+		Con_Printf ("Save too large for slot (limit %d KB); save aborted.\n",
+					SAVEGAME_SLOT_CAPACITY / 1024);
+	else
+		Con_Printf ("done.\n");
 }
 
 

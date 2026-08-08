@@ -79,6 +79,10 @@ void D_DrawSkyScans8 (espan_t *pspan)
 	extern viddef_t vid;
 	const uint32_t  fb_base = (uint32_t)(uintptr_t)vid.buffer;
 	const int       fb_row  = vid.rowbytes;
+	/* The animated sky is a dynamic texture; its GPU base address comes from the
+	 * texture manager (r_sky_gpu_addr).  Sky draws in the dynamic fetch domain,
+	 * set by the caller (D_DrawSurfaces). */
+	const uint32_t  sky_tex_addr = r_sky_gpu_addr;
 
 	do {
 		int        v       = pspan->v;
@@ -109,7 +113,7 @@ void D_DrawSkyScans8 (espan_t *pspan)
 
 			of_emit_span_t sp = {
 				.fb_addr   = fb_base + (uint32_t)(v * fb_row + u),
-				.tex_addr  = (uint32_t)(uintptr_t)r_skysource,
+				.tex_addr  = sky_tex_addr,
 				.s         = s,
 				.t         = t,
 				.sstep     = sstep,

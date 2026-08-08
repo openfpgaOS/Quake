@@ -331,11 +331,22 @@ PQ_HOT byte D_GpuLightSurface (msurface_t *surface, int miplevel)
 
 	R_BuildLightMap ();
 
-	/* Raw mip texture, not a built cache block. */
-	cacheblock = (pixel_t *)((byte *)mt + mt->offsets[miplevel]);
+	/* Raw mip texture, not a built cache block.  The GPU base address comes from
+	 * the texture manager: when fast textures are active it's a CRAM1 byte offset
+	 * (the texels were uploaded there at map load — no CPU cache to clean);
+	 * otherwise it's the SDRAM address, which needs the robust clean once. */
 	cachewidth = mt->width >> miplevel;
-	of_emit_cache_clean_once (cacheblock,
-		(uint32_t)(cachewidth * (mt->height >> miplevel)));
+	if (of_emit_fasttex_active ())
+	{
+		cacheblock = (pixel_t *)(uintptr_t)
+			(mt->gpu_tex_addr + (mt->offsets[miplevel] - mt->offsets[0]));
+	}
+	else
+	{
+		cacheblock = (pixel_t *)((byte *)mt + mt->offsets[miplevel]);
+		of_emit_cache_clean_once (cacheblock,
+			(uint32_t)(cachewidth * (mt->height >> miplevel)));
+	}
 	pq_world_tex_w_mask = (uint16_t)(cachewidth - 1);
 	pq_world_tex_h_mask = (uint16_t)((mt->height >> miplevel) - 1);
 	pq_world_tex_s_offset = (surface->texturemins[0] * 65536) >> miplevel;

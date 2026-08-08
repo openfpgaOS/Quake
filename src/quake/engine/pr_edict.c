@@ -497,21 +497,23 @@ void ED_Write (FILE *f, edict_t *ed)
 	char	*name;
 	int		type;
 
-	fprintf (f, "{\n");
+	/* Host_SavegamePrintf = fprintf + the savegame slot-capacity guard
+	 * (plain passthrough outside Host_Savegame_f). */
+	Host_SavegamePrintf (f, "{\n");
 
 	if (ed->free)
 	{
-		fprintf (f, "}\n");
+		Host_SavegamePrintf (f, "}\n");
 		return;
 	}
-	
+
 	for (i=1 ; i<progs->numfielddefs ; i++)
 	{
 		d = &pr_fielddefs[i];
 		name = pr_strings + d->s_name;
 		if (name[strlen(name)-2] == '_')
 			continue;	// skip _x, _y, _z vars
-			
+
 		v = (int *)((char *)&ed->v + d->ofs*4);
 
 	// if the value is still all 0, skip the field
@@ -521,12 +523,12 @@ void ED_Write (FILE *f, edict_t *ed)
 				break;
 		if (j == type_size[type])
 			continue;
-	
-		fprintf (f,"\"%s\" ",name);
-		fprintf (f,"\"%s\"\n", PR_UglyValueString(d->type, (eval_t *)v));		
+
+		Host_SavegamePrintf (f,"\"%s\" ",name);
+		Host_SavegamePrintf (f,"\"%s\"\n", PR_UglyValueString(d->type, (eval_t *)v));
 	}
 
-	fprintf (f, "}\n");
+	Host_SavegamePrintf (f, "}\n");
 }
 
 void ED_PrintNum (int ent)
@@ -627,7 +629,7 @@ void ED_WriteGlobals (FILE *f)
 	char		*name;
 	int			type;
 
-	fprintf (f,"{\n");
+	Host_SavegamePrintf (f,"{\n");
 	for (i=0 ; i<progs->numglobaldefs ; i++)
 	{
 		def = &pr_globaldefs[i];
@@ -641,11 +643,11 @@ void ED_WriteGlobals (FILE *f)
 		&& type != ev_entity)
 			continue;
 
-		name = pr_strings + def->s_name;		
-		fprintf (f,"\"%s\" ", name);
-		fprintf (f,"\"%s\"\n", PR_UglyValueString(type, (eval_t *)&pr_globals[def->ofs]));		
+		name = pr_strings + def->s_name;
+		Host_SavegamePrintf (f,"\"%s\" ", name);
+		Host_SavegamePrintf (f,"\"%s\"\n", PR_UglyValueString(type, (eval_t *)&pr_globals[def->ofs]));
 	}
-	fprintf (f,"}\n");
+	Host_SavegamePrintf (f,"}\n");
 }
 
 /*

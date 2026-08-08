@@ -74,6 +74,8 @@ typedef struct texture_s
 	struct texture_s *anim_next;		// in the animation sequence
 	struct texture_s *alternate_anims;	// bmodels in frmae 1 use these
 	unsigned	offsets[MIPLEVELS];		// four mip maps stored
+	unsigned	gpu_tex_addr;			// GPU base address of the mip-0 block,
+										// from the texture manager (R_CreateWorldTextures)
 } texture_t;
 
 

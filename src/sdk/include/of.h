@@ -32,7 +32,8 @@
  *   }
  *
  * Platform: Analogue Pocket FPGA, RISC-V (VexiiRiscv) @ 100 MHz
- * Video:    320x240, 8-bit indexed color, triple-buffered
+ * Video:    source modes up to 800x600 (boot default 320x240; output
+ *           path supports 480p), 8-bit indexed color, triple-buffered
  * Audio:    48 kHz PCM FIFO + 32-voice mixer; sample-based
  *           MIDI synth (SF2 → .ofsf banks)
  * Input:    2 controllers, d-pad + ABXY + L/R + sticks + triggers
@@ -77,6 +78,7 @@ extern "C" {
 #include "of_caps.h"
 #include "of_services.h"
 #include "of_config.h"
+#include "of_launch.h"
 /* Note: of_gpu.h is intentionally NOT included here -- it has per-app
  * static state (ring buffer pointers) and must be included from exactly
  * one TU. Standard C library functions come from upstream musl headers

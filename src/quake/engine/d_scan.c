@@ -120,9 +120,12 @@ static byte *D_AllocTurbScratchRow (void)
 
 static void D_EmitTurbScratchSpan (uint32_t fb_addr, byte *scratch, int count)
 {
+	/* The warped water row was just built (and cache-cleaned by the caller).
+	 * Hand the GPU its address through the texture manager; turbulent draws in
+	 * the dynamic fetch domain, set by the caller. */
 	of_emit_span_t sp = {
 		.fb_addr   = fb_addr,
-		.tex_addr  = (uint32_t)(uintptr_t)scratch,
+		.tex_addr  = of_emit_tex_source_addr(scratch),
 		.s         = 0,
 		.t         = 0,
 		.sstep     = 0x10000,
@@ -884,7 +887,11 @@ PQ_HOT void R_DrawSurfaceTris (msurface_t *fa, int miplevel)
 	if (nverts < 3) return;   /* fully behind the near plane */
 
 	texture_t *mt = R_TextureAnimation(fa->texinfo->texture);
-	uint32_t tex_addr = (uint32_t)(uintptr_t)((byte *)mt + mt->offsets[miplevel]);
+	/* The texture's GPU base address (set by the texture manager in
+	 * R_CreateWorldTextures) plus this mip's intra-block byte offset; the manager
+	 * uploaded all mips contiguously, so the delta is preserved.  Memory-agnostic
+	 * — the world pass binds the matching fetch domain before drawing. */
+	uint32_t tex_addr = mt->gpu_tex_addr + (mt->offsets[miplevel] - mt->offsets[0]);
 	uint16_t tex_w    = (uint16_t)(mt->width  >> miplevel);
 	uint16_t tex_h    = (uint16_t)(mt->height >> miplevel);
 

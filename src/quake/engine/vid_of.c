@@ -21,6 +21,7 @@
 #include "of_cache.h"
 #include "of_services.h"
 #include "of_gpu.h"                 /* static ring state lives HERE only */
+#include "of_texture.h"             /* portable texture manager — driven ONLY here */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,6 +121,23 @@ static int     zbuffer_cpu_cached;
 static uint32_t of_emit_caps;
 static int     of_emit_ready;
 static int     of_emit_cpu_sync_needed;
+/* vid_of.c is the SINGLE TU that drives the portable texture manager
+ * (of_texture.h) — it owns the placement/upload/fetch-domain decisions so the
+ * rest of the engine deals only in opaque GPU addresses and a couple of
+ * domain-bind calls.  of_texture_create() puts static textures in the best
+ * memory (the dedicated fast tier where present, the other otherwise); dynamic
+ * textures (sky/turbulent) stay out of the fast tier.  These handles are the
+ * bind representatives: one static (the world's fetch domain) and one dynamic. */
+static of_texture_t of_tex_world;     /* representative static texture (world)   */
+static of_texture_t of_tex_dynamic;   /* representative dynamic texture (SDRAM)  */
+static of_texture_t of_tex_sky;       /* the animated sky source (dynamic)       */
+static int          of_tex_world_valid;
+/* r_fasttex (read once per level): when 0, world textures go to main memory and
+ * the domain binds no-op, isolating the triangle path from the fast-texture
+ * path.  When 1 (and a fast tier exists), the normal fast path runs. */
+extern cvar_t       r_fasttex;
+static int          of_fasttex_active;
+static int          of_fasttex_spilled;   /* world textures that didn't fit the fast tier */
 /* OF_HW_GPU_VERT_TRI: GPU derives the attribute planes from raw vertices
  * (CMD_DRAW_VERT_TRI). Set in of_emit_init; selects the alias lowering. */
 static int     g_vert_tri;
@@ -779,12 +797,28 @@ void of_emit_init(void)
     of_gpu_init();
     of_emit_ready = 1;
 
+    /* Bring up the portable texture manager.  It reads the fast-tier size from
+     * caps itself; nothing here names a memory.  A tiny dynamic texture serves
+     * as the dynamic-domain bind representative (its address is never sampled —
+     * binding it just routes the fetch domain back for the raw-pointer draws:
+     * sky, turbulent, alias, sprites, HUD). */
+    of_texture_init();
+    {
+        static unsigned char of_tex_dynamic_dummy[16] __attribute__((aligned(16)));
+        of_texture_create_dynamic(&of_tex_dynamic, of_tex_dynamic_dummy, 1, 1);
+    }
+    of_tex_world_valid = 0;
+
     /* Generic triangle depth is still not exposed here.  Param spans can
      * write and/or test d_pzbuffer when the runtime caps advertise it. */
 }
 
 void of_emit_upload_colormap(const unsigned char *cm, uint32_t size)
 {
+    /* Populate slot 0 of the GPU's 16KB-aligned SDRAM palookup storage
+     * (_gpu_palookup_storage; GPU_PALOOKUP_BASE was set there by of_gpu_init).
+     * of_texture_set_colormap (per level) then co-locates a copy into the fast
+     * tier and lets of_texture_bind move GPU_PALOOKUP_BASE with the fetch domain. */
     of_gpu_palookup_upload(0, cm, size);
 }
 
@@ -963,6 +997,139 @@ void of_emit_cache_clean_once(const void *addr, uint32_t size)
     of_emit_clean_once_hash[h] = (uint16_t)(of_emit_clean_once_next + 1u);
     of_emit_clean_once_next =
         (of_emit_clean_once_next + 1u) % OF_EMIT_CLEAN_ONCE_SLOTS;
+}
+
+/* ====================================================================
+ * Texture store — thin wrappers over the portable texture manager
+ *
+ * The engine never includes of_texture.h (it would duplicate the manager's and
+ * of_gpu.h's static state); it calls these instead.  Placement, the fetch-
+ * domain switch and the colormap move are all decided here.  Returned values
+ * are opaque GPU addresses (what a span/tri record's tex_addr wants); for a
+ * given mip, add the intra-texture byte offset.
+ * ==================================================================== */
+
+/* Reset the manager on level change (clears the static placement allocator).
+ * The colormap lives in the GPU's SDRAM palookup storage, independent of the
+ * manager, so it persists across the reset. */
+void of_emit_tex_reset(void)
+{
+    of_texture_reset();
+    of_tex_world_valid = 0;
+    of_fasttex_spilled = 0;
+    /* Fast textures ride the raw-miptex span path (not triangles), so they only
+     * need r_fasttex + a fast tier. */
+    of_fasttex_active = (r_fasttex.value != 0.0f) && of_texture_has_fast_mem();
+    /* Co-locate the colormap exactly like the Doom port (r_gpu.c): the colormap
+     * fetch follows the texture route, so with the world in the fast tier the
+     * colormap must be there too.  of_texture_set_colormap, called as the FIRST
+     * fast allocation (before any world texture, so its fast copy lands at 16KB-
+     * aligned offset 0), uploads a copy of the SDRAM palookup (slot 0, already
+     * filled with host_colormap) into the fast tier AND records both the fast and
+     * SDRAM bases, so of_texture_bind moves GPU_PALOOKUP_BASE atomically with the
+     * fetch domain.  Pass the 16KB-aligned _gpu_palookup_storage, never the
+     * 16-byte-aligned host_colormap (the HW 16KB-aligns the slot). */
+    if (of_fasttex_active)
+        of_texture_set_colormap(_gpu_palookup_storage, 64 * 256);
+}
+
+/* 1 when world textures are being served from the fast tier this map (engine
+ * gates the per-surface tex_addr and the fetch-domain binds on this). */
+int of_emit_fasttex_active(void)
+{
+    return of_fasttex_active;
+}
+
+/* Create a STATIC texture (world miptex, alias skin, …).  Returns its GPU base
+ * address; the first one created becomes the static-domain bind representative. */
+/* 1 if the target advertises a dedicated fast texture tier (diagnostics). */
+int of_emit_has_fast_mem(void)
+{
+    return of_emit_ready ? of_texture_has_fast_mem() : 0;
+}
+
+/* Fast-tier accounting for the spill diagnostic. */
+uint32_t of_emit_fasttex_size(void)
+{
+    const struct of_capabilities *c = of_get_caps();
+    return (c && c->version >= 3) ? c->tex_fast_size : 0u;
+}
+uint32_t of_emit_fasttex_budget_free(void)
+{
+    return of_emit_ready ? of_texture_budget_free() : 0u;
+}
+int of_emit_fasttex_spill_count(void)
+{
+    return of_fasttex_spilled;
+}
+
+uint32_t of_emit_tex_create(const void *pixels, uint16_t w, uint16_t h, uint32_t nbytes)
+{
+    of_texture_t t;
+    if (of_fasttex_active)
+        of_texture_create(&t, pixels, w, h, nbytes);          /* fast tier */
+    else
+        of_texture_create_dynamic(&t, (void *)(uintptr_t)pixels, w, h);  /* main memory in place */
+    if (of_fasttex_active && !of_texture_in_fast_mem(&t))
+        of_fasttex_spilled++;     /* didn't fit the tier → SDRAM addr, but route is CRAM1 */
+    if (!of_tex_world_valid) {
+        of_tex_world = t;
+        of_tex_world_valid = 1;
+    }
+    return of_texture_gpu_addr(&t);
+}
+
+/* Register the animated sky as a DYNAMIC (in-place) texture; updated each
+ * rebuild.  Returns its GPU base address (for the per-span sky tex_addr). */
+static const void *of_sky_src;
+uint32_t of_emit_sky_create(void *pixels, uint16_t w, uint16_t h)
+{
+    of_texture_create_dynamic(&of_tex_sky, pixels, w, h);
+    of_sky_src = pixels;
+    return of_texture_gpu_addr(&of_tex_sky);
+}
+
+/* Publish the freshly-rebuilt sky bytes to the GPU.  Use the robust clean
+ * (cbo.flush + read-back), NOT of_texture_update()'s plain cache_clean_range —
+ * the plain clean leaves stale L1 lines visible to the GPU's AXI reader, which
+ * shows up as speckle in the sky each frame. */
+void of_emit_sky_update(uint32_t nbytes)
+{
+    if (of_sky_src)
+        of_emit_cache_clean(of_sky_src, nbytes);
+}
+
+/* GPU base address of an in-place source the GPU samples directly (turbulent
+ * scratch rows, etc.) — memory-agnostic, matches of_texture's addressing. */
+uint32_t of_emit_tex_source_addr(const void *src)
+{
+    of_texture_t t;
+    of_texture_create_dynamic(&t, (void *)(uintptr_t)src, 1, 1);
+    return of_texture_gpu_addr(&t);
+}
+
+/* Establish the GPU fetch domain for the next batch.  of_emit_bind_static()
+ * routes to the static textures' tier (fast where present); of_emit_bind_dynamic()
+ * routes to the dynamic tier for the dynamic + raw-pointer draws.  Each flips (draining
+ * first) only when the domain actually changes; callers flush pending batched
+ * geometry before switching. */
+void of_emit_bind_static(void)
+{
+    /* No fast tier / r_fasttex 0 => one memory, no domain to flip. */
+    if (!of_emit_ready || !of_fasttex_active || !of_tex_world_valid)
+        return;
+    of_emit_finish();                 /* push queued spans/tris to the ring + drain */
+    /* of_texture_set_colormap recorded both colormap copies, so of_texture_bind
+     * flips the texture fetch domain AND moves GPU_PALOOKUP_BASE to the matching
+     * colormap (fast copy here) atomically — no manual poke (Doom r_gpu.c pattern). */
+    of_texture_bind(&of_tex_world);
+}
+void of_emit_bind_dynamic(void)
+{
+    if (!of_emit_ready || !of_fasttex_active)
+        return;
+    of_emit_finish();
+    of_texture_bind(&of_tex_dynamic);   /* restores the SDRAM colormap with the domain */
 }
 
 void of_emit_clear(uint32_t flags, uint16_t color, uint16_t depth)
