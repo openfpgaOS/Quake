@@ -64,9 +64,21 @@ extern	vec3_t	vpn, base_vpn;
 extern	vec3_t	vright, base_vright;
 extern	entity_t		*currententity;
 
-#define NUMSTACKEDGES		3200
+/* Per-frame edge/surface pools.  id's 3200/1200 were sized for id1
+ * geometry; when a view needs more, R_RenderFace silently DROPS the
+ * surface (r_draw.c, r_outofsurfaces++), so distant parts of a scene
+ * vanish and pop back in as you approach and the working set shrinks.
+ * The re-release BSP2 maps carry several times id1's face density and
+ * blew through 1200 routinely.  Raised to 4096/12288 (id's ~2.7:1 edge
+ * ratio kept).  Cost is BSS only -- R_BeginEdgeFrame just resets
+ * pointers, so nothing per-frame scales with these.  The array-based AET
+ * in r_edge.c is sized off NUMSTACKEDGES too, which is why r_maxedges
+ * must NOT be pushed past it at runtime; raising the constant keeps
+ * the pool and the AET in step.  aet_surfs is uint16, so
+ * NUMSTACKSURFACES must stay under 65535. */
+#define NUMSTACKEDGES		12288
 #define	MINEDGES			NUMSTACKEDGES
-#define NUMSTACKSURFACES	1200
+#define NUMSTACKSURFACES	4096
 #define MINSURFACES			NUMSTACKSURFACES
 #define	MAXSPANS			3000
 

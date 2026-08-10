@@ -198,6 +198,21 @@ void	R_InitTextures (void)
 
 /*
 ===============
+R_Fog_f
+
+Accept and ignore "fog <density> <r> <g> <b>".  The re-release maps and
+their QuakeC stuff this on level load (it is a GLQuake-era extension);
+the software renderer has no fog, so the command exists purely to stop
+'Unknown command "fog"' appearing on every load.  Silent by design --
+the whole point is to remove console noise.
+===============
+*/
+static void R_Fog_f (void)
+{
+}
+
+/*
+===============
 R_Init
 ===============
 */
@@ -215,8 +230,9 @@ void R_Init (void)
 
 	R_InitTurb ();
 	
-	Cmd_AddCommand ("timerefresh", R_TimeRefresh_f);	
-	Cmd_AddCommand ("pointfile", R_ReadPointFile_f);	
+	Cmd_AddCommand ("timerefresh", R_TimeRefresh_f);
+	Cmd_AddCommand ("pointfile", R_ReadPointFile_f);
+	Cmd_AddCommand ("fog", R_Fog_f);
 
 	Cvar_RegisterVariable (&r_draworder);
 	Cvar_RegisterVariable (&r_drawflat);

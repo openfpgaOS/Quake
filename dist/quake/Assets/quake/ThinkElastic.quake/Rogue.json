@@ -19,7 +19,15 @@
             { "id": 16, "filename": "s6.sav" },
             { "id": 17, "filename": "s7.sav" },
             { "id": 18, "filename": "s8.sav" },
-            { "id": 19, "filename": "s9.sav" }
+            { "id": 19, "filename": "s9.sav" },
+            { "id": 22, "filename": "cd/rogue/track02.bin" },
+            { "id": 23, "filename": "cd/rogue/track03.bin" },
+            { "id": 24, "filename": "cd/rogue/track04.bin" },
+            { "id": 25, "filename": "cd/rogue/track05.bin" },
+            { "id": 26, "filename": "cd/rogue/track06.bin" },
+            { "id": 27, "filename": "cd/rogue/track07.bin" },
+            { "id": 28, "filename": "cd/rogue/track08.bin" },
+            { "id": 29, "filename": "cd/rogue/track09.bin" }
         ]
     }
 }

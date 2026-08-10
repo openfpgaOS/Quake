@@ -87,9 +87,12 @@ typedef struct texture_s
 #define SURF_DRAWBACKGROUND	0x40
 
 // !!! if this is changed, it must be changed in asm_draw.h too !!!
+/* v[] is 32-bit so a BSP2 map's edge lump loads unchanged; a v29 map
+ * simply zero-extends into it.  Costs 4 bytes per edge (~137 KB on the
+ * largest map that ships with the re-release). */
 typedef struct
 {
-	unsigned short	v[2];
+	unsigned int	v[2];
 	unsigned int	cachededgeoffset;
 } medge_t;
 
@@ -141,8 +144,8 @@ typedef struct mnode_s
 	mplane_t	*plane;
 	struct mnode_s	*children[2];	
 
-	unsigned short		firstsurface;
-	unsigned short		numsurfaces;
+	unsigned int		firstsurface;
+	unsigned int		numsurfaces;
 } mnode_t;
 
 
@@ -167,10 +170,18 @@ typedef struct mleaf_s
 	byte		ambient_sound_level[NUM_AMBIENTS];
 } mleaf_t;
 
+/* In-memory clipnode.  Separate from the on-disk dclipnode_t because
+ * BSP2 stores 32-bit children; a v29 map's shorts widen on load. */
+typedef struct
+{
+	int			planenum;
+	int			children[2];	// negative numbers are contents
+} mclipnode_t;
+
 // !!! if this is changed, it must be changed in asm_i386.h too !!!
 typedef struct
 {
-	dclipnode_t	*clipnodes;
+	mclipnode_t	*clipnodes;
 	mplane_t	*planes;
 	int			firstclipnode;
 	int			lastclipnode;
@@ -349,7 +360,7 @@ typedef struct model_s
 	int			*surfedges;
 
 	int			numclipnodes;
-	dclipnode_t	*clipnodes;
+	mclipnode_t	*clipnodes;
 
 	int			nummarksurfaces;
 	msurface_t	**marksurfaces;

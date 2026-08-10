@@ -369,6 +369,111 @@ static void send_edge_key(uint32_t changed, uint32_t buttons,
     Key_Event(quake_key, (buttons & mask) ? true : false);
 }
 
+/* ── Real keyboard: Pocket dock, or MiSTer USB via hps_keyboard.v ─────
+ *
+ * of_keyboard_state_t reports USB HID usage IDs -- a level-triggered
+ * 256-bit map plus pressed/released edge masks already computed by the
+ * input HAL -- so this only translates and forwards.
+ *
+ * Quake takes lowercase ASCII for ordinary keys and its own K_* codes for
+ * the rest, and has ONE code per modifier (K_CTRL/K_SHIFT/K_ALT), so left
+ * and right collapse onto it.  Both the HID function-key block and Quake's
+ * K_F1..K_F12 are contiguous, so that range maps arithmetically. */
+static int hid_to_quakekey(unsigned usage)
+{
+    if (usage >= 0x04u && usage <= 0x1Du) return 'a' + (int)(usage - 0x04u);
+    if (usage >= 0x1Eu && usage <= 0x26u) return '1' + (int)(usage - 0x1Eu);
+    if (usage >= 0x3Au && usage <= 0x45u) return K_F1 + (int)(usage - 0x3Au);
+
+    switch (usage) {
+    case 0x27u: return '0';
+    case 0x28u: return K_ENTER;
+    case 0x29u: return K_ESCAPE;
+    case 0x2Au: return K_BACKSPACE;
+    case 0x2Bu: return K_TAB;
+    case 0x2Cu: return K_SPACE;
+    case 0x2Du: return '-';
+    case 0x2Eu: return '=';
+    case 0x2Fu: return '[';
+    case 0x30u: return ']';
+    case 0x31u: return '\\';
+    case 0x33u: return ';';
+    case 0x34u: return '\'';
+    case 0x35u: return '`';
+    case 0x36u: return ',';
+    case 0x37u: return '.';
+    case 0x38u: return '/';
+    case 0x48u: return K_PAUSE;
+    case 0x49u: return K_INS;
+    case 0x4Au: return K_HOME;
+    case 0x4Bu: return K_PGUP;
+    case 0x4Cu: return K_DEL;
+    case 0x4Du: return K_END;
+    case 0x4Eu: return K_PGDN;
+    case 0x4Fu: return K_RIGHTARROW;
+    case 0x50u: return K_LEFTARROW;
+    case 0x51u: return K_DOWNARROW;
+    case 0x52u: return K_UPARROW;
+    /* Keypad onto the main-row equivalents, so it works for menus and the
+     * console without needing its own bindings. */
+    case 0x58u: return K_ENTER;
+    case 0x59u: return '1';
+    case 0x5Au: return '2';
+    case 0x5Bu: return '3';
+    case 0x5Cu: return '4';
+    case 0x5Du: return '5';
+    case 0x5Eu: return '6';
+    case 0x5Fu: return '7';
+    case 0x60u: return '8';
+    case 0x61u: return '9';
+    case 0x62u: return '0';
+    default:    return 0;
+    }
+}
+
+static void poll_real_keyboard(void)
+{
+    static int prev_ctrl, prev_shift, prev_alt;
+    of_keyboard_state_t kb;
+
+    of_input_keyboard_state(&kb);
+    if (!kb.present) {
+        /* Unplugged mid-hold: release what we were reporting held. */
+        if (prev_ctrl)  Key_Event(K_CTRL,  false);
+        if (prev_shift) Key_Event(K_SHIFT, false);
+        if (prev_alt)   Key_Event(K_ALT,   false);
+        prev_ctrl = prev_shift = prev_alt = 0;
+        return;
+    }
+
+    for (unsigned w = 0; w < OF_KEYBOARD_WORDS; w++) {
+        uint32_t dn = kb.keys_pressed[w];
+        uint32_t up = kb.keys_released[w];
+        while (dn) {
+            unsigned b = (unsigned)__builtin_ctz(dn);
+            dn &= dn - 1u;
+            int k = hid_to_quakekey(w * 32u + b);
+            if (k) Key_Event(k, true);
+        }
+        while (up) {
+            unsigned b = (unsigned)__builtin_ctz(up);
+            up &= up - 1u;
+            int k = hid_to_quakekey(w * 32u + b);
+            if (k) Key_Event(k, false);
+        }
+    }
+
+    /* Collapse L/R onto one code, then edge off the collapsed level -- so
+     * holding LCtrl and adding RCtrl does not send a second keydown. */
+    int ctrl  = (kb.modifiers & 0x11u) != 0;
+    int shift = (kb.modifiers & 0x22u) != 0;
+    int alt   = (kb.modifiers & 0x44u) != 0;
+    if (ctrl  != prev_ctrl)  Key_Event(K_CTRL,  ctrl  ? true : false);
+    if (shift != prev_shift) Key_Event(K_SHIFT, shift ? true : false);
+    if (alt   != prev_alt)   Key_Event(K_ALT,   alt   ? true : false);
+    prev_ctrl = ctrl; prev_shift = shift; prev_alt = alt;
+}
+
 static int pad_axis_live(int16_t v)
 {
     return v != 0 && v != (int16_t)0x8000;
@@ -486,6 +591,9 @@ void IN_SendKeyEvents(void)
     of_input_state(0, &st);
 
     read_mouse();
+    /* Before the in_nav() early-out below, so the keyboard drives the menu
+     * and console too, not just gameplay. */
+    poll_real_keyboard();
 
     uint32_t buttons = st.buttons;
     uint32_t changed = buttons ^ prev_buttons;

@@ -871,6 +871,13 @@ if (!strcmp(com_token, "light"))
 		if (keyname[0] == '_')
 			continue;
 		
+		/* Map-compiler metadata, not gameplay fields -- no progs.dat
+		 * defines them, so warning about them is pure noise on any map
+		 * built with modern tools.  Keys starting with '_' are already
+		 * skipped above; these are the unprefixed ones. */
+		if (!strcmp (keyname, "mapversion"))
+			continue;
+
 		key = ED_FindField (keyname);
 		if (!key)
 		{

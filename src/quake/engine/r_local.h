@@ -216,7 +216,15 @@ void	R_ZDrawSubmodelPolys (model_t *clmodel);
 // Alias models
 //=========================================================
 
-#define MAXALIASVERTS		1024
+/* Caps alias (.mdl) vertex count.  Sizes two static arrays in r_alias.c
+ * -- finalverts[] and auxverts[], 44 bytes per vertex between them -- and
+ * nothing per-frame iterates to the cap, so the only cost is BSS.
+ * id's 1024 covers everything id ever shipped (id1 peaks at 325, the
+ * mission packs at 336), but the re-release's mg3 has 8 models past it,
+ * topping out at 1912 (progs/player_hanging.mdl).  4096 leaves real
+ * headroom for +135 KB; that content sits exactly on MAX_LBM_HEIGHT
+ * too, so it is clearly authored right up against engine limits. */
+#define MAXALIASVERTS		4096
 #define ALIAS_Z_CLIP_PLANE	5
 
 extern int				numverts;

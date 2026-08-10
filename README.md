@@ -29,14 +29,17 @@ All game data goes into **`/Assets/quake/common/`** on the SD card. Filenames an
 | **Hipnotic** — Scourge of Armagon | `pak0.pak`, `PAK1.PAK`, `HIPNOTIC/PAK0.PAK` |
 | **Rogue** — Dissolution of Eternity | `pak0.pak`, `PAK1.PAK`, `ROGUE/PAK0.PAK` |
 | **X-Men** — Ravages of Apocalypse | `pak0.pak`, `PAK1.PAK`, `XMEN/PAK0.PAK` … `XMEN/PAK3.PAK` |
+| **Dimension of the Past** — MachineGames episode 5 | `pak0.pak`, `PAK1.PAK`, `DOPA/PAK0.PAK` |
 
 Each entry is a separate "game" in the Pocket's library list — pick the one you want to launch. The registered `pak0.pak`/`PAK1.PAK` come from any classic Quake release (CD, Steam, GOG). Mission pack PAKs go into their own uppercase subdirectory as shown.
 
 ### Using the 2021 re-release ("Quake Enhanced") data
 
-Each re-release folder holds one self-contained `pak0.pak`, so no `PAK1.PAK` is needed: copy `rerelease/id1/pak0.pak` → `pak0.pak`, `rerelease/hipnotic/pak0.pak` → `HIPNOTIC/PAK0.PAK`, and `rerelease/rogue/pak0.pak` → `ROGUE/PAK0.PAK`.
+Each re-release folder holds one self-contained `pak0.pak`, so no `PAK1.PAK` is needed: copy `rerelease/id1/pak0.pak` → `pak0.pak`, `rerelease/hipnotic/pak0.pak` → `HIPNOTIC/PAK0.PAK`, `rerelease/rogue/pak0.pak` → `ROGUE/PAK0.PAK`, and `rerelease/dopa/pak0.pak` → `DOPA/PAK0.PAK`.
 
-The rest of that folder has no library entry. `rerelease/ctf/` (Threewave CTF) is deathmatch-only and this build has no networking. The MachineGames expansions — `dopa` (Dimension of the Past), `mg1` (Dimension of the Machine) and `mg3` — use the **BSP2** map format, and this engine is a vanilla WinQuake renderer that reads only BSP version 29. `mg1`/`mg3` are out of reach on the hardware regardless, at 16–35 MB per map against a 24 MB engine heap.
+Dimension of the Past ships as **BSP2** maps — the 32-bit brush format with wider node, leaf, clipnode, face and edge records — which the engine now loads alongside classic BSP version 29.
+
+The rest of that folder has no library entry. `rerelease/ctf/` (Threewave CTF) is deathmatch-only and this build has no networking. `mg1` (Dimension of the Machine) and `mg3` are BSP2 too, but out of reach on the hardware: their maps run 16–35 MB each against a 24 MB engine heap.
 
 ## Adding the soundtrack
 

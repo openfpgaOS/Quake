@@ -68,7 +68,10 @@ typedef struct
 	byte		reliable_datagram_buf[MAX_DATAGRAM];
 
 	sizebuf_t	signon;
-	byte		signon_buf[32768]; // PROTOCOL_FITZQUAKE: larger for more models/entities
+	/* Sized to MAX_MSGLEN so it can never outgrow the client message
+	 * buffer it gets copied into (Host_PreSpawn_f).  Overflow here is a
+	 * clean Sys_Error; overflow on the copy is silent truncation. */
+	byte		signon_buf[MAX_MSGLEN];
 } server_t;
 
 

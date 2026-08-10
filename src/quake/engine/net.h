@@ -28,7 +28,10 @@ struct qsockaddr
 
 #define	NET_NAMELEN			64
 
-#define NET_MAXMESSAGE		8192
+/* Must exceed MAX_MSGLEN plus the loopback header (net_loop.c refuses a
+ * send that would pass this, which strands the signon rather than
+ * corrupting it).  Sized 64000 -> 65536 alongside MAX_MSGLEN. */
+#define NET_MAXMESSAGE		65536
 #define NET_HEADERSIZE		(2 * sizeof(unsigned int))
 #define NET_DATAGRAMSIZE	(MAX_DATAGRAM + NET_HEADERSIZE)
 

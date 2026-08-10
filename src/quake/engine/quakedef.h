@@ -100,13 +100,27 @@ void	VID_UnlockBuffer (void);
 
 #define	ON_EPSILON		0.1			// point on plane side epsilon
 
-#define	MAX_MSGLEN		8000		// max length of a reliable message
+/* Max length of a reliable message.  This MUST be able to hold the whole
+ * signon buffer, because Host_PreSpawn_f copies sv.signon into
+ * client->message in one go -- and client->message has allowoverflow set,
+ * so an oversized signon does not error, it silently SZ_Clears and the
+ * client receives a truncated stream ("CL_ParseServerMessage: Illegible
+ * server message").  signon_buf had already been raised to 32 KB for
+ * PROTOCOL_FITZQUAKE while this stayed at id's 8000, so any map whose
+ * precache list plus baselines passed 8 KB broke: mg3's map1 has 112
+ * submodels and ~1000 baselines. */
+#define	MAX_MSGLEN		64000
 #define	MAX_DATAGRAM	1024		// max length of unreliable message
 
 //
 // per-level limits
 //
-#define	MAX_EDICTS		2048		// PROTOCOL_FITZQUAKE supports up to 32000
+/* PROTOCOL_FITZQUAKE supports up to 32000; the real cost here is that
+ * SV_SpawnServer hunk-allocates MAX_EDICTS*pr_edict_size for EVERY map
+ * and cl_entities[] is 180 bytes a slot in BSS, so this is not free —
+ * keep it just ahead of the content.  mg3's map2b holds 2200 map
+ * entities before any runtime spawns (gibs, rockets, temp entities). */
+#define	MAX_EDICTS		3072
 #define	MAX_LIGHTSTYLES	64
 #define	MAX_MODELS		2048		// PROTOCOL_FITZQUAKE: 16-bit model indices
 #define	MAX_SOUNDS		2048		// PROTOCOL_FITZQUAKE: 16-bit sound indices

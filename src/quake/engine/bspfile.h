@@ -31,7 +31,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define	MAX_MAP_PLANES		32767
 #define	MAX_MAP_NODES		32767		// because negative shorts are contents
 #define	MAX_MAP_CLIPNODES	32767		//
-#define	MAX_MAP_LEAFS		8192
+/* Sizes the engine's four PVS bitvectors (mod_novis, Mod_DecompressVis's
+ * decompressed[], SV_FatPVS's fatpvs[], PF_checkclient's checkpvs[]) at
+ * MAX_MAP_LEAFS/8 bytes each.  id maps peak near 3 k leafs, but the
+ * re-release BSP2 expansions reach 68 k (Dimension of the Machine's hub),
+ * and a leaf count over the cap silently overran those static buffers.
+ * 128 k leafs costs 16 KB per vector, 64 KB of BSS total.  Mod_LoadLeafs
+ * enforces it so an even larger map fails cleanly instead. */
+#define	MAX_MAP_LEAFS		131072
 #define	MAX_MAP_VERTS		65535
 #define	MAX_MAP_FACES		65535
 #define	MAX_MAP_MARKSURFACES 65535
@@ -54,6 +61,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 
 #define BSPVERSION	29
+
+/* BSP2 -- the 32-bit brush format.  Same fifteen lumps in the same
+ * order; the version word is replaced by the ASCII tag "BSP2", and the
+ * node / leaf / clipnode / face / edge / marksurface records widen to
+ * 32-bit indices (node and leaf bounds also become floats).  Read as a
+ * little-endian int the four bytes 'B','S','P','2' give the constant
+ * below.  The sibling "2PSB" (BSP2rmq) variant keeps 16-bit bounds and
+ * face counts; it is detected only so the loader can name it in the
+ * error rather than complain about a nonsense version number. */
+#define BSP2VERSION		(('2'<<24) | ('P'<<16) | ('S'<<8) | 'B')
+#define BSP2VERSION_2PSB	(('B'<<24) | ('S'<<16) | ('P'<<8) | '2')
+
 #define	TOOLVERSION	2
 
 typedef struct
@@ -168,6 +187,23 @@ typedef struct
 	short		children[2];	// negative numbers are contents
 } dclipnode_t;
 
+// BSP2 counterparts of the two structures above (44 and 12 bytes).
+typedef struct
+{
+	int			planenum;
+	int			children[2];	// negative numbers are -(leafs+1), not nodes
+	float		mins[3];		// for sphere culling
+	float		maxs[3];
+	unsigned int	firstface;
+	unsigned int	numfaces;	// counting both sides
+} dnode2_t;
+
+typedef struct
+{
+	int			planenum;
+	int			children[2];	// negative numbers are contents
+} dclipnode2_t;
+
 
 typedef struct texinfo_s
 {
@@ -184,6 +220,11 @@ typedef struct
 	unsigned short	v[2];		// vertex numbers
 } dedge_t;
 
+typedef struct
+{
+	unsigned int	v[2];		// vertex numbers
+} dedge2_t;
+
 #define	MAXLIGHTMAPS	4
 typedef struct
 {
@@ -198,6 +239,20 @@ typedef struct
 	byte		styles[MAXLIGHTMAPS];
 	int			lightofs;		// start of [numstyles*surfsize] samples
 } dface_t;
+
+typedef struct
+{
+	int			planenum;
+	int			side;
+
+	int			firstedge;
+	int			numedges;
+	int			texinfo;
+
+// lighting info
+	byte		styles[MAXLIGHTMAPS];
+	int			lightofs;		// start of [numstyles*surfsize] samples
+} dface2_t;
 
 
 
@@ -223,6 +278,28 @@ typedef struct
 
 	byte		ambient_level[NUM_AMBIENTS];
 } dleaf_t;
+
+typedef struct
+{
+	int			contents;
+	int			visofs;				// -1 = no visibility info
+
+	float		mins[3];			// for frustum culling
+	float		maxs[3];
+
+	unsigned int		firstmarksurface;
+	unsigned int		nummarksurfaces;
+
+	byte		ambient_level[NUM_AMBIENTS];
+} dleaf2_t;
+
+/* These are wire formats, not internal structs -- a stray pad byte
+ * would silently misparse every record after the first. */
+_Static_assert (sizeof(dnode2_t)     == 44, "BSP2 dnode2_t must be 44 bytes");
+_Static_assert (sizeof(dleaf2_t)     == 44, "BSP2 dleaf2_t must be 44 bytes");
+_Static_assert (sizeof(dface2_t)     == 28, "BSP2 dface2_t must be 28 bytes");
+_Static_assert (sizeof(dclipnode2_t) == 12, "BSP2 dclipnode2_t must be 12 bytes");
+_Static_assert (sizeof(dedge2_t)     ==  8, "BSP2 dedge2_t must be 8 bytes");
 
 
 //============================================================================

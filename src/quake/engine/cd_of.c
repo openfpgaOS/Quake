@@ -260,9 +260,23 @@ static FILE *CDAudio_OpenTrack(byte track)
         }
     }
 
-    Con_Printf("CDAudio: track %d (slot %d) not found on card\n",
-               (int)track, slot);
-    CDAudio_DumpRoot();
+    /* A game with no soundtrack installed asks for a new track on every
+     * level change, so say this once and then keep quiet -- nothing about
+     * the situation changes, and the root dump below is the useful part. */
+    {
+        static int warned;
+
+        if (!warned) {
+            warned = 1;
+            Con_Printf("CDAudio: track %d (slot %d) not found on card "
+                       "(no soundtrack bound for this game)\n",
+                       (int)track, slot);
+            CDAudio_DumpRoot();
+        } else {
+            Con_DPrintf("CDAudio: track %d (slot %d) not found\n",
+                        (int)track, slot);
+        }
+    }
     return NULL;
 }
 

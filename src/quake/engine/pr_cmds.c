@@ -1880,9 +1880,16 @@ void PF_Fixme (void)
 }
 
 // Soft stub: log warning but don't crash (for extended builtins mods may call)
+//
+// The return slot must be cleared, not left holding the previous call's
+// result.  #99 checkextension is the one mods actually test: Dimension of
+// the Past queries it at startup, and a stale nonzero would tell the
+// QuakeC an extension is present that this engine does not implement.
+// Zero reads as "unsupported" and sends it down the vanilla path.
 void PF_Stub (void)
 {
 	Con_DPrintf ("PF_Stub: unimplemented builtin called\n");
+	G_FLOAT(OFS_RETURN) = 0;
 }
 
 

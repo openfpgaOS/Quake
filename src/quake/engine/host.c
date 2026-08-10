@@ -68,6 +68,13 @@ cvar_t	teamplay = {"teamplay","0",false,true};
 cvar_t	samelevel = {"samelevel","0"};
 cvar_t	noexit = {"noexit","0",false,true};
 
+/* The 2021 re-release QuakeC sets "campaign" on every level change to
+ * tell the engine which episode set is running.  Vanilla has no such
+ * cvar, so each map load printed "Cvar_Set: variable campaign not
+ * found".  Registering it both silences that and lets the progs read
+ * back what it wrote, which is what the mod actually expects. */
+cvar_t	campaign = {"campaign","0"};
+
 #ifdef QUAKE2
 cvar_t	developer = {"developer","1"};	// should be 0 for release!
 #else
@@ -259,6 +266,7 @@ void Host_InitLocal (void)
 	Cvar_RegisterVariable (&teamplay);
 	Cvar_RegisterVariable (&samelevel);
 	Cvar_RegisterVariable (&noexit);
+	Cvar_RegisterVariable (&campaign);
 	Cvar_RegisterVariable (&skill);
 	Cvar_RegisterVariable (&developer);
 	Cvar_RegisterVariable (&deathmatch);

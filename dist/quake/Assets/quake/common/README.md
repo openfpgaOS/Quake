@@ -45,6 +45,13 @@ common/XMEN/PAK1.PAK
 common/XMEN/PAK2.PAK
 ```
 
+### Dimension of the Past (MachineGames episode 5)
+```
+common/pak0.pak
+common/PAK1.PAK
+common/DOPA/PAK0.PAK
+```
+
 ### Optional — original CD soundtrack
 Rip your Quake CD to 16-bit signed PCM `.bin` tracks and drop them in:
 ```
@@ -67,6 +74,7 @@ instance JSON in `Assets/quake/ThinkElastic.quake/`:
 | `Hipnotic`     | Mission Pack 1  | id1 PAKs + `HIPNOTIC/PAK0.PAK`                          |
 | `Rogue`        | Mission Pack 2  | id1 PAKs + `ROGUE/PAK0.PAK`                             |
 | `X-Men`        | X-Men: ROA      | id1 PAKs + `XMEN/PAK0.PAK`, `PAK1.PAK`, `PAK2.PAK`      |
+| `Dimension of the Past` | MachineGames ep. 5 | id1 PAKs + `DOPA/PAK0.PAK`                  |
 
 Saves (`s0.sav` … `s9.sav`) are created automatically in the Pocket's
 non-volatile save area — no setup needed.
@@ -76,20 +84,24 @@ non-volatile save area — no setup needed.
 The re-release ships one self-contained `pak0.pak` per game folder, so
 its files slot straight into the layout above — no `PAK1.PAK` needed:
 
-| Re-release folder     | Copy to                    | Library entry |
-| --------------------- | -------------------------- | ------------- |
-| `rerelease/id1/`      | `common/pak0.pak`          | `Quake`       |
-| `rerelease/hipnotic/` | `common/HIPNOTIC/PAK0.PAK` | `Hipnotic`    |
-| `rerelease/rogue/`    | `common/ROGUE/PAK0.PAK`    | `Rogue`       |
+| Re-release folder     | Copy to                    | Library entry           |
+| --------------------- | -------------------------- | ----------------------- |
+| `rerelease/id1/`      | `common/pak0.pak`          | `Quake`                 |
+| `rerelease/hipnotic/` | `common/HIPNOTIC/PAK0.PAK` | `Hipnotic`              |
+| `rerelease/rogue/`    | `common/ROGUE/PAK0.PAK`    | `Rogue`                 |
+| `rerelease/dopa/`     | `common/DOPA/PAK0.PAK`     | `Dimension of the Past` |
 
-Hipnotic and Rogue still need the id1 `pak0.pak` alongside them.
+Hipnotic, Rogue and Dimension of the Past still need the id1 `pak0.pak`
+alongside them.
+
+Dimension of the Past ships **BSP2** maps — the 32-bit brush format,
+with wider node / leaf / clipnode / face / edge records — which the
+engine loads alongside classic BSP version 29.
 
 **Not supported.** `rerelease/ctf/` (Threewave CTF) is deathmatch-only
-and this build has no networking. `dopa` (Dimension of the Past), `mg1`
-(Dimension of the Machine) and `mg3` store their maps in the **BSP2**
-format, which this engine — a vanilla WinQuake renderer — does not load;
-it only reads BSP version 29. `mg1`/`mg3` are also far out of reach on
-the hardware: their maps are 16–35 MB each against a 24 MB engine heap.
+and this build has no networking. `mg1` (Dimension of the Machine) and
+`mg3` are BSP2 as well, but out of reach on the hardware: their maps run
+16–35 MB each against a 24 MB engine heap.
 
 ## 3. Controls
 
