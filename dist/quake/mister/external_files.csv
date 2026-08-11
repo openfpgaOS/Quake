@@ -1,0 +1,40 @@
+# openfpgaOS — Quake freeware data list for the MiSTer Downloader database.
+#
+# THIS IS A BUILD INPUT, NOT A DEVICE FILE.  The device never reads it.  It is
+# consumed by  src/sdk/platforms/mister/mkdb.py  at package time, which folds
+# each valid row into the generated  quake.json.zip  (the real Downloader
+# custom-database artifact).  The MiSTer Downloader then fetches these files
+# straight from their own absolute URLs onto the SD card at the given sd_path.
+#
+# Only FREEWARE data belongs here.  Quake's PAK files are NOT redistributable:
+# the registered id1 set (pak0.pak + PAK1.PAK), the mission packs (Hipnotic
+# HIPNOTIC/PAK0.PAK, Rogue ROGUE/PAK0.PAK), Dimension of the Past
+# (DOPA/PAK0.PAK), the MachineGames episodes (MG1/, MG3/) and X-Men: Ravages
+# of Apocalypse (XMEN/) are all owned content — the user copies those into
+#   games/OpenfpgaOS/Quake/wads/
+# by hand and runs setup.sh, which injects them into /Quake/common on boot.vhd.
+#
+# The id Software Quake SHAREWARE episode (Episode 1, "Dimension of the
+# Doomed") is the one distributable piece: its pak0.pak is what the
+# `Shareware` instance plays.  It is still governed by id's shareware licence,
+# so it may only be offered from a URL that is authorised to host it.
+#
+# Format — one file per row, comma-separated:
+#   sd_path , url , size , md5 , tags
+#     sd_path : on-SD path relative to /media/fat (mirrors the DB layout)
+#     url     : absolute http(s) source for the exact hosted file
+#     size    : file size in bytes (integer)
+#     md5     : lowercase 32-hex MD5 of the hosted file
+#     tags    : space-separated Downloader filter tags (users can filter these
+#               out of the sync, e.g. add  filter = !freeware  in downloader.ini)
+#
+# TODO(maintainer): the url + size + md5 below are UNKNOWN and MUST be pinned
+# against the exact hosted artifact before release.  Rows with a TODO_ field
+# are SKIPPED by mkdb.py (with a warning) — the DB is still valid, that file
+# just won't be offered until a real url+size+md5 is filled in.  Do NOT invent
+# hashes.  Note the shareware distribution ships pak0.pak inside an archive
+# (quake106.zip / resource.1), so a bare-file URL has to be arranged before a
+# row here can go live.
+#
+sd_path,url,size,md5,tags
+games/OpenfpgaOS/Quake/wads/pak0.pak,TODO_URL,TODO_SIZE,TODO_MD5,quake shareware freeware
