@@ -259,7 +259,6 @@ int Sys_QuakePackPath(char *dir, int pak_index, char *out, int out_size)
     rc = of_config_get(QUAKE_CONFIG_SECTION, key, out, (uint32_t)out_size);
     if (rc == 0 && out[0])
         return 1;
-
     return -1;
 }
 
