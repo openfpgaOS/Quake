@@ -101,8 +101,15 @@ copy-app: all
 #                      tree under games/OpenfpgaOS/ at this base.
 #   MISTER_DB_URL      where quake.json.zip itself is published (for the ini snippet)
 MISTER_DB_ID       ?= openfpgaOS/openfpgaos-quake
-MISTER_DB_BASE_URL ?= https://github.com/openfpgaOS/Quake/releases/latest/download/
-MISTER_DB_URL      ?= https://github.com/openfpgaOS/Quake/releases/latest/download/quake.json.zip
+# Version of THIS app's core.json — pins the DB's asset URLs to this
+# release's own tag.  releases/latest/download is ONE pointer per REPO:
+# with several release streams (doom/heretic/hexen) it resolves to
+# whichever core released last, serving the wrong stream's assets.
+MISTER_DB_VER  := $(shell python3 -c "import glob,json;print(json.load(open(sorted(glob.glob('$(DIST)/Cores/*/core.json'))[0]))['core']['metadata']['version'])" 2>/dev/null || echo 0.0.0)
+MISTER_DB_BASE_URL ?= https://github.com/openfpgaOS/Quake/releases/download/quake-mister-v$(MISTER_DB_VER)/
+# The DB itself is tiny — committed to the repo and served via raw, a
+# stable per-game pointer immune to the shared 'latest' problem.
+MISTER_DB_URL      ?= https://raw.githubusercontent.com/openfpgaOS/Quake/main/releases/mister/quake.json.zip
 MISTER_DB          = $(ROOT)/releases/mister/$(APP).json.zip
 MISTER_DB_INI      = $(ROOT)/releases/mister/$(APP).downloader.ini
 ifeq ($(TARGET),mister)
