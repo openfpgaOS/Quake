@@ -367,7 +367,7 @@ void SCR_DrawTurtle (void)
 	if (!scr_showturtle.value)
 		return;
 
-	if (host_frametime < 0.1)
+	if (host_frametime < 0.1f)	// smallest float above 0.1
 	{
 		count = 0;
 		return;
@@ -387,7 +387,7 @@ SCR_DrawNet
 */
 void SCR_DrawNet (void)
 {
-	if (realtime - cl.last_received_message < 0.3)
+	if (realtime - cl.last_received_message < 0.3f)	// smallest float above 0.3
 		return;
 	if (cls.demoplayback)
 		return;

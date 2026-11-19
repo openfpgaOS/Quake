@@ -571,7 +571,9 @@ int	NET_GetMessage (qsocket_t *sock)
 		return -1;
 	}
 
-	SetNetTime();
+	// loopback (driver 0) never reads net_time; per-socket readers are driver-gated
+	if (sock->driver)
+		SetNetTime();
 
 	ret = sfunc.QGetMessage(sock);
 
@@ -656,7 +658,8 @@ int NET_SendMessage (qsocket_t *sock, sizebuf_t *data)
 		return -1;
 	}
 
-	SetNetTime();
+	if (sock->driver)
+		SetNetTime();
 	r = sfunc.QSendMessage(sock, data);
 	if (r == 1 && sock->driver)
 		messagesSent++;
@@ -687,7 +690,8 @@ int NET_SendUnreliableMessage (qsocket_t *sock, sizebuf_t *data)
 		return -1;
 	}
 
-	SetNetTime();
+	if (sock->driver)
+		SetNetTime();
 	r = sfunc.SendUnreliableMessage(sock, data);
 	if (r == 1 && sock->driver)
 		unreliableMessagesSent++;
@@ -723,7 +727,8 @@ qboolean NET_CanSendMessage (qsocket_t *sock)
 	if (sock->disconnected)
 		return false;
 
-	SetNetTime();
+	if (sock->driver)
+		SetNetTime();
 
 	r = sfunc.CanSendMessage(sock);
 	
@@ -963,6 +968,9 @@ void NET_Poll(void)
 		}
 		configRestored = true;
 	}
+
+	if (!pollProcedureList)
+		return;
 
 	SetNetTime();
 

@@ -100,6 +100,8 @@ vec3_t			r_entorigin;	// the currently rendering entity in world
 								// coordinates
 
 float			entity_rotation[3][3];
+static int		entity_rotation_angles[3];	// angle bits it was built from
+static qboolean	entity_rotation_valid;
 
 vec3_t			r_worldmodelorg;
 
@@ -139,10 +141,10 @@ void R_EntityRotate (vec3_t vec)
 
 /*
 ================
-R_RotateBmodel
+R_BuildEntityRotation
 ================
 */
-void R_RotateBmodel (void)
+static __attribute__((noinline)) void R_BuildEntityRotation (void)
 {
 	float	angle, s, c, temp1[3][3], temp2[3][3], temp3[3][3];
 
@@ -203,6 +205,35 @@ void R_RotateBmodel (void)
 	temp1[2][2] = c;
 
 	R_ConcatRotations (temp1, temp3, entity_rotation);
+}
+
+
+/*
+================
+R_RotateBmodel
+================
+*/
+void R_RotateBmodel (void)
+{
+	union
+	{
+		vec3_t	f;
+		int		bits[3];
+	} angles;
+
+// entity_rotation is a function of the angles only
+	VectorCopy (currententity->angles, angles.f);
+	if (!entity_rotation_valid ||
+		angles.bits[0] != entity_rotation_angles[0] ||
+		angles.bits[1] != entity_rotation_angles[1] ||
+		angles.bits[2] != entity_rotation_angles[2])
+	{
+		R_BuildEntityRotation ();
+		entity_rotation_angles[0] = angles.bits[0];
+		entity_rotation_angles[1] = angles.bits[1];
+		entity_rotation_angles[2] = angles.bits[2];
+		entity_rotation_valid = true;
+	}
 
 //
 // rotate modelorg and the transformation matrix
@@ -692,11 +723,12 @@ R_RecursiveWorldNode
 */
 PQ_FASTTEXT void R_RecursiveWorldNode (mnode_t *node, int clipflags)
 {
-	int			i, c, side, *pindex;
+	int			i, c, side;
+	const int	*pindex;
 	mplane_t	*plane;
 	msurface_t	*surf, **mark;
 	mleaf_t		*pleaf;
-	float		d, dot;
+	float		d, dback, dot;
 
 	if (node->contents == CONTENTS_SOLID)
 		return;		// solid
@@ -707,22 +739,24 @@ PQ_FASTTEXT void R_RecursiveWorldNode (mnode_t *node, int clipflags)
 // size cull: skip subtree if its bounding box projects smaller than r_cullsize pixels
 	if (cull_threshold_sq > 0)
 	{
-		float dx, dy, dz, dist_sq;
+		float dx, dy, dz, dist_sq, lo, hi;
 
-		dx = 0; dy = 0; dz = 0;
-		if (modelorg[0] < node->minmaxs[0])
-			dx = modelorg[0] - node->minmaxs[0];
-		else if (modelorg[0] > node->minmaxs[3])
-			dx = modelorg[0] - node->minmaxs[3];
-		if (modelorg[1] < node->minmaxs[1])
-			dy = modelorg[1] - node->minmaxs[1];
-		else if (modelorg[1] > node->minmaxs[4])
-			dy = modelorg[1] - node->minmaxs[4];
-		if (modelorg[2] < node->minmaxs[2])
-			dz = modelorg[2] - node->minmaxs[2];
-		else if (modelorg[2] > node->minmaxs[5])
-			dz = modelorg[2] - node->minmaxs[5];
-		dist_sq = dx*dx + dy*dy + dz*dz;
+	// distance from the box, branchless: minmaxs is a proper bounding box,
+	// so at most one of the two terms per axis is non-zero
+		lo = modelorg[0] - (float)node->minmaxs[0];
+		hi = modelorg[0] - (float)node->minmaxs[3];
+		dx = (lo < 0 ? lo : 0) + (hi > 0 ? hi : 0);
+		lo = modelorg[1] - (float)node->minmaxs[1];
+		hi = modelorg[1] - (float)node->minmaxs[4];
+		dy = (lo < 0 ? lo : 0) + (hi > 0 ? hi : 0);
+		lo = modelorg[2] - (float)node->minmaxs[2];
+		hi = modelorg[2] - (float)node->minmaxs[5];
+		dz = (lo < 0 ? lo : 0) + (hi > 0 ? hi : 0);
+
+	// exact: fmaf pins the x,y,z accumulation order that the branchy form
+	// emitted; -ffast-math would otherwise reassociate it and change the
+	// rounding, which can flip the cull for a whole subtree
+		dist_sq = fmaf(dz, dz, fmaf(dy, dy, dx*dx));
 
 		if (dist_sq > 40000.0f)
 		{
@@ -752,22 +786,28 @@ PQ_FASTTEXT void R_RecursiveWorldNode (mnode_t *node, int clipflags)
 			if (! (clipflags & (1<<i)) )
 				continue;
 
-			pindex = pfrustum_indexes[i];
+		// r_frustum_indexes[i*6] is what pfrustum_indexes[i] points at;
+		// using it directly drops the per-plane pointer load
+			pindex = &r_frustum_indexes[i*6];
 			n = view_clipplanes[i].normal;
 			dist = view_clipplanes[i].dist;
 
+		// near and far corner distances are independent: compute both
+		// before testing so the two fmadd chains interleave (the near
+		// test rejects on under 4% of planes, so the far corner is
+		// almost always needed anyway)
 			d = (float)node->minmaxs[pindex[0]] * n[0] +
 			    (float)node->minmaxs[pindex[1]] * n[1] +
 			    (float)node->minmaxs[pindex[2]] * n[2] - dist;
 
+			dback = (float)node->minmaxs[pindex[3]] * n[0] +
+			        (float)node->minmaxs[pindex[4]] * n[1] +
+			        (float)node->minmaxs[pindex[5]] * n[2] - dist;
+
 			if (d <= 0)
 				return;
 
-			d = (float)node->minmaxs[pindex[3]] * n[0] +
-			    (float)node->minmaxs[pindex[4]] * n[1] +
-			    (float)node->minmaxs[pindex[5]] * n[2] - dist;
-
-			if (d >= 0)
+			if (dback >= 0)
 				clipflags &= ~(1<<i);
 		}
 	}

@@ -278,6 +278,16 @@ extern	client_state_t	cl;
 // FIXME, allocate dynamically
 extern	efrag_t			cl_efrags[MAX_EFRAGS];
 extern	entity_t		cl_entities[MAX_EDICTS];
+
+// one bit per cl_entities[] slot, set while the slot has a model or a
+// pending forcelink.  CL_RelinkEntities walks the bits instead of the
+// 180 byte entity records, so empty slots cost no cache line
+#define	CL_ENTLIVE_WORDS	((MAX_EDICTS+31)>>5)
+extern	unsigned int	cl_entlive[CL_ENTLIVE_WORDS];
+
+#define	CL_EntLiveSet(n)	(cl_entlive[(n)>>5] |= 1u<<((n)&31))
+#define	CL_EntLiveClear(n)	(cl_entlive[(n)>>5] &= ~(1u<<((n)&31)))
+
 extern	entity_t		cl_static_entities[MAX_STATIC_ENTITIES];
 extern	lightstyle_t	cl_lightstyle[MAX_LIGHTSTYLES];
 extern	dlight_t		cl_dlights[MAX_DLIGHTS];

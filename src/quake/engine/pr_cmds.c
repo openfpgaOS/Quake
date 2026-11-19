@@ -101,11 +101,52 @@ PF_makevectors
 
 Writes new values for v_forward, v_up, and v_right based on angles
 makevectors(vector)
+
+The last few results are kept, keyed on the bit patterns of the angles.
 ==============
 */
+#define	MAX_MAKEVECTORS_MEMO	4
+
+typedef struct
+{
+	int		angles[3];
+	vec3_t	forward, right, up;
+} makevectors_memo_t;
+
+static makevectors_memo_t	makevectors_memo[MAX_MAKEVECTORS_MEMO];
+static int	makevectors_memo_used, makevectors_memo_next;
+
 void PF_makevectors (void)
 {
+	int		i, *angles;
+	makevectors_memo_t	*m;
+
+	angles = (int *)G_VECTOR(OFS_PARM0);
+	for (i=0 ; i<makevectors_memo_used ; i++)
+	{
+		m = &makevectors_memo[i];
+		if (m->angles[0] == angles[0] && m->angles[1] == angles[1] && m->angles[2] == angles[2])
+		{
+			VectorCopy (m->forward, pr_global_struct->v_forward);
+			VectorCopy (m->right, pr_global_struct->v_right);
+			VectorCopy (m->up, pr_global_struct->v_up);
+			return;
+		}
+	}
+
 	AngleVectors (G_VECTOR(OFS_PARM0), pr_global_struct->v_forward, pr_global_struct->v_right, pr_global_struct->v_up);
+
+	m = &makevectors_memo[makevectors_memo_next];
+	m->angles[0] = angles[0];
+	m->angles[1] = angles[1];
+	m->angles[2] = angles[2];
+	VectorCopy (pr_global_struct->v_forward, m->forward);
+	VectorCopy (pr_global_struct->v_right, m->right);
+	VectorCopy (pr_global_struct->v_up, m->up);
+	if (++makevectors_memo_next == MAX_MAKEVECTORS_MEMO)
+		makevectors_memo_next = 0;
+	if (makevectors_memo_used < MAX_MAKEVECTORS_MEMO)
+		makevectors_memo_used++;
 }
 
 /*
@@ -405,6 +446,52 @@ void PF_vlen (void)
 
 /*
 =================
+PF_TruncDivPi
+
+(int)((double)f * (1.0 / M_PI)) in integer arithmetic.  The 77 bit product
+of the mantissas is rounded to the 53 bits of a double, ties to even, then
+truncated; out of range values saturate and NaN gives 0x7fffffff, as the
+double to int conversion does.
+=================
+*/
+static int PF_TruncDivPi (float f)
+{
+	union { float f; unsigned u; } v;
+	unsigned long long	a, hi;
+	unsigned	m, lo, half;
+	int		e, d;
+
+	v.f = f;
+	e = (v.u >> 23) & 0xff;
+	if (e < 128)	// |f| < 2
+		return 0;
+	if (e >= 160)	// |f| >= 2^33, infinity or NaN
+		return (v.u & 0x80000000) && !(e == 0xff && (v.u & 0x7fffff)) ? (int)0x80000000 : 0x7fffffff;
+
+// 1/pi = 0x145f306dc9c883 * 2^-54
+	m = (v.u & 0x7fffff) | 0x800000;
+	a = (unsigned long long)m * 0x6dc9c883;
+	hi = (unsigned long long)m * 0x145f30 + (a >> 32);
+	lo = (unsigned)a;
+
+	d = hi >> 44 ? 24 : 23;
+	half = 1u << (d - 1);
+	if ((lo & ((2u << d) - 1)) == half)
+		lo -= half;		// tie, rounds down to even
+	else
+	{
+		lo += half;
+		hi += lo < half;
+	}
+
+	hi >>= 172 - e;
+	if (v.u & 0x80000000)
+		return hi >= 0x80000000 ? (int)0x80000000 : -(int)hi;
+	return hi >= 0x80000000 ? 0x7fffffff : (int)hi;
+}
+
+/*
+=================
 PF_vectoyaw
 
 float vectoyaw(vector)
@@ -421,7 +508,7 @@ void PF_vectoyaw (void)
 		yaw = 0;
 	else
 	{
-		yaw = (int) (atan2f(value1[1], value1[0]) * 180 / M_PI);
+		yaw = PF_TruncDivPi (atan2f(value1[1], value1[0]) * 180);
 		if (yaw < 0)
 			yaw += 360;
 	}
@@ -455,12 +542,12 @@ void PF_vectoangles (void)
 	}
 	else
 	{
-		yaw = (int) (atan2f(value1[1], value1[0]) * 180 / M_PI);
+		yaw = PF_TruncDivPi (atan2f(value1[1], value1[0]) * 180);
 		if (yaw < 0)
 			yaw += 360;
 
 		forward = sqrtf (value1[0]*value1[0] + value1[1]*value1[1]);
-		pitch = (int) (atan2f(value1[2], forward) * 180 / M_PI);
+		pitch = PF_TruncDivPi (atan2f(value1[2], forward) * 180);
 		if (pitch < 0)
 			pitch += 360;
 	}
@@ -779,7 +866,9 @@ void PF_checkclient (void)
 	vec3_t	view;
 	
 // find a new check if on a new frame
-	if (sv.time - sv.lastchecktime >= 0.1)
+// 0.1f, not 0.1: no float lies between the two constants, so the float
+// compare answers the same as the promoted double one without soft float
+	if (sv.time - sv.lastchecktime >= 0.1f)
 	{
 		sv.lastcheck = PF_newcheckclient (sv.lastcheck);
 		sv.lastchecktime = sv.time;
@@ -861,15 +950,50 @@ void PF_localcmd (void)
 PF_cvar
 
 float cvar (string)
+
+Recently found variables are kept by name pointer.  A hit is confirmed by
+name, and cvars are unique and never unregistered, so it is the variable
+Cvar_FindVar would return.
 =================
 */
+#define	MAX_CVAR_CACHE	4
+
+static struct
+{
+	char	*name;
+	cvar_t	*var;
+} cvar_cache[MAX_CVAR_CACHE];
+static int	cvar_cache_next;
+
 void PF_cvar (void)
 {
 	char	*str;
+	cvar_t	*var;
+	int		i;
 	
 	str = G_STRING(OFS_PARM0);
 	
-	G_FLOAT(OFS_RETURN) = Cvar_VariableValue (str);
+	for (i=0 ; i<MAX_CVAR_CACHE ; i++)
+		if (cvar_cache[i].name == str && !Q_strcmp (str, cvar_cache[i].var->name))
+			break;
+
+	if (i < MAX_CVAR_CACHE)
+		var = cvar_cache[i].var;
+	else
+	{
+		var = Cvar_FindVar (str);
+		if (!var)
+		{
+			G_FLOAT(OFS_RETURN) = 0;
+			return;
+		}
+		cvar_cache[cvar_cache_next].name = str;
+		cvar_cache[cvar_cache_next].var = var;
+		if (++cvar_cache_next == MAX_CVAR_CACHE)
+			cvar_cache_next = 0;
+	}
+
+	G_FLOAT(OFS_RETURN) = Q_atof (var->string);
 }
 
 /*
@@ -896,20 +1020,38 @@ PF_findradius
 Returns a chain of entities that have origins within a spherical area
 
 findradius (origin, radius)
+
+The distance is first estimated in float.  Its error against the double
+evaluation is below (|org| + |mins+maxs| + 2*len) * 2^-20 summed over the
+axes, so outside eight times that margin the estimate decides; closer
+calls, and non-finite or huge values, are evaluated in double.
 =================
 */
+static qboolean PF_FloatBelow (float f, float limit)
+{
+	union { float f; unsigned u; } a, b;
+
+	a.f = f;
+	b.f = limit;
+	return (a.u & 0x7fffffff) < b.u;	// false for NaN
+}
+
 void PF_findradius (void)
 {
 	edict_t	*ent, *chain;
 	float	rad;
 	float	*org;
-	vec3_t	eorg;
+	vec3_t	eorg, size;
 	int		i, j;
+	float	orgsize, len, bound, margin;
 
 	chain = (edict_t *)sv.edicts;
 	
 	org = G_VECTOR(OFS_PARM0);
 	rad = G_FLOAT(OFS_PARM1);
+	orgsize = fabsf(org[0]) + fabsf(org[1]) + fabsf(org[2]);
+	if (!PF_FloatBelow (rad, 1e30f))
+		orgsize = 1e30f;	// no estimates
 
 	ent = NEXT_EDICT(sv.edicts);
 	for (i=1 ; i<sv.num_edicts ; i++, ent = NEXT_EDICT(ent))
@@ -919,10 +1061,26 @@ void PF_findradius (void)
 		if (ent->v.solid == SOLID_NOT)
 			continue;
 		for (j=0 ; j<3 ; j++)
-			eorg[j] = org[j] - (ent->v.origin[j] + (ent->v.mins[j] + ent->v.maxs[j])*0.5);			
-		if (Length(eorg) > rad)
-			continue;
-			
+		{
+			size[j] = ent->v.mins[j] + ent->v.maxs[j];
+			eorg[j] = org[j] - fmaf (0.5f, size[j], ent->v.origin[j]);
+		}
+		len = Length(eorg);
+		bound = orgsize + fabsf(size[0]) + fabsf(size[1]) + fabsf(size[2]) + 2*len;
+		margin = bound * (1.0f / 131072) + 1e-18f;
+		if (PF_FloatBelow (bound, 1073741824.0f) && (len > rad + margin || len < rad - margin))
+		{
+			if (len > rad)
+				continue;
+		}
+		else
+		{
+			for (j=0 ; j<3 ; j++)
+				eorg[j] = org[j] - (ent->v.origin[j] + (ent->v.mins[j] + ent->v.maxs[j])*0.5);
+			if (Length(eorg) > rad)
+				continue;
+		}
+
 		ent->v.chain = EDICT_TO_PROG(chain);
 		chain = ent;
 	}
@@ -1167,6 +1325,82 @@ void PF_eprint (void)
 
 /*
 ===============
+PF_DegToRad
+
+(float)((double)f * (M_PI*2 / 360)) in integer arithmetic.  The 77 bit
+product of the mantissas is rounded to the 53 bits of a double, then to
+the float (or denormal) grid, both ties to even.
+===============
+*/
+static float PF_DegToRad (float f)
+{
+	union { float f; unsigned u; } v;
+	unsigned long long	a, hi, rem, halfg;
+	unsigned	m, lo, half, n;
+	int		e, d, g, sh;
+
+	v.f = f;
+	e = (v.u >> 23) & 0xff;
+	m = v.u & 0x7fffff;
+	if (e == 0xff)
+	{
+		if (m)
+			v.u = 0x7fc00000;	// default NaN
+		return v.f;
+	}
+	if (e == 0)
+	{
+		if (!m)
+			return f;
+		for (e = 1 ; !(m & 0x800000) ; e--)
+			m <<= 1;
+	}
+	else
+		m |= 0x800000;
+
+// M_PI*2 / 360 = 0x11df46a2529d39 * 2^-58, so f * it = product * 2^(e - 208)
+	a = (unsigned long long)m * 0xa2529d39;
+	hi = (unsigned long long)m * 0x11df46 + (a >> 32);
+	lo = (unsigned)a;
+
+	d = hi >> 44 ? 24 : 23;
+	half = 1u << (d - 1);
+	if ((lo & ((2u << d) - 1)) == half)
+		lo -= half;		// tie, rounds down to even
+	else
+	{
+		lo += half;
+		hi += lo < half;
+		lo &= ~(half + half - 1);
+	}
+
+	g = 52 + (hi >> 44 != 0) + (hi >> 45 != 0);
+	if (g < 59 - e)
+		g = 59 - e;		// denormal result
+	sh = g - 32;
+	if (sh > 63)
+		sh = 63;
+	n = hi >> sh;
+	rem = hi & ((1ull << sh) - 1);
+	halfg = 1ull << (sh - 1);
+	if (rem > halfg || (rem == halfg && (lo || (n & 1))))
+		n++;
+	if (n == 0x1000000)
+	{
+		n = 0x800000;
+		g++;
+	}
+
+// n * 2^(g + e - 208)
+	if (n < 0x800000)
+		v.u = (v.u & 0x80000000) | n;
+	else
+		v.u = (v.u & 0x80000000) | (((unsigned)(g + e - 59) << 23) + n);
+	return v.f;
+}
+
+/*
+===============
 PF_walkmove
 
 float(float yaw, float dist) walkmove
@@ -1190,7 +1424,7 @@ void PF_walkmove (void)
 		return;
 	}
 
-	yaw = yaw*M_PI*2 / 360;
+	yaw = PF_DegToRad (yaw);
 	
 	move[0] = cosf(yaw)*dist;
 	move[1] = sinf(yaw)*dist;
@@ -1273,14 +1507,43 @@ void PF_lightstyle (void)
 		}
 }
 
+/*
+=================
+PF_rint
+
+Rounds half away from zero.  Out of range values saturate and NaN gives
+0x7fffffff, as (int)(f + 0.5) and (int)(f - 0.5) in double do.
+=================
+*/
 void PF_rint (void)
 {
 	float	f;
+	int		i;
+
 	f = G_FLOAT(OFS_PARM0);
-	if (f > 0)
-		G_FLOAT(OFS_RETURN) = (int)(f + 0.5);
+	if (((unsigned)G_INT(OFS_PARM0) & 0x7fffffff) >= 0x7f800000)
+		i = G_INT(OFS_PARM0) == (int)0xff800000 ? (int)0x80000000 : 0x7fffffff;
+	else if (f > 0)
+	{
+		if (f >= 2147483648.0f)
+			i = 0x7fffffff;
+		else
+		{
+			i = (int)f;
+			i += f - i >= 0.5f;
+		}
+	}
 	else
-		G_FLOAT(OFS_RETURN) = (int)(f - 0.5);
+	{
+		if (f <= -2147483648.0f)
+			i = 0x80000000;
+		else
+		{
+			i = (int)f;
+			i -= f - i <= -0.5f;
+		}
+	}
+	G_FLOAT(OFS_RETURN) = i;
 }
 void PF_floor (void)
 {
@@ -1398,9 +1661,8 @@ void PF_aim (void)
 			continue;
 		if (teamplay.value && ent->v.team > 0 && ent->v.team == check->v.team)
 			continue;	// don't aim at teammate
-		for (j=0 ; j<3 ; j++)
-			end[j] = check->v.origin[j]
-			+ 0.5*(check->v.mins[j] + check->v.maxs[j]);
+		for (j=0 ; j<3 ; j++)	// origin + (mins+maxs)*0.5 rounded once, as in double
+			end[j] = fmaf (0.5f, check->v.mins[j] + check->v.maxs[j], check->v.origin[j]);
 		VectorSubtract (end, start, dir);
 		VectorNormalize (dir);
 		dist = DotProduct (dir, pr_global_struct->v_forward);

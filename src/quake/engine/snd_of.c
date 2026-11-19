@@ -7,15 +7,16 @@
  * Quake's software mixer paints signed-16 interleaved stereo samples into
  * a 16 K-pair ring and SNDDMA_Submit drains that ring to of_audio_write().
  *
- * A 1 kHz timer ISR was tried for frame-rate-independent drainage but
- * calling OF_SVC->audio_write / audio_get_free from interrupt context
- * is not reentrant-safe with main-thread calls and manifested as a
- * progressive freeze after a few frames (mirrors of_midi_pump's
- * "no ECALL from ISR" warning in of_midi.c). Keeping this path
- * synchronous with the frame for now — at 15 fps the 1024-pair FIFO
- * (~21 ms) does underrun during long frames, but correctness beats
- * audio smoothness. Fix properly by either growing the HW FIFO or by
- * restructuring the kernel audio service to be reentrant.
+ * For the software mixer, a 1 kHz timer ISR was tried for frame-rate-
+ * independent drainage but calling OF_SVC->audio_write / audio_get_free
+ * from interrupt context is not reentrant-safe with main-thread calls
+ * and manifested as a progressive freeze after a few frames (mirrors
+ * of_midi_pump's "no ECALL from ISR" warning in of_midi.c). Keeping
+ * this path synchronous with the frame for now — at 15 fps the
+ * 1024-pair FIFO (~21 ms) does underrun during long frames, but
+ * correctness beats audio smoothness. Fix properly by either growing
+ * the HW FIFO or by restructuring the kernel audio service to be
+ * reentrant.
  */
 
 #include "quakedef.h"
@@ -53,6 +54,7 @@ extern volatile dma_t sn;
 
 static volatile dma_t *const sn_state = &sn;
 
+#if !SND_USE_HW_MIXER
 /* Drain as many painted pairs as will fit into the FIFO right now.
  * Called from SNDDMA_Submit (per-frame). */
 static void audio_drain(void)
@@ -76,6 +78,7 @@ static void audio_drain(void)
     }
     submit_src_pos = submit;
 }
+#endif
 
 qboolean SNDDMA_Init(void)
 {
@@ -107,7 +110,9 @@ int SNDDMA_GetDMAPos(void)
 
 void SNDDMA_Submit(void)
 {
+#if !SND_USE_HW_MIXER
     audio_drain();
+#endif
 }
 
 void SNDDMA_Shutdown(void) { }
@@ -120,10 +125,17 @@ void SNDDMA_ClearBuffer(void)
 }
 
 /* The engine calls SNDDMA_FillRing from inside R_EdgeDrawing
- * (r_main.c:1512, :1540) — that's two extra drain points per frame
- * inside the render loop, which keeps the FIFO topped up when frame
- * times are long (15 fps frame ≈ 66 ms vs 21 ms FIFO). Main-thread
- * only, no ISR involvement, so audio_drain is safe here. */
+ * (r_main.c:1512, :1540).  With the software mixer that's two extra
+ * drain points per frame inside the render loop, which keeps the FIFO
+ * topped up when frame times are long (15 fps frame ≈ 66 ms vs 21 ms
+ * FIFO); main-thread only, no ISR involvement, so audio_drain is safe
+ * here.  With the HW mixer snd_buffer is never painted, so Submit and
+ * FillRing stream nothing and the kernel's stream voice stays off. */
 int audio_timer_active = 0;
 void Audio_TimerStart(void) { }
-void SNDDMA_FillRing(void)  { audio_drain(); }
+void SNDDMA_FillRing(void)
+{
+#if !SND_USE_HW_MIXER
+    audio_drain();
+#endif
+}

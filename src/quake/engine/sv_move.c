@@ -34,28 +34,179 @@ is not a staircase.
 */
 int c_yes, c_no;
 
+// distance of a corner from a non-axial plane.  -ffast-math re-associates a
+// plain DotProduct differently at every site, and the corner descent must
+// round exactly as the four inlined SV_PointContents calls this replaced:
+// fma(y,n1, fma(x,n0, fma(z,n2,-dist))).  Written as fmaf so the association
+// is the code's and not the optimizer's.
+#define CornerDist(pl,x,y,z)	fmaf ((y), (pl)->normal[1], \
+								fmaf ((x), (pl)->normal[0], \
+								fmaf ((z), (pl)->normal[2], -(pl)->dist)))
+
+/*
+=============
+SV_CornerContents
+
+Finishes one corner's hull 0 descent, with SV_CheckBottom's rounding.  Not
+SV_HullPointContents: that one's other callers round their own way.
+=============
+*/
+static int SV_CornerContents (mclipnode_t *clipnodes, mplane_t *planes, int num, vec3_t p)
+{
+	mclipnode_t	*node;
+	mplane_t	*plane;
+	float		d;
+
+	while (num >= 0)
+	{
+		node = clipnodes + num;
+		plane = planes + node->planenum;
+		d = (plane->type < 3) ? p[plane->type] - plane->dist
+							  : CornerDist (plane, p[0], p[1], p[2]);
+		num = node->children[d < 0];
+	}
+
+	return num;
+}
+
+/*
+=============
+SV_CornersAllSolid
+
+The four points under the corners of the box, walked down hull 0 together.
+Near the root the box is small against the node planes, so all four corners
+take the same child and one descent serves them all; once a plane separates
+them the four run interleaved, which fills each other's FPU latency.  Same
+answer as four SV_PointContents calls, without their early out.
+=============
+*/
+static qboolean SV_CornersAllSolid (vec3_t mins, vec3_t maxs, float z)
+{
+	hull_t		*hull;
+	mclipnode_t	*clipnodes, *node;
+	mplane_t	*planes, *plane, *pl0, *pl1, *pl2, *pl3;
+	mclipnode_t	*n0, *n1, *n2, *n3;
+	vec3_t		lo, hi, c0, c1, c2, c3;
+	float		dz, dxlo, dxhi;
+	float		dlo, dhi, d0, d1, d2, d3;
+	int			t, slo, shi;
+	int			num, num0, num1, num2, num3;
+
+	lo[0] = mins[0];	lo[1] = mins[1];	lo[2] = z;
+	hi[0] = maxs[0];	hi[1] = maxs[1];	hi[2] = z;
+
+	c0[0] = lo[0];	c0[1] = lo[1];	c0[2] = z;
+	c1[0] = lo[0];	c1[1] = hi[1];	c1[2] = z;
+	c2[0] = hi[0];	c2[1] = lo[1];	c2[2] = z;
+	c3[0] = hi[0];	c3[1] = hi[1];	c3[2] = z;
+
+	hull = &sv.worldmodel->hulls[0];
+	clipnodes = hull->clipnodes;
+	planes = hull->planes;
+
+// shared prefix: an axis plane sees only two distinct corner distances, and
+// the corners only part when those two straddle it
+	num = 0;
+	while (num >= 0)
+	{
+		node = clipnodes + num;
+		plane = planes + node->planenum;
+		t = plane->type;
+		if (t < 3)
+		{
+			dlo = lo[t] - plane->dist;
+			dhi = hi[t] - plane->dist;
+			slo = (dlo < 0);
+			shi = (dhi < 0);
+			if (slo != shi)
+			{
+				num0 = node->children[slo];
+				num3 = node->children[shi];
+				if (t == 0)
+				{	// lo[0] is the x of c0 and c1
+					num1 = num0;
+					num2 = num3;
+				}
+				else
+				{	// t == 1; lo[1] is the y of c0 and c2.  t == 2 cannot
+					// reach here, lo[2] == hi[2] == z
+					num2 = num0;
+					num1 = num3;
+				}
+				goto parted;
+			}
+			num = node->children[slo];
+		}
+		else
+		{	// the corners share z, and pairwise share x, so the common
+			// leading fmas are computed once -- each d is still exactly the
+			// three-fma chain for its own corner
+			dz = fmaf (z, plane->normal[2], -plane->dist);
+			dxlo = fmaf (lo[0], plane->normal[0], dz);
+			dxhi = fmaf (hi[0], plane->normal[0], dz);
+			d0 = fmaf (lo[1], plane->normal[1], dxlo);
+			d1 = fmaf (hi[1], plane->normal[1], dxlo);
+			d2 = fmaf (lo[1], plane->normal[1], dxhi);
+			d3 = fmaf (hi[1], plane->normal[1], dxhi);
+			num0 = node->children[d0 < 0];
+			num1 = node->children[d1 < 0];
+			num2 = node->children[d2 < 0];
+			num3 = node->children[d3 < 0];
+			if (num0 != num1 || num0 != num2 || num0 != num3)
+				goto parted;
+			num = num0;
+		}
+	}
+
+	return num == CONTENTS_SOLID;
+
+parted:
+	while ((num0 | num1 | num2 | num3) >= 0)
+	{
+		n0 = clipnodes + num0;	pl0 = planes + n0->planenum;
+		d0 = (pl0->type < 3) ? c0[pl0->type] - pl0->dist
+							 : CornerDist (pl0, c0[0], c0[1], c0[2]);
+		n1 = clipnodes + num1;	pl1 = planes + n1->planenum;
+		d1 = (pl1->type < 3) ? c1[pl1->type] - pl1->dist
+							 : CornerDist (pl1, c1[0], c1[1], c1[2]);
+		n2 = clipnodes + num2;	pl2 = planes + n2->planenum;
+		d2 = (pl2->type < 3) ? c2[pl2->type] - pl2->dist
+							 : CornerDist (pl2, c2[0], c2[1], c2[2]);
+		n3 = clipnodes + num3;	pl3 = planes + n3->planenum;
+		d3 = (pl3->type < 3) ? c3[pl3->type] - pl3->dist
+							 : CornerDist (pl3, c3[0], c3[1], c3[2]);
+
+		num0 = n0->children[d0 < 0];
+		num1 = n1->children[d1 < 0];
+		num2 = n2->children[d2 < 0];
+		num3 = n3->children[d3 < 0];
+	}
+
+// whichever descents have not reached a leaf yet finish on their own
+	num0 = SV_CornerContents (clipnodes, planes, num0, c0);
+	num1 = SV_CornerContents (clipnodes, planes, num1, c1);
+	num2 = SV_CornerContents (clipnodes, planes, num2, c2);
+	num3 = SV_CornerContents (clipnodes, planes, num3, c3);
+
+	return num0 == CONTENTS_SOLID && num1 == CONTENTS_SOLID
+		&& num2 == CONTENTS_SOLID && num3 == CONTENTS_SOLID;
+}
+
 qboolean SV_CheckBottom (edict_t *ent)
 {
 	vec3_t	mins, maxs, start, stop;
 	trace_t	trace;
 	int		x, y;
 	float	mid, bottom;
-	
+
 	VectorAdd (ent->v.origin, ent->v.mins, mins);
 	VectorAdd (ent->v.origin, ent->v.maxs, maxs);
 
 // if all of the points under the corners are solid world, don't bother
 // with the tougher checks
 // the corners must be within 16 of the midpoint
-	start[2] = mins[2] - 1;
-	for	(x=0 ; x<=1 ; x++)
-		for	(y=0 ; y<=1 ; y++)
-		{
-			start[0] = x ? maxs[0] : mins[0];
-			start[1] = y ? maxs[1] : mins[1];
-			if (SV_PointContents (start) != CONTENTS_SOLID)
-				goto realcheck;
-		}
+	if (!SV_CornersAllSolid (mins, maxs, mins[2] - 1))
+		goto realcheck;
 
 	c_yes++;
 	return true;		// we got out easy
@@ -222,6 +373,46 @@ qboolean SV_movestep (edict_t *ent, vec3_t move, qboolean relink)
 
 /*
 ======================
+SV_SinCos
+
+sinf and cosf of angle, remembered by the exact bits of angle
+======================
+*/
+#define	SINCOS_HASH_BITS	6
+
+typedef struct
+{
+	unsigned	bits;
+	qboolean	valid;
+	float		sinval, cosval;
+} sincos_t;
+
+static sincos_t	sincos_cache[1<<SINCOS_HASH_BITS];
+
+void SV_SinCos (float angle, float *sinval, float *cosval)
+{
+	union
+	{
+		float		f;
+		unsigned	u;
+	} key;
+	sincos_t	*c;
+
+	key.f = angle;
+	c = &sincos_cache[(key.u * 0x9e3779b1u) >> (32 - SINCOS_HASH_BITS)];
+	if (!c->valid || c->bits != key.u)
+	{
+		c->sinval = sinf(angle);
+		c->cosval = cosf(angle);
+		c->bits = key.u;
+		c->valid = true;
+	}
+	*sinval = c->sinval;
+	*cosval = c->cosval;
+}
+
+/*
+======================
 SV_StepDirection
 
 Turns to the movement direction, and walks the current distance if
@@ -234,13 +425,15 @@ qboolean SV_StepDirection (edict_t *ent, float yaw, float dist)
 {
 	vec3_t		move, oldorigin;
 	float		delta;
+	float		sinval, cosval;
 	
 	ent->v.ideal_yaw = yaw;
 	PF_changeyaw();
 	
 	yaw = yaw * (float)(M_PI / 180.0);
-	move[0] = cosf(yaw)*dist;
-	move[1] = sinf(yaw)*dist;
+	SV_SinCos (yaw, &sinval, &cosval);
+	move[0] = cosval*dist;
+	move[1] = sinval*dist;
 	move[2] = 0;
 
 	VectorCopy (ent->v.origin, oldorigin);

@@ -98,24 +98,51 @@ extern cvar_t	pq_gpu_spanblit;
 int		pq_combined_z_active;  /* tells d_edge.c to skip D_DrawZSpans when 1 */
 int		pq_gpu_zwrite_pending; /* GPU wrote d_pzbuffer; CPU z readers need a retire barrier */
 
-static of_emit_param_span_record_t pq_param_span_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS];
+/* Span lists never exceed the span pool, so one record per pool entry. */
+static of_emit_param_span_record_t pq_param_span_records[MAXSPANS]
+	__attribute__((aligned(4)));
 
-#define D_TURB_SCRATCH_ROWS 128
+/* The (u,v) halfword pair of an even record, as one word. */
+typedef uint32_t pq_uv_pair_t __attribute__((may_alias));
 
-static byte d_turb_scratch_rows[D_TURB_SCRATCH_ROWS][MAXWIDTH]
-	__attribute__((aligned(64)));
-static int d_turb_scratch_row_next;
+/* Q29 span-list header: per-frame fields set by D_Q29BeginFrame, the rest
+ * per surface; never-written fields stay zero. */
+static of_emit_param_span_list_t d_q29_params;
+static int d_q29_ok;
+static int d_q29_zwrite;
 
-static byte *D_AllocTurbScratchRow (void)
+/* GPU-sampled scratch pools (turbulent rows here, text and translate rows in
+ * draw.c) reuse an address only after a drain and texture cache flush; every
+ * such flush bumps d_scratch_epoch and resets all pools. */
+unsigned	d_scratch_epoch;
+
+#define D_TURB_SCRATCH_BYTES (128 * MAXWIDTH)
+
+static byte d_turb_scratch[D_TURB_SCRATCH_BYTES] __attribute__((aligned(64)));
+static int d_turb_scratch_next;
+static unsigned d_turb_scratch_epoch;
+
+/* Rows start on 64-byte boundaries so no two rows share a CPU or GPU cache
+ * line. */
+static byte *D_AllocTurbScratch (int nbytes)
 {
-	if (d_turb_scratch_row_next >= D_TURB_SCRATCH_ROWS)
+	int need = (nbytes + 63) & ~63;
+
+	if (d_turb_scratch_epoch != d_scratch_epoch)
+	{
+		d_turb_scratch_epoch = d_scratch_epoch;
+		d_turb_scratch_next = 0;
+	}
+	if (d_turb_scratch_next + need > D_TURB_SCRATCH_BYTES)
 	{
 		of_emit_finish();
 		of_emit_texture_cache_flush();
-		d_turb_scratch_row_next = 0;
+		d_turb_scratch_epoch = ++d_scratch_epoch;
+		d_turb_scratch_next = 0;
 	}
 
-	return d_turb_scratch_rows[d_turb_scratch_row_next++];
+	d_turb_scratch_next += need;
+	return d_turb_scratch + d_turb_scratch_next - need;
 }
 
 static void D_EmitTurbScratchSpan (uint32_t fb_addr, byte *scratch, int count)
@@ -358,7 +385,7 @@ void D_WarpScreen (void)
 
 	for (v=0 ; v<scr_vrect.height ; v++)
 	{
-		scratch = D_AllocTurbScratchRow ();
+		scratch = D_AllocTurbScratch (scr_vrect.width);
 		fb_addr = (uint32_t)(uintptr_t)(vid.buffer +
 			(scr_vrect.y + v) * vid.rowbytes + scr_vrect.x);
 		col = &column[turb[v]];
@@ -442,7 +469,7 @@ void Turbulent8 (espan_t *pspan)
 		if (count <= 0)
 			goto NextSpan;
 
-		scratch = D_AllocTurbScratchRow ();
+		scratch = D_AllocTurbScratch (span_width);
 		r_turb_pdest = scratch;
 
 	// calculate the initial s/z, t/z, 1/z, s, and t and clamp
@@ -990,6 +1017,46 @@ PQ_HOT void R_DrawSurfaceTris (msurface_t *fa, int miplevel)
 
 /*
 =============
+D_Q29BeginFrame
+
+Latches the per-frame state of the Q29 span-list path; called at the end of
+D_SetupFrame, after the view buffer and screenwidth are chosen.
+=============
+*/
+void D_Q29BeginFrame (void)
+{
+	d_q29_ok = (int)pq_gpu_persp.value &&
+	           (int)pq_gpu_param.value &&
+	           of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST) &&
+	           of_emit_supports(OF_EMIT_CAP_Q29_SCALE);
+	d_q29_zwrite = (int)pq_gpu_zwrite.value &&
+	               of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_Z) &&
+	               d_pzbuffer != NULL && d_zwidth != 0;
+
+	d_q29_params.fb_major_step = screenwidth;
+	d_q29_params.fb_minor_step = 1;
+	d_q29_params.flags         = OF_EMIT_PERSP;
+	d_q29_params.attr_mode     = OF_EMIT_PARAM_ATTR_PERSP_Q29;
+	d_q29_params.span_axis     = OF_EMIT_PARAM_AXIS_X;
+	d_q29_params.clamp_min[0]  = 0;
+	d_q29_params.clamp_min[1]  = 0;
+	if (d_q29_zwrite) {
+		d_q29_params.z_mode       = OF_EMIT_PARAM_Z_WRITE_ZI;
+		d_q29_params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
+		d_q29_params.z_minor_step = (int32_t)sizeof(short);
+	} else {
+		d_q29_params.z_mode       = OF_EMIT_PARAM_Z_NONE;
+		d_q29_params.z_base       = 0;
+		d_q29_params.z_major_step = 0;
+		d_q29_params.z_minor_step = 0;
+	}
+}
+
+static __attribute__((cold, noinline)) void D_DrawSpans8_Slow (espan_t *pspan,
+	unsigned char *pbase, const int gpu_world_light);
+
+/*
+=============
 D_DrawSpans8
 
 World textured spans. Prefer the unified param-span path when advertised;
@@ -1004,8 +1071,6 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 #else
 	const int gpu_world_light = 0;
 #endif
-	const int tex_s_offset = gpu_world_light ? pq_world_tex_s_offset : 0;
-	const int tex_t_offset = gpu_world_light ? pq_world_tex_t_offset : 0;
 
 	/* Pre-lit surface cache path: D_CacheSurface marks cache blocks dirty
 	 * only when R_DrawSurfaceBlock8_mipN rebuilt data[]. Cache hits are
@@ -1019,63 +1084,53 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 	}
 
 #if D_USE_GPU_PERSP
-	if ((int)pq_gpu_persp.value &&
-	    (int)pq_gpu_param.value &&
-	    !gpu_world_light &&
-	    of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_LIST) &&
-	    of_emit_supports(OF_EMIT_CAP_Q29_SCALE)) {
-		espan_t *span;
-		int base_u = 0, base_v = 0, max_u = 0, max_v = 0;
-		uint32_t total_records = 0;
+	if (d_q29_ok && !gpu_world_light) {
+		of_emit_param_span_record_t *rec = pq_param_span_records;
+		of_emit_param_span_record_t *const rec_end = rec + MAXSPANS;
+		espan_t *span, *next_span;
+		int base_u = INT32_MAX, base_v = INT32_MAX;
+		int max_u = INT32_MIN, max_v = INT32_MIN;
+		uint32_t total_records;
 
-		for (span = pspan; span != NULL; span = span->pnext) {
-			int last_u;
+		/* One walk: absolute records and the surface batch bounds.
+		 * The pnext load is issued first so the next span's line is on
+		 * its way while this one is packed. */
+		for (span = pspan; span != NULL; span = next_span) {
+			int u, v, count, last_u;
 
-			if (span->count <= 0)
+			next_span = span->pnext;
+			count = span->count;
+			if (count <= 0)
 				continue;
-			last_u = span->u + span->count - 1;
-			if (total_records == 0) {
-				base_u = span->u;
-				base_v = span->v;
+			if (rec == rec_end)
+				Sys_Error ("D_DrawSpans8: span list overflow");
+			u = span->u;
+			v = span->v;
+			rec->u = (uint16_t)u;
+			rec->v = (uint16_t)v;
+			rec->count = (uint16_t)count;
+			rec++;
+			last_u = u + count - 1;
+			if (u < base_u)
+				base_u = u;
+			if (v < base_v)
+				base_v = v;
+			if (last_u > max_u)
 				max_u = last_u;
-				max_v = span->v;
-			} else {
-				if (span->u < base_u)
-					base_u = span->u;
-				if (span->v < base_v)
-					base_v = span->v;
-				if (last_u > max_u)
-					max_u = last_u;
-				if (span->v > max_v)
-					max_v = span->v;
-			}
-			total_records++;
+			if (v > max_v)
+				max_v = v;
 		}
+		total_records = (uint32_t)(rec - pq_param_span_records);
 
 		if (total_records != 0) {
-			/* Static template: zero-initialised once at load; the
-			 * constant-zero fields (colormap_id, masks, light plane,
-			 * clamp[2], reserved) never change, so skip the ~100-byte
-			 * memset that used to run per surface. */
-			static of_emit_param_span_list_t params;
-			uint8_t flags = OF_EMIT_PERSP;
-			const int gpu_zwrite =
-				(int)pq_gpu_zwrite.value &&
-				of_emit_supports(OF_EMIT_CAP_PARAM_SPAN_Z) &&
-				d_pzbuffer != NULL && d_zwidth != 0 &&
-				(flags & (OF_EMIT_SKIP_ZERO | OF_EMIT_COLUMN)) == 0;
+			of_emit_param_span_record_t *p;
+			uint32_t batch_count, left;
+			uint32_t submitted_records = 0;
 
-			params.fb_base       = (uint32_t)(uintptr_t)
+			d_q29_params.fb_base   = (uint32_t)(uintptr_t)
 				(d_viewbuffer + screenwidth * base_v + base_u);
-			params.fb_major_step = screenwidth;
-			params.fb_minor_step = 1;
-			params.tex_addr      = (uint32_t)(uintptr_t)pbase;
-			params.tex_width     = (uint16_t)cachewidth;
-			params.flags         = flags;
-			params.attr_mode     = OF_EMIT_PARAM_ATTR_PERSP_Q29;
-			params.span_axis     = OF_EMIT_PARAM_AXIS_X;
-			params.z_mode        = gpu_zwrite ? OF_EMIT_PARAM_Z_WRITE_ZI
-			                                  : OF_EMIT_PARAM_Z_NONE;
+			d_q29_params.tex_addr  = (uint32_t)(uintptr_t)pbase;
+			d_q29_params.tex_width = (uint16_t)cachewidth;
 
 #if D_PARAM_FLOAT_SETUP
 			/* FPU fast path — attr planes in value units, scaled to
@@ -1137,11 +1192,11 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 					scale = sb.f;
 				}
 
-				params.q29_attr_shift = (uint8_t)sh;
+				d_q29_params.q29_attr_shift = (uint8_t)sh;
 				for (i = 0; i < 3; i++) {
-					params.attr_origin[i] = (int32_t)(f_org[i] * scale);
-					params.attr_du[i]     = (int32_t)(f_du[i] * scale);
-					params.attr_dv[i]     = (int32_t)(f_dv[i] * scale);
+					d_q29_params.attr_origin[i] = (int32_t)(f_org[i] * scale);
+					d_q29_params.attr_du[i]     = (int32_t)(f_du[i] * scale);
+					d_q29_params.attr_dv[i]     = (int32_t)(f_dv[i] * scale);
 				}
 			}
 #else
@@ -1176,64 +1231,82 @@ PQ_FASTTEXT void D_DrawSpans8 (espan_t *pspan)
 				q29_shift = D_ParamSurfaceQ29Shift(attr_origin_q29,
 					attr_du_q29, attr_dv_q29,
 					max_u - base_u, max_v - base_v);
-				params.q29_attr_shift = (uint8_t)q29_shift;
+				d_q29_params.q29_attr_shift = (uint8_t)q29_shift;
 				for (int i = 0; i < 3; i++) {
-					params.attr_origin[i] =
+					d_q29_params.attr_origin[i] =
 						D_I64ToI32Sat(D_ShrTrunc64(attr_origin_q29[i], q29_shift));
-					params.attr_du[i] =
+					d_q29_params.attr_du[i] =
 						D_I64ToI32Sat(D_ShrTrunc64(attr_du_q29[i], q29_shift));
-					params.attr_dv[i] =
+					d_q29_params.attr_dv[i] =
 						D_I64ToI32Sat(D_ShrTrunc64(attr_dv_q29[i], q29_shift));
 				}
 			}
 #endif
-			params.clamp_min[0] = 0;
-			params.clamp_max[0] = bbextents;
-			params.clamp_min[1] = 0;
-			params.clamp_max[1] = bbextentt;
-			if (gpu_zwrite) {
-				params.z_base = (uint32_t)(uintptr_t)
+			d_q29_params.clamp_max[0] = bbextents;
+			d_q29_params.clamp_max[1] = bbextentt;
+			if (d_q29_zwrite)
+				d_q29_params.z_base = (uint32_t)(uintptr_t)
 					(d_pzbuffer + d_zwidth * base_v + base_u);
-				params.z_major_step = (int32_t)d_zwidth * (int32_t)sizeof(short);
-				params.z_minor_step = (int32_t)sizeof(short);
-			} else {
-				params.z_base = 0;
-				params.z_major_step = 0;
-				params.z_minor_step = 0;
-			}
 
-			uint32_t batch_count = 0;
-			uint32_t submitted_records = 0;
-			for (span = pspan; span != NULL; span = span->pnext) {
-				if (span->count > 0) {
-					of_emit_param_span_record_t *rec =
-						&pq_param_span_records[batch_count++];
-					rec->u = (uint16_t)(span->u - base_u);
-					rec->v = (uint16_t)(span->v - base_v);
-					rec->count = (uint16_t)span->count;
+			/* Rebase records to the batch origin, then submit in
+			 * OF_EMIT_PARAM_SPAN_MAX_RECORDS chunks.  A record is 6
+			 * bytes and the pool is 4-aligned, so every even record
+			 * holds u and v in one aligned word; u >= base_u and
+			 * v >= base_v, so the halves never borrow into each other
+			 * and the pair goes out as one subtract. */
+			{
+				const uint32_t uvbase =
+					((uint32_t)base_v << 16) | (uint32_t)(uint16_t)base_u;
+				uint32_t n = total_records;
 
-					if (batch_count == OF_EMIT_PARAM_SPAN_MAX_RECORDS) {
-						submitted_records += of_emit_param_span_list(
-							&params, pq_param_span_records, batch_count);
-						batch_count = 0;
-					}
+				p = pq_param_span_records;
+				while (n >= 2) {
+					*(pq_uv_pair_t *)&p[0].u -= uvbase;
+					p[1].u = (uint16_t)(p[1].u - base_u);
+					p[1].v = (uint16_t)(p[1].v - base_v);
+					p += 2;
+					n -= 2;
 				}
+				if (n)
+					*(pq_uv_pair_t *)&p[0].u -= uvbase;
 			}
-
-			if (batch_count != 0) {
+			p = pq_param_span_records;
+			left = total_records;
+			do {
+				batch_count = left < OF_EMIT_PARAM_SPAN_MAX_RECORDS ?
+					left : OF_EMIT_PARAM_SPAN_MAX_RECORDS;
 				submitted_records += of_emit_param_span_list(
-					&params, pq_param_span_records, batch_count);
-			}
+					&d_q29_params, p, batch_count);
+				p += batch_count;
+				left -= batch_count;
+			} while (left != 0);
 
-			pq_combined_z_active = gpu_zwrite &&
-				total_records != 0 &&
+			pq_combined_z_active = d_q29_zwrite &&
 				submitted_records == total_records;
 			if (pq_combined_z_active)
 				pq_gpu_zwrite_pending = 1;
 			return;
 		}
 	}
+#endif /* D_USE_GPU_PERSP */
 
+	D_DrawSpans8_Slow (pspan, pbase, gpu_world_light);
+}
+
+/*
+=============
+D_DrawSpans8_Slow
+
+Older SDK perspective spans, or CPU-side per-16-pixel affine spans.
+=============
+*/
+static __attribute__((cold, noinline)) void D_DrawSpans8_Slow (espan_t *pspan,
+	unsigned char *pbase, const int gpu_world_light)
+{
+	const int tex_s_offset = gpu_world_light ? pq_world_tex_s_offset : 0;
+	const int tex_t_offset = gpu_world_light ? pq_world_tex_t_offset : 0;
+
+#if D_USE_GPU_PERSP
 	if ((int)pq_gpu_persp.value && of_emit_supports(OF_EMIT_CAP_PERSP)) {
 		/* Bake Quake's `+ sadjust` offset into the projection-space planes
 		 * so GPU output stays exact across the scanline:

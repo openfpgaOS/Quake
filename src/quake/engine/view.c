@@ -126,7 +126,7 @@ float V_CalcBob (void)
 
 	bob = sqrtf(cl.velocity[0]*cl.velocity[0] + cl.velocity[1]*cl.velocity[1]) * cl_bob.value;
 //Con_Printf ("speed: %5.1f\n", Length(cl.velocity));
-	bob = bob*0.3f + bob*0.7f*sinf(cycle);
+	bob = bob*0.3f + bob*0.7f*PQ_SinRad(cycle);
 	if (bob > 4)
 		bob = 4;
 	else if (bob < -7)
@@ -328,7 +328,7 @@ void V_ParseDamage (void)
 	for (i=0 ; i<3 ; i++)
 		from[i] = MSG_ReadCoord ();
 
-	count = blood*0.5 + armor*0.5;
+	count = blood*0.5f + armor*0.5f;
 	if (count < 10)
 		count = 10;
 
@@ -699,6 +699,30 @@ float angledelta (float a)
 
 /*
 ==================
+V_IdleNop
+
+True when v_idlescale is 0 and the idle sway term for this cycle and level
+is a signed zero that leaves a bit-for-bit unchanged (a is not -0 or NaN),
+so its sine can be skipped.  Kept out of line so the sway expressions
+compile to the same fused operations.
+==================
+*/
+static __attribute__((noinline)) qboolean V_IdleNop (float a, float cycle, float level)
+{
+	union { float f; unsigned i; }	ua, ut, ul;
+
+	if (v_idlescale.value != 0)
+		return false;
+	ua.f = a;
+	ut.f = cl.time*cycle;
+	ul.f = level;
+	return ua.i != 0x80000000 && (ua.i & 0x7f800000) != 0x7f800000
+		&& (ut.i & 0x7f800000) != 0x7f800000
+		&& (ul.i & 0x7f800000) != 0x7f800000;
+}
+
+/*
+==================
 CalcGunAngle
 ==================
 */
@@ -750,9 +774,12 @@ void CalcGunAngle (void)
 	cl.viewent.angles[YAW] = r_refdef.viewangles[YAW] + yaw;
 	cl.viewent.angles[PITCH] = - (r_refdef.viewangles[PITCH] + pitch);
 
-	cl.viewent.angles[ROLL] -= v_idlescale.value * sinf(cl.time*v_iroll_cycle.value) * v_iroll_level.value;
-	cl.viewent.angles[PITCH] -= v_idlescale.value * sinf(cl.time*v_ipitch_cycle.value) * v_ipitch_level.value;
-	cl.viewent.angles[YAW] -= v_idlescale.value * sinf(cl.time*v_iyaw_cycle.value) * v_iyaw_level.value;
+	if (!V_IdleNop (cl.viewent.angles[ROLL], v_iroll_cycle.value, v_iroll_level.value))
+		cl.viewent.angles[ROLL] -= v_idlescale.value * PQ_SinRad(cl.time*v_iroll_cycle.value) * v_iroll_level.value;
+	if (!V_IdleNop (cl.viewent.angles[PITCH], v_ipitch_cycle.value, v_ipitch_level.value))
+		cl.viewent.angles[PITCH] -= v_idlescale.value * PQ_SinRad(cl.time*v_ipitch_cycle.value) * v_ipitch_level.value;
+	if (!V_IdleNop (cl.viewent.angles[YAW], v_iyaw_cycle.value, v_iyaw_level.value))
+		cl.viewent.angles[YAW] -= v_idlescale.value * PQ_SinRad(cl.time*v_iyaw_cycle.value) * v_iyaw_level.value;
 }
 
 /*
@@ -792,9 +819,12 @@ Idle swaying
 */
 void V_AddIdle (void)
 {
-	r_refdef.viewangles[ROLL] += v_idlescale.value * sinf(cl.time*v_iroll_cycle.value) * v_iroll_level.value;
-	r_refdef.viewangles[PITCH] += v_idlescale.value * sinf(cl.time*v_ipitch_cycle.value) * v_ipitch_level.value;
-	r_refdef.viewangles[YAW] += v_idlescale.value * sinf(cl.time*v_iyaw_cycle.value) * v_iyaw_level.value;
+	if (!V_IdleNop (r_refdef.viewangles[ROLL], v_iroll_cycle.value, v_iroll_level.value))
+		r_refdef.viewangles[ROLL] += v_idlescale.value * PQ_SinRad(cl.time*v_iroll_cycle.value) * v_iroll_level.value;
+	if (!V_IdleNop (r_refdef.viewangles[PITCH], v_ipitch_cycle.value, v_ipitch_level.value))
+		r_refdef.viewangles[PITCH] += v_idlescale.value * PQ_SinRad(cl.time*v_ipitch_cycle.value) * v_ipitch_level.value;
+	if (!V_IdleNop (r_refdef.viewangles[YAW], v_iyaw_cycle.value, v_iyaw_level.value))
+		r_refdef.viewangles[YAW] += v_idlescale.value * PQ_SinRad(cl.time*v_iyaw_cycle.value) * v_iyaw_level.value;
 }
 
 

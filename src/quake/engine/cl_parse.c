@@ -126,7 +126,7 @@ void CL_ParseStartSoundPacket(void)
 		volume = DEFAULT_SOUND_PACKET_VOLUME;
 	
     if (field_mask & SND_ATTENUATION)
-		attenuation = MSG_ReadByte () / 64.0;
+		attenuation = MSG_ReadByte () / 64.0f;
 	else
 		attenuation = DEFAULT_SOUND_PACKET_ATTENUATION;
 	
@@ -545,6 +545,10 @@ void CL_ParseUpdate (int bits)
 		VectorCopy (ent->msg_angles[0], ent->angles);
 		ent->forcelink = true;
 	}
+
+// this slot needs relinking; CL_RelinkEntities drops the bit again when
+// the entity turns out to have neither a model nor a pending forcelink
+	CL_EntLiveSet (num);
 }
 
 /*
@@ -855,10 +859,18 @@ void CL_ParseServerMessage (void)
 			return;		// end of message
 		}
 
-		/* Brief delay between svc commands during signon.  Without this,
-		 * the message parser outruns some internal state when multiple
-		 * pak files are loaded, causing signon to stall at stage 2. */
-		if (cls.signon < SIGNONS) {
+		/* Brief delay before every signon command except the ones that
+		 * only parse bytes into memory.  Without it the message parser
+		 * outruns some internal state when multiple pak files are loaded,
+		 * causing signon to stall at stage 2.  Nothing but interrupts and
+		 * DMA runs during the spin, so baselines, statics, lightstyles
+		 * and stats had nothing to wait for; anything else, listed or
+		 * not, still waits.  On e1m3 that is 79 waits instead of 351. */
+		if (cls.signon < SIGNONS
+			&& cmd != svc_nop && cmd != svc_updatestat && cmd != svc_time
+			&& cmd != svc_lightstyle && cmd != svc_spawnstatic
+			&& cmd != svc_spawnbaseline && cmd != svc_spawnbaseline2
+			&& cmd != svc_spawnstatic2) {
 			volatile unsigned int *cyc = (volatile unsigned int *)0x40000004;
 			unsigned int t = *cyc;
 			while (*cyc - t < 50000) {} /* ~500us @ 100MHz */

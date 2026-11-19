@@ -27,6 +27,10 @@ static vec5_t			clip_verts[2][MAXWORKINGVERTS];
 static int				sprite_width, sprite_height;
 
 spritedesc_t			r_spritedesc;
+
+// cos(1 degree) = 0.999848; this is the largest float below it, so a float
+// compares against it exactly as against the double constant
+#define COS_1_DEGREE	0.999847949f
 	
 
 /*
@@ -312,7 +316,7 @@ void R_DrawSprite (void)
 		VectorNormalize (tvec);
 		dot = tvec[2];	// same as DotProduct (tvec, r_spritedesc.vup) because
 						//  r_spritedesc.vup is 0, 0, 1
-		if ((dot > 0.999848) || (dot < -0.999848))	// cos(1 degree) = 0.999848
+		if ((dot > COS_1_DEGREE) || (dot < -COS_1_DEGREE))
 			return;
 		r_spritedesc.vup[0] = 0;
 		r_spritedesc.vup[1] = 0;
@@ -351,7 +355,7 @@ void R_DrawSprite (void)
 	// the two vectors are less than 1 degree apart
 		dot = vpn[2];	// same as DotProduct (vpn, r_spritedesc.vup) because
 						//  r_spritedesc.vup is 0, 0, 1
-		if ((dot > 0.999848) || (dot < -0.999848))	// cos(1 degree) = 0.999848
+		if ((dot > COS_1_DEGREE) || (dot < -COS_1_DEGREE))
 			return;
 		r_spritedesc.vup[0] = 0;
 		r_spritedesc.vup[1] = 0;

@@ -184,8 +184,9 @@ void SV_StartSound (edict_t *entity, int channel, char *sample, int volume,
 	else
 		MSG_WriteByte (&sv.datagram, sound_num);
 	//johnfitz
+	// exact: fmaf rounds once, the same as origin+0.5*(mins+maxs) in double
 	for (i=0 ; i<3 ; i++)
-		MSG_WriteCoord (&sv.datagram, entity->v.origin[i]+0.5*(entity->v.mins[i]+entity->v.maxs[i]));
+		MSG_WriteCoord (&sv.datagram, fmaf(entity->v.mins[i]+entity->v.maxs[i], 0.5f, entity->v.origin[i]));
 }           
 
 /*
@@ -379,26 +380,61 @@ crosses a waterline.
 =============================================================================
 */
 
+#define	MAX_FAT_LEAFS	64
+
 int		fatbytes;
 byte	fatpvs[MAX_MAP_LEAFS/8];
+
+static mleaf_t	*fat_leafs[MAX_FAT_LEAFS];
+static int		fat_numleafs;
+static mleaf_t	*fat_cached[MAX_FAT_LEAFS];
+static int		fat_numcached = -1;	// -1 = fatpvs not built from a remembered leaf list
+
+static void SV_ClearFatPVS (void)
+{
+	fatbytes = (sv.worldmodel->numleafs+31)>>3;
+	if (fatbytes > sizeof(fatpvs))
+		fatbytes = sizeof(fatpvs);
+	Q_memset (fatpvs, 0, fatbytes);
+}
+
+static void SV_OrLeafPVS (mleaf_t *leaf)
+{
+	int		i;
+	byte	*pvs;
+
+	pvs = Mod_LeafPVS (leaf, sv.worldmodel);
+	for (i=0 ; i<fatbytes ; i++)
+		fatpvs[i] |= pvs[i];
+}
 
 void SV_AddToFatPVS (vec3_t org, mnode_t *node)
 {
 	int		i;
-	byte	*pvs;
 	mplane_t	*plane;
 	float	d;
 
 	while (1)
 	{
-	// if this is a leaf, accumulate the pvs bits
+	// if this is a leaf, remember it; past MAX_FAT_LEAFS build the pvs directly
 		if (node->contents < 0)
 		{
 			if (node->contents != CONTENTS_SOLID)
 			{
-				pvs = Mod_LeafPVS ( (mleaf_t *)node, sv.worldmodel);
-				for (i=0 ; i<fatbytes ; i++)
-					fatpvs[i] |= pvs[i];
+				if (fat_numleafs < MAX_FAT_LEAFS)
+					fat_leafs[fat_numleafs] = (mleaf_t *)node;
+				else
+				{
+					if (fat_numleafs == MAX_FAT_LEAFS)
+					{
+						SV_ClearFatPVS ();
+						for (i=0 ; i<MAX_FAT_LEAFS ; i++)
+							SV_OrLeafPVS (fat_leafs[i]);
+						fat_numcached = -1;
+					}
+					SV_OrLeafPVS ((mleaf_t *)node);
+				}
+				fat_numleafs++;
 			}
 			return;
 		}
@@ -422,14 +458,34 @@ void SV_AddToFatPVS (vec3_t org, mnode_t *node)
 SV_FatPVS
 
 Calculates a PVS that is the inclusive or of all leafs within 8 pixels of the
-given point.
+given point.  Reuses the last result when the same leafs are touched.
 =============
 */
 byte *SV_FatPVS (vec3_t org)
 {
-	fatbytes = (sv.worldmodel->numleafs+31)>>3;
-	Q_memset (fatpvs, 0, fatbytes);
+	int		i;
+
+	fat_numleafs = 0;
 	SV_AddToFatPVS (org, sv.worldmodel->nodes);
+	if (fat_numleafs > MAX_FAT_LEAFS)
+		return fatpvs;
+
+	if (fat_numleafs == fat_numcached)
+	{
+		for (i=0 ; i<fat_numleafs ; i++)
+			if (fat_leafs[i] != fat_cached[i])
+				break;
+		if (i == fat_numleafs)
+			return fatpvs;
+	}
+
+	SV_ClearFatPVS ();
+	for (i=0 ; i<fat_numleafs ; i++)
+	{
+		SV_OrLeafPVS (fat_leafs[i]);
+		fat_cached[i] = fat_leafs[i];
+	}
+	fat_numcached = fat_numleafs;
 	return fatpvs;
 }
 
@@ -492,7 +548,8 @@ void SV_WriteEntitiesToClient (edict_t	*clent, sizebuf_t *msg)
 		for (i=0 ; i<3 ; i++)
 		{
 			miss = ent->v.origin[i] - ent->baseline.origin[i];
-			if ( miss < -0.1 || miss > 0.1 )
+			// exact: <= -0.1f / >= 0.1f match the double compares for every float
+			if ( miss <= -0.1f || miss >= 0.1f )
 				bits |= U_ORIGIN1<<i;
 		}
 
@@ -634,8 +691,9 @@ void SV_WriteClientdataToMessage (edict_t *ent, sizebuf_t *msg)
 		MSG_WriteByte (msg, svc_damage);
 		MSG_WriteByte (msg, ent->v.dmg_save);
 		MSG_WriteByte (msg, ent->v.dmg_take);
+		// exact: fmaf rounds once, the same as origin+0.5*(mins+maxs) in double
 		for (i=0 ; i<3 ; i++)
-			MSG_WriteCoord (msg, other->v.origin[i] + 0.5*(other->v.mins[i] + other->v.maxs[i]));
+			MSG_WriteCoord (msg, fmaf(other->v.mins[i] + other->v.maxs[i], 0.5f, other->v.origin[i]));
 	
 		ent->v.dmg_take = 0;
 		ent->v.dmg_save = 0;
@@ -1244,6 +1302,7 @@ void SV_SpawnServer (char *server)
 	strcpy (sv.name, server);
 	sprintf (sv.modelname,"maps/%s.bsp", server);
 	sv.worldmodel = Mod_ForName (sv.modelname, false);
+	fat_numcached = -1;
 	if (!sv.worldmodel)
 	{
 		Con_Printf ("Couldn't spawn server %s\n", sv.modelname);

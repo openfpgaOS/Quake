@@ -45,6 +45,7 @@ static of_mixer_handle_t channel_mixer_handles[MAX_CHANNELS];
 static int               channel_mixer_start_time[MAX_CHANNELS];
 static int               channel_mixer_start_pos[MAX_CHANNELS];
 static int               channel_mixer_length[MAX_CHANNELS];
+static int               channel_mixer_vol[MAX_CHANNELS]; // last (l<<8)|r sent, -1 unknown
 static double            hw_sound_sample_accum;
 #endif
 
@@ -67,6 +68,17 @@ static int  oldsamplepos;
 int         s_rawend;
 
 static qboolean sound_started = false;
+
+// Static channels never move, so one that is outside its attenuation radius
+// stays outside until the listener has travelled the difference.  snd_travel
+// counts listener travel in 1/16 units and only grows; while it is below a
+// static channel's stamp that channel is silent, stopped and free to skip.
+// A channel with no sfx is stamped SND_TRAVEL_NEVER and skipped for good.
+#define SND_TRAVEL_MAX      0x40000000
+#define SND_TRAVEL_NEVER    0x7fffffff
+static int      snd_travel;
+static int      snd_reject_travel[MAX_CHANNELS];
+static vec3_t   snd_travel_origin;
 
 cvar_t bgmvolume = {"bgmvolume", "0.9", true};
 cvar_t volume = {"volume", "0.75", true};
@@ -142,10 +154,12 @@ static void S_MixerStopChannel(int idx)
 {
     if (idx < 0 || idx >= MAX_CHANNELS)
         return;
-    if (channel_mixer_handles[idx] != OF_MIXER_HANDLE_INVALID) {
-        of_mixer_stop_h(channel_mixer_handles[idx]);
-        channel_mixer_handles[idx] = OF_MIXER_HANDLE_INVALID;
-    }
+    // An invalid handle already implies zeroed position state: only
+    // S_MixerStartChannel writes it, and it takes the handle with it
+    if (channel_mixer_handles[idx] == OF_MIXER_HANDLE_INVALID)
+        return;
+    of_mixer_stop_h(channel_mixer_handles[idx]);
+    channel_mixer_handles[idx] = OF_MIXER_HANDLE_INVALID;
     channel_mixer_start_time[idx] = 0;
     channel_mixer_start_pos[idx] = 0;
     channel_mixer_length[idx] = 0;
@@ -212,6 +226,7 @@ static qboolean S_MixerStartChannel(int idx)
     channel_mixer_start_time[idx] = paintedtime;
     channel_mixer_start_pos[idx] = ch->pos;
     channel_mixer_length[idx] = sc->length;
+    channel_mixer_vol[idx] = -1;
 
     if (S_MixerChannelLoops(idx) && mixer_loopstart >= 0)
         of_mixer_set_loop_h(handle, mixer_loopstart, (int)mixer_length);
@@ -229,14 +244,13 @@ static qboolean S_MixerStartChannel(int idx)
     return true;
 }
 
+// Non-looping channels only: follow the voice with paintedtime
 static void S_MixerUpdateChannelPos(int idx)
 {
     channel_t *ch;
     int pos;
 
-    if (idx < 0 || idx >= MAX_CHANNELS)
-        return;
-    if (S_MixerChannelLoops(idx) || channel_mixer_length[idx] <= 0)
+    if (channel_mixer_length[idx] <= 0)
         return;
 
     ch = &channels[idx];
@@ -252,6 +266,7 @@ static void S_MixerUpdateChannelPos(int idx)
 static void S_MixerApplyChannelVolume(int idx)
 {
     channel_t *ch;
+    int vol;
 
     if (idx < 0 || idx >= MAX_CHANNELS)
         return;
@@ -259,37 +274,21 @@ static void S_MixerApplyChannelVolume(int idx)
         return;
 
     ch = &channels[idx];
-    of_mixer_set_vol_lr_h(channel_mixer_handles[idx],
-                          S_MixerClampVolume(ch->leftvol),
-                          S_MixerClampVolume(ch->rightvol));
+    vol = (S_MixerClampVolume(ch->leftvol) << 8) |
+          S_MixerClampVolume(ch->rightvol);
+    if (vol == channel_mixer_vol[idx])
+        return;                 // the voice already holds this volume
+    channel_mixer_vol[idx] = vol;
+    of_mixer_set_vol_lr_h(channel_mixer_handles[idx], vol >> 8, vol & 255);
 }
 
-static void S_MixerSyncChannel(int idx)
+// Ambient and static channels: the voice is dropped while inaudible and
+// restarted from the top when it comes back
+static void S_MixerSyncLooping(int idx)
 {
-    channel_t *ch;
-    int left, right;
-    qboolean looping;
+    channel_t *ch = &channels[idx];
 
-    if (idx < 0 || idx >= MAX_CHANNELS)
-        return;
-
-    ch = &channels[idx];
-    if (!ch->sfx) {
-        S_MixerStopChannel(idx);
-        return;
-    }
-
-    looping = S_MixerChannelLoops(idx);
-    S_MixerUpdateChannelPos(idx);
-    if (!looping && ch->end <= paintedtime) {
-        S_MixerStopChannel(idx);
-        ch->sfx = NULL;
-        return;
-    }
-
-    left = S_MixerClampVolume(ch->leftvol);
-    right = S_MixerClampVolume(ch->rightvol);
-    if (looping && left == 0 && right == 0) {
+    if (!ch->sfx || (ch->leftvol <= 0 && ch->rightvol <= 0)) {
         S_MixerStopChannel(idx);
         return;
     }
@@ -300,6 +299,37 @@ static void S_MixerSyncChannel(int idx)
 
     S_MixerApplyChannelVolume(idx);
 }
+
+// Dynamic entity channels: play once, then free the slot
+static void S_MixerSyncDynamic(int idx)
+{
+    channel_t *ch = &channels[idx];
+
+    if (!ch->sfx) {
+        S_MixerStopChannel(idx);
+        return;
+    }
+
+    S_MixerUpdateChannelPos(idx);
+    if (ch->end <= paintedtime) {
+        S_MixerStopChannel(idx);
+        ch->sfx = NULL;
+        return;
+    }
+
+    if (channel_mixer_handles[idx] == OF_MIXER_HANDLE_INVALID &&
+        !S_MixerStartChannel(idx))
+        return;
+
+    S_MixerApplyChannelVolume(idx);
+}
+
+static qboolean S_MixerChannelStopped(int idx)
+{
+    return channel_mixer_handles[idx] == OF_MIXER_HANDLE_INVALID;
+}
+#else
+#define S_MixerChannelStopped(idx)  true
 #endif
 
 sfx_t *S_FindName(char *name)
@@ -338,10 +368,95 @@ sfx_t *S_FindName(char *name)
 // Spatialization
 // ====================================================================
 
+// Truncate m * b / 2^sh toward zero; |m * b| < 2^53, sh >= 27.
+static int SND_TruncShift(uint32_t m, int32_t b, int sh)
+{
+    uint64_t p = (uint64_t)m * (uint32_t)(b < 0 ? -b : b);
+    int v = sh < 64 ? (int)(p >> sh) : 0;
+
+    return b < 0 ? -v : v;
+}
+
+// (int)(a * (1.0 + dot)) and (int)(a * (1.0 - dot)) without double
+// arithmetic.  For 0 <= a < 2^20 and 2^-5 <= |dot| < 2 both products are
+// exact in double (at most 24 + 29 significant bits), so truncation is a
+// shift of the integer significand product.  Returns false outside that range.
+static qboolean SND_TruncPan(float a, float dot, int *left, int *right)
+{
+    union { float f; uint32_t u; } fa, fd;
+    uint32_t ma, md;
+    int32_t one, bplus, bminus;
+    int ea, ed, sh;
+
+    fa.f = a;
+    fd.f = dot;
+    ea = fa.u >> 23;                // sign bit set -> out of range
+    ed = (fd.u >> 23) & 0xff;
+    if (ea > 146 || ed < 122 || ed > 127)
+        return false;
+    if (ea == 0) {
+        if (fa.u)                   // subnormal
+            return false;
+        *left = *right = 0;
+        return true;
+    }
+
+    ma = (fa.u & 0x7fffff) | 0x800000;
+    md = (fd.u & 0x7fffff) | 0x800000;
+    one = 1 << (150 - ed);          // dot = +-md / one
+    sh = 300 - ea - ed;             // a * (1 +- dot) = ma * (one +- md) / 2^sh
+    bplus = one + md;
+    bminus = one - (int32_t)md;
+    if (fd.u >> 31) {
+        *right = SND_TruncShift(ma, bminus, sh);
+        *left = SND_TruncShift(ma, bplus, sh);
+    } else {
+        *right = SND_TruncShift(ma, bplus, sh);
+        *left = SND_TruncShift(ma, bminus, sh);
+    }
+    return true;
+}
+
+static void SND_ResetTravel(void)
+{
+    int i;
+
+    snd_travel = 0;
+    VectorCopy(listener_origin, snd_travel_origin);
+    for (i = 0; i < MAX_CHANNELS; i++)
+        snd_reject_travel[i] =
+            (i >= MAX_DYNAMIC_CHANNELS + NUM_AMBIENTS && !channels[i].sfx) ?
+            SND_TRAVEL_NEVER : 0;
+}
+
+// Listener travel, in 1/16 units, that must happen before ch can come back
+// inside its attenuation radius; 0 when it could be audible next frame.
+// 1.0005/dist_mult over-states the radius and the result is cut to 15/16, so
+// a stamped channel is still well past the d2 * dist_mult^2 > 1.0002 reject.
+static int SND_RejectTravel(channel_t *ch)
+{
+    vec3_t source_vec;
+    vec_t slack;
+
+    if (ch->entnum != 0 || !(ch->dist_mult > 0))
+        return 0;
+
+    VectorSubtract(ch->origin, listener_origin, source_vec);
+    slack = sqrtf(DotProduct(source_vec, source_vec)) - 1.0005f / ch->dist_mult;
+    if (!(slack > 1.0f))
+        return 0;
+    if (slack > 0x100000)
+        slack = 0x100000;
+
+    return (int)(slack * 15.0f);
+}
+
 void SND_Spatialize(channel_t *ch)
 {
+    union { float f; uint32_t u; } vol;
     vec_t dist;
     vec_t scale;
+    vec_t a;
     vec3_t source_vec;
 
     // Anything coming from the view entity will always be full volume
@@ -353,9 +468,26 @@ void SND_Spatialize(channel_t *ch)
     // Distance attenuation + stereo panning
     VectorSubtract(ch->origin, listener_origin, source_vec);
 
+    // Well past the attenuation radius both volumes truncate to 0
+    if (ch->dist_mult > 0 && volume.value >= 0) {
+        vec_t d2 = DotProduct(source_vec, source_vec);
+        if (d2 * (ch->dist_mult * ch->dist_mult) > 1.0002f) {
+            ch->leftvol = ch->rightvol = 0;
+            return;
+        }
+    }
+
     dist = VectorNormalize(source_vec) * ch->dist_mult;
 
-    scale = (1.0 - dist) * volume.value;
+    // (1.0 - dist) * volume is exact in double when volume is finite and
+    // dist is 0 or in [2^-6, 2^24], so a single fused float op rounds it
+    // to the same float
+    vol.f = volume.value;
+    if ((vol.u & 0x7f800000) != 0x7f800000 &&
+        (dist == 0 || (dist >= 0.015625f && dist <= 16777216.0f)))
+        scale = fmaf(-dist, volume.value, volume.value);
+    else
+        scale = (1.0 - dist) * volume.value;
     if (scale < 0) scale = 0;
 
     // Stereo panning: dot product with listener right vector
@@ -365,8 +497,11 @@ void SND_Spatialize(channel_t *ch)
 
     // dot = -1..1: center sounds are full volume in both channels,
     // hard-panned sounds reach 2x in one channel (matches original Quake)
-    ch->rightvol = (int)(ch->master_vol * scale * (1.0 + dot));
-    ch->leftvol  = (int)(ch->master_vol * scale * (1.0 - dot));
+    a = ch->master_vol * scale;
+    if (!SND_TruncPan(a, dot, &ch->leftvol, &ch->rightvol)) {
+        ch->rightvol = (int)(a * (1.0 + dot));
+        ch->leftvol  = (int)(a * (1.0 - dot));
+    }
 }
 
 // ====================================================================
@@ -592,7 +727,7 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin,
         if (check == target_chan)
             continue;
         if (check->sfx == sfx && !check->pos) {
-            skip = rand() % (int)(0.1 * shm->speed);
+            skip = rand() % (shm->speed / 10);
             if (skip >= target_chan->end - paintedtime)
                 skip = target_chan->end - paintedtime - 1;
             target_chan->pos += skip;
@@ -644,6 +779,7 @@ void S_StopAllSounds(qboolean clear)
     }
 
     memset(channels, 0, MAX_CHANNELS * sizeof(channel_t));
+    SND_ResetTravel();
 
     if (clear)
         S_ClearBuffer();
@@ -680,6 +816,7 @@ void S_StaticSound(sfx_t *sfx, vec3_t origin, float vol, float attenuation)
     }
 
     ss = &channels[total_channels];
+    snd_reject_travel[total_channels] = SND_TRAVEL_NEVER;
     total_channels++;
 
     sc = S_LoadSound(sfx);
@@ -691,6 +828,7 @@ void S_StaticSound(sfx_t *sfx, vec3_t origin, float vol, float attenuation)
         return;
     }
 
+    snd_reject_travel[ss - channels] = 0;
     ss->sfx = sfx;
     VectorCopy(origin, ss->origin);
     ss->master_vol = vol;
@@ -718,8 +856,10 @@ static void S_UpdateAmbientSounds(void)
     if (!cl.worldmodel)
         return;
 
-    l = Mod_PointInLeaf(listener_origin, cl.worldmodel);
-    if (!l || !ambient_level.value) {
+    l = NULL;
+    if (ambient_level.value)
+        l = Mod_PointInLeaf(listener_origin, cl.worldmodel);
+    if (!l) {
         for (ambient_channel = 0; ambient_channel < NUM_AMBIENTS; ambient_channel++) {
 #if SND_USE_HW_MIXER
             S_MixerStopChannel(ambient_channel);
@@ -783,8 +923,10 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
 {
     int i, j;
     int total;
+    int travel;
     channel_t *ch;
     channel_t *combine;
+    vec3_t listener_move;
     int endtime;
     int samps;
 
@@ -803,16 +945,40 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
     // Update ambient sounds
     S_UpdateAmbientSounds();
 
+    // Advance the static-channel reject cache by this frame's listener travel.
+    // Its stamps assume entnum 0 is not the view entity and volume is positive
+    VectorSubtract(listener_origin, snd_travel_origin, listener_move);
+    travel = (int)(sqrtf(DotProduct(listener_move, listener_move)) * 16.0f + 1.0f);
+    if (travel > 0 && snd_travel < SND_TRAVEL_MAX - travel &&
+        volume.value >= 0 && cl.viewentity) {
+        snd_travel += travel;
+        VectorCopy(listener_origin, snd_travel_origin);
+    } else {
+        SND_ResetTravel();
+    }
+
     // Update spatialization for all sounds
     combine = NULL;
 
     for (i = NUM_AMBIENTS; i < total_channels; i++) {
+        // A stamped static is silent, stopped and cannot be reached yet
+        if (i >= MAX_DYNAMIC_CHANNELS + NUM_AMBIENTS &&
+            snd_travel < snd_reject_travel[i])
+            continue;
+
         ch = &channels[i];
         if (!ch->sfx)
             continue;
+
         SND_Spatialize(ch);
-        if (!ch->leftvol && !ch->rightvol)
+        if (!ch->leftvol && !ch->rightvol) {
+            // stamp it once its voice is gone, so the skip can stand in for
+            // the sync pass too
+            if (i >= MAX_DYNAMIC_CHANNELS + NUM_AMBIENTS &&
+                S_MixerChannelStopped(i))
+                snd_reject_travel[i] = snd_travel + SND_RejectTravel(ch);
             continue;
+        }
 
         // Try to combine static sounds with a previous channel of the same
         // sound effect so we don't mix five torches every frame
@@ -821,6 +987,7 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
             if (combine && combine->sfx == ch->sfx) {
                 combine->leftvol += ch->leftvol;
                 combine->rightvol += ch->rightvol;
+                snd_reject_travel[combine - channels] = 0;
                 ch->leftvol = ch->rightvol = 0;
                 continue;
             }
@@ -837,6 +1004,7 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
                 if (combine != ch) {
                     combine->leftvol += ch->leftvol;
                     combine->rightvol += ch->rightvol;
+                    snd_reject_travel[j] = 0;
                     ch->leftvol = ch->rightvol = 0;
                 }
                 continue;
@@ -845,8 +1013,18 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
     }
 
 #if SND_USE_HW_MIXER
-    for (i = 0; i < total_channels; i++)
-        S_MixerSyncChannel(i);
+    total = total_channels;
+    if (total > MAX_CHANNELS)
+        total = MAX_CHANNELS;
+    for (i = 0; i < total && i < NUM_AMBIENTS; i++)
+        S_MixerSyncLooping(i);
+    for (; i < total && i < NUM_AMBIENTS + MAX_DYNAMIC_CHANNELS; i++)
+        S_MixerSyncDynamic(i);
+    for (; i < total; i++) {
+        if (snd_travel < snd_reject_travel[i])
+            continue;               // stamped: silent and already stopped
+        S_MixerSyncLooping(i);
+    }
     return;
 #endif
 

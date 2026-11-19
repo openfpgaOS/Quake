@@ -39,7 +39,9 @@ qpic_t		*draw_disc;
 qpic_t		*draw_backtile;
 
 static byte draw_chars_keyed[128 * 128] __attribute__((aligned(64)));
-static byte draw_fade_pattern[8] __attribute__((aligned(64))) = {
+// a full cache line to itself: the GPU reads this 4x2 pattern, so no
+// CPU-written variable may share the line and re-dirty it after the clean
+static byte draw_fade_pattern[64] __attribute__((aligned(64))) = {
 	TRANSPARENT_COLOR, 0, 0, 0,
 	0, 0, TRANSPARENT_COLOR, 0
 };
@@ -52,9 +54,13 @@ static byte draw_fade_pattern[8] __attribute__((aligned(64))) = {
 static byte draw_textline_buffers[DRAW_TEXTLINE_BUFFERS]
 	[DRAW_TEXTLINE_MAX_CHARS * 8 * 8] __attribute__((aligned(64)));
 static int draw_textline_buffer_next;
+static unsigned draw_textline_epoch;
 static byte draw_translate_row_buffers[DRAW_TRANSLATE_ROW_BUFFERS]
 	[DRAW_TRANSLATE_MAX_WIDTH] __attribute__((aligned(64)));
 static int draw_translate_row_buffer_next;
+static unsigned draw_translate_row_epoch;
+
+extern unsigned d_scratch_epoch;	// d_scan.c: bumped by every scratch-pool flush
 
 //=============================================================================
 /* Support Routines */
@@ -294,10 +300,16 @@ void Draw_Character (int x, int y, int num)
 
 static byte *Draw_AllocTextLineBuffer (void)
 {
+	if (draw_textline_epoch != d_scratch_epoch)
+	{
+		draw_textline_epoch = d_scratch_epoch;
+		draw_textline_buffer_next = 0;
+	}
 	if (draw_textline_buffer_next >= DRAW_TEXTLINE_BUFFERS)
 	{
 		of_emit_finish();
 		of_emit_texture_cache_flush();
+		draw_textline_epoch = ++d_scratch_epoch;
 		draw_textline_buffer_next = 0;
 	}
 
@@ -306,10 +318,16 @@ static byte *Draw_AllocTextLineBuffer (void)
 
 static byte *Draw_AllocTranslateRowBuffer (void)
 {
+	if (draw_translate_row_epoch != d_scratch_epoch)
+	{
+		draw_translate_row_epoch = d_scratch_epoch;
+		draw_translate_row_buffer_next = 0;
+	}
 	if (draw_translate_row_buffer_next >= DRAW_TRANSLATE_ROW_BUFFERS)
 	{
 		of_emit_finish();
 		of_emit_texture_cache_flush();
+		draw_translate_row_epoch = ++d_scratch_epoch;
 		draw_translate_row_buffer_next = 0;
 	}
 
@@ -328,17 +346,17 @@ static void Draw_StringChunk8 (int x, int y, char *str, int len,
 	pitch = len * 8;
 	scratch = Draw_AllocTextLineBuffer ();
 
-	for (row=0 ; row<drawline ; row++)
+	/* char outer, row inner: the glyph base address is computed once per
+	 * character instead of once per character and row */
+	for (col=0 ; col<len ; col++)
 	{
-		byte *dst = scratch + row * pitch;
-		for (col=0 ; col<len ; col++)
-		{
-			int ch = str[col] & 255;
-			byte *src = draw_chars_keyed +
-				((ch >> 4) << 10) + ((ch & 15) << 3) +
-				(src_row + row) * 128;
-			memcpy (dst + col * 8, src, 8);
-		}
+		int ch = str[col] & 255;
+		byte *src = draw_chars_keyed +
+			((ch >> 4) << 10) + ((ch & 15) << 3) + src_row * 128;
+		byte *dst = scratch + col * 8;
+
+		for (row=0 ; row<drawline ; row++, src += 128, dst += pitch)
+			memcpy (dst, src, 8);
 	}
 
 	of_emit_cache_clean(scratch, (uint32_t)(pitch * drawline));

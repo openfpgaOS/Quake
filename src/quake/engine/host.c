@@ -538,6 +538,7 @@ void Host_ClearMemory (void)
 	cls.signon = 0;
 	memset (&sv, 0, sizeof(sv));
 	memset (&cl, 0, sizeof(cl));
+	memset (cl_entlive, 0, sizeof(cl_entlive));	// cl.num_entities went to 0
 }
 
 
@@ -555,7 +556,7 @@ qboolean Host_FilterTime (float time)
 {
 	realtime += time;
 
-	if (!cls.timedemo && realtime - oldrealtime < 1.0/72.0)
+	if (!cls.timedemo && realtime - oldrealtime < 1.0f/72.0f)
 		return false;		// framerate is too high
 
 	host_frametime = realtime - oldrealtime;
@@ -685,23 +686,27 @@ Runs all active servers
 */
 void _Host_Frame (float time)
 {
-	static float		time1 = 0;
-	static float		time2 = 0;
-	static float		time3 = 0;
 	/* host_speeds: per-second averaged render trace to UART (us/frame) */
-	static double		perf_srv = 0, perf_gfx = 0, perf_tot = 0;
-	static double		perf_gwait = 0, perf_gworld = 0, perf_g2d = 0, perf_gpresent = 0;
-	static double		perf_setup = 0, perf_redge = 0, perf_ralias = 0, perf_rview = 0, perf_rpart = 0, perf_rwarp = 0;
-	static double		perf_rworld = 0, perf_bent = 0, perf_scan = 0, perf_surf = 0;
-	static double		perf_scache = 0, perf_sz = 0, perf_ssky = 0, perf_sturb = 0;
-	static double		perf_smiss = 0;
-	static int		perf_frames = 0;
-	static float		perf_anchor = 0;
+	static struct
+	{
+		unsigned	srv, gfx, snd, tot;
+		unsigned	gwait, gworld, g2d, gpresent;
+		unsigned	setup, redge, ralias, rview, rpart, rwarp;
+		unsigned	rworld, bent, scan, surf;
+		unsigned	scache, sz, ssky, sturb;
+		unsigned	smiss, polys;
+		unsigned	frames;
+	} perf;
+	static unsigned		time1, time2, time3;	// Sys_Micros stamps
+	static unsigned		perf_anchor;			// window start
+	static unsigned		perf_trace;				// last window's print time
+	static int			perf_lastframe = -2;
 	extern float		scr_t_wait, scr_t_world, scr_t_2d, scr_t_present;
 	extern float		r_t_setup, r_t_edges, r_t_alias, r_t_view, r_t_part, r_t_warp;
 	extern float		r_t_rworld, r_t_bent, r_t_scan, r_t_surf;
 	extern float		r_t_surfcache, r_t_surfz, r_t_surfsky, r_t_surfturb;
 	extern int		r_c_surfmiss;
+	extern unsigned	Sys_Micros (void);
 
 	if (setjmp (host_abortserver) )
 		return;			// something bad happened, or the server disconnected
@@ -761,12 +766,21 @@ void _Host_Frame (float time)
 
 // update video
 	if (host_speeds.value)
-		time1 = Sys_FloatTime ();
+	{
+		// phases skipped this frame must read 0, not last frame's time
+		scr_t_wait = scr_t_world = scr_t_2d = scr_t_present = 0;
+		r_t_setup = r_t_edges = r_t_alias = r_t_view = r_t_part = r_t_warp = 0;
+		r_t_rworld = r_t_bent = r_t_scan = r_t_surf = 0;
+		r_t_surfcache = r_t_surfz = r_t_surfsky = r_t_surfturb = 0;
+		r_c_surfmiss = 0;
+		r_drawnpolycount = 0;
+		time1 = Sys_Micros ();
+	}
 		
 	SCR_UpdateScreen ();
 
 	if (host_speeds.value)
-		time2 = Sys_FloatTime ();
+		time2 = Sys_Micros ();
 		
 // update audio
 	if (cls.signon == SIGNONS)
@@ -781,70 +795,80 @@ void _Host_Frame (float time)
 
 	if (host_speeds.value)
 	{
-		float	fsrv, fgfx, fnow, ftot;
+		unsigned	now = Sys_Micros ();
 
-		fsrv = time1 - time3;		/* time3 = previous frame end */
-		fnow = Sys_FloatTime ();
-		ftot = fnow - time3;		/* whole frame */
-		time3 = fnow;
-		fgfx = time2 - time1;		/* SCR_UpdateScreen (render) */
-
+#define US(x)	((x) > 0 ? (unsigned)((x) * 1.0e6f + 0.5f) : 0u)
+		if (host_framecount != perf_lastframe + 1)
+		{	// first traced frame: no previous frame end, start a new window
+			memset (&perf, 0, sizeof(perf));
+			perf_anchor = now;
+			perf_trace = 0;
+		}
+		else
 		{
-			/* Accumulate; emit once per ~second so the UART stays readable. */
-			perf_srv += fsrv * 1.0e6; perf_gfx += fgfx * 1.0e6;
-			perf_tot += ftot * 1.0e6;
-			perf_gwait += scr_t_wait * 1.0e6; perf_gworld += scr_t_world * 1.0e6;
-			perf_g2d += scr_t_2d * 1.0e6; perf_gpresent += scr_t_present * 1.0e6;
-			perf_setup += r_t_setup * 1.0e6;
-			perf_redge += r_t_edges * 1.0e6; perf_ralias += r_t_alias * 1.0e6;
-			perf_rview += r_t_view * 1.0e6;  perf_rpart += r_t_part * 1.0e6;
-			perf_rwarp += r_t_warp * 1.0e6;
-			perf_rworld += r_t_rworld * 1.0e6; perf_bent += r_t_bent * 1.0e6;
-			perf_scan += r_t_scan * 1.0e6;     perf_surf += r_t_surf * 1.0e6;
-			perf_scache += r_t_surfcache * 1.0e6; perf_sz += r_t_surfz * 1.0e6;
-			perf_ssky += r_t_surfsky * 1.0e6;  perf_sturb += r_t_surfturb * 1.0e6;
-			perf_smiss += (double)r_c_surfmiss;
-			perf_frames++;
-			if (fnow - perf_anchor >= 1.0f && perf_frames > 0)
-			{
-				float	n = (float)perf_frames;
-				float	win = fnow - perf_anchor;
-				/* Sys_Printf, not Con_Printf: the trace is on by
-				 * default and Con_Printf would park 5 notify lines on
-				 * screen every second.  UART/system console only. */
-				Sys_Printf ("[perf] %4.1f fps | srv %5.0f gfx %5.0f tot %5.0f us/fr (avg %d fr)\n",
-					perf_frames / win, perf_srv / n, perf_gfx / n,
-					perf_tot / n, perf_frames);
-				Sys_Printf ("[gfx]  wait %5.0f world %5.0f 2d %5.0f present %5.0f us/fr\n",
-					perf_gwait / n, perf_gworld / n, perf_g2d / n, perf_gpresent / n);
-				Sys_Printf ("[wrld] setup %5.0f edges %5.0f alias %5.0f weap %5.0f part %5.0f warp %5.0f\n",
-					perf_setup / n, perf_redge / n, perf_ralias / n,
-					perf_rview / n, perf_rpart / n, perf_rwarp / n);
-				Sys_Printf ("[edge] rworld %5.0f bent %5.0f scan %5.0f (surf %5.0f) us/fr\n",
-					perf_rworld / n, perf_bent / n, perf_scan / n, perf_surf / n);
-				/* emit = remainder of [surf]: D_CalcGradients + Q29 setup +
-				 * param-span submit + per-surface loop overhead.  Only the
-				 * rare paths are bracketed directly, so the common path adds
-				 * no measurement cost. */
-				{
-					double surf_other = (perf_surf - perf_scache - perf_sz
-						- perf_ssky - perf_sturb) / n;
-					if (surf_other < 0) surf_other = 0;
-					Sys_Printf ("[surf] cache %5.0f emit %5.0f z %5.0f sky %5.0f turb %5.0f (miss %3.0f/fr)\n",
-						perf_scache / n, surf_other, perf_sz / n,
-						perf_ssky / n, perf_sturb / n, perf_smiss / n);
-				}
-				perf_srv = perf_gfx = perf_tot = 0;
-				perf_gwait = perf_gworld = perf_g2d = perf_gpresent = 0;
-				perf_setup = perf_redge = perf_ralias = perf_rview = perf_rpart = perf_rwarp = 0;
-				perf_rworld = perf_bent = perf_scan = perf_surf = 0;
-				perf_scache = perf_sz = perf_ssky = perf_sturb = perf_smiss = 0;
-				perf_frames = 0;
-				perf_anchor = fnow;
-			}
+			/* snd = S_Update + CL_DecayLights + CDAudio_Update; mixing
+			 * done inside the render is counted in gfx */
+			perf.srv += time1 - time3;		/* time3 = previous frame end */
+			perf.gfx += time2 - time1;		/* SCR_UpdateScreen (render) */
+			perf.snd += now - time2;
+			perf.tot += now - time3;		/* whole frame */
+			perf.gwait += US(scr_t_wait); perf.gworld += US(scr_t_world);
+			perf.g2d += US(scr_t_2d); perf.gpresent += US(scr_t_present);
+			perf.setup += US(r_t_setup);
+			perf.redge += US(r_t_edges); perf.ralias += US(r_t_alias);
+			perf.rview += US(r_t_view);  perf.rpart += US(r_t_part);
+			perf.rwarp += US(r_t_warp);
+			perf.rworld += US(r_t_rworld); perf.bent += US(r_t_bent);
+			perf.scan += US(r_t_scan);     perf.surf += US(r_t_surf);
+			perf.scache += US(r_t_surfcache); perf.sz += US(r_t_surfz);
+			perf.ssky += US(r_t_surfsky);  perf.sturb += US(r_t_surfturb);
+			perf.smiss += r_c_surfmiss;
+			perf.polys += r_drawnpolycount;
+			perf.frames++;
+		}
+#undef US
+		perf_lastframe = host_framecount;
+		time3 = now;
+
+		/* Accumulate; emit once per ~second so the UART stays readable. */
+		if (now - perf_anchor >= 1000000u && perf.frames > 0)
+		{
+			unsigned	n = perf.frames;
+			unsigned	win = (now - perf_anchor) / 100;	// 100 us units
+			unsigned	fps10 = (n * 100000 + win / 2) / win;
+			int			emit;
+
+#define AVG(x)	(((x) + n / 2) / n)
+			/* Sys_Printf, not Con_Printf: the trace is on by
+			 * default and Con_Printf would park 5 notify lines on
+			 * screen every second.  UART/system console only. */
+			Sys_Printf ("[perf] %2u.%u fps | srv %5u gfx %5u tot %5u us/fr (avg %u fr) | snd %5u us/fr, trace %u us\n",
+				fps10 / 10, fps10 % 10, AVG(perf.srv), AVG(perf.gfx),
+				AVG(perf.tot), n, AVG(perf.snd), perf_trace);
+			Sys_Printf ("[gfx]  wait %5u world %5u 2d %5u present %5u us/fr\n",
+				AVG(perf.gwait), AVG(perf.gworld), AVG(perf.g2d), AVG(perf.gpresent));
+			Sys_Printf ("[wrld] setup %5u edges %5u alias %5u weap %5u part %5u warp %5u\n",
+				AVG(perf.setup), AVG(perf.redge), AVG(perf.ralias),
+				AVG(perf.rview), AVG(perf.rpart), AVG(perf.rwarp));
+			Sys_Printf ("[edge] rworld %5u bent %5u scan %5u (surf %5u) us/fr\n",
+				AVG(perf.rworld), AVG(perf.bent), AVG(perf.scan), AVG(perf.surf));
+			/* emit = remainder of [surf]: D_CalcGradients + Q29 setup +
+			 * param-span submit + per-surface loop overhead.  Only the
+			 * rare paths are bracketed directly, so the common path adds
+			 * no measurement cost. */
+			emit = (int)(perf.surf - perf.scache - perf.sz - perf.ssky - perf.sturb);
+			Sys_Printf ("[surf] cache %5u emit %5u z %5u sky %5u turb %5u (miss %3u/fr) polys %4u\n",
+				AVG(perf.scache), emit > 0 ? AVG((unsigned)emit) : 0u, AVG(perf.sz),
+				AVG(perf.ssky), AVG(perf.sturb), AVG(perf.smiss), AVG(perf.polys));
+#undef AVG
+			memset (&perf, 0, sizeof(perf));
+			perf_anchor = now;
+			// keep the print out of the next frame's srv/tot
+			time3 = Sys_Micros ();
+			perf_trace = time3 - now;
 		}
 	}
-	
+
 	host_framecount++;
 
 }

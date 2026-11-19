@@ -289,20 +289,162 @@ if (sides == 0)
 #endif
 
 
+/*
+=================
+DegMod360
+
+The angle modulo 360 for a magnitude too large for the 90-degree reduction
+below to stay exact.  Such a float is a 24-bit integer times 2^e with e >= -6,
+so the reduction runs on the mantissa and is exact.  Infinities and NaN have
+no angle and come back as 0.
+=================
+*/
+static __attribute__((noinline)) float DegMod360 (unsigned bits)
+{
+	union { float f; unsigned i; }	sc;
+	unsigned	m, p, q;
+	int			e;
+
+	e = (int)((bits >> 23) & 0xff);
+	if (e == 0xff)
+		return 0;
+	m = (bits & 0x7fffff) | 0x800000;
+	e -= 150;						// |deg| = m * 2^e
+	if (e < 0)
+	{
+		q = m % (360u << -e);
+		sc.i = (unsigned)(127 + e) << 23;		// 2^e, so q * 2^e is exact
+		return (bits & 0x80000000) ? -(float)q * sc.f : (float)q * sc.f;
+	}
+	for (p = 1 ; e > 0 ; e--)		// 2^e mod 360
+	{
+		p += p;
+		if (p >= 360)
+			p -= 360;
+	}
+	q = (m % 360) * p % 360;
+	return (bits & 0x80000000) ? -(float)q : (float)q;
+}
+
+/*
+=================
+SinCosPoly
+
+sin and cos of r degrees (|r| <= 45.02) shifted by n quadrants, from a float
+minimax polynomial in r.  Worst case over every float in range: 0.70 ulp on
+sin, 0.90 ulp on cos.  The quadrant is applied as a swap and two sign flips.
+=================
+*/
+#define SD1H	 1.745329238e-02f		// pi/180, in two parts
+#define SD1L	 1.351996015e-10f
+#define SD3		-8.860952789e-07f
+#define SD5		 1.349386401e-11f
+#define SD7		-9.620557863e-17f
+#define CD2		-1.523087121e-04f
+#define CD4		 3.866323262e-09f
+#define CD6		-3.925460353e-14f
+#define CD8		 2.106266537e-19f
+
+static inline __attribute__((always_inline)) void SinCosPoly (float r, int n, float *s, float *c)
+{
+	union { float f; unsigned i; }	a, b;
+	unsigned	d;
+	float		u, ps, pc;
+
+	u = r * r;
+	ps = fmaf (u, SD7, SD5);
+	pc = fmaf (u, CD8, CD6);
+	ps = fmaf (u, ps, SD3);
+	pc = fmaf (u, pc, CD4);
+	ps = fmaf (u, ps, SD1L);
+	pc = fmaf (u, pc, CD2);
+	a.f = fmaf (r, SD1H, r * ps);
+	b.f = fmaf (u, pc, 1.0f);
+
+	d = (a.i ^ b.i) & (unsigned)-(n & 1);		// odd quadrant: swap
+	a.i ^= d;
+	b.i ^= d;
+	a.i ^= (unsigned)(n & 2) << 30;				// sin < 0 in quadrants 2, 3
+	b.i ^= (unsigned)((n + 1) & 2) << 30;		// cos < 0 in quadrants 1, 2
+	*s = a.f;
+	*c = b.f;
+}
+
+/*
+=================
+SinCosDeg
+
+sin and cos of an angle in degrees.  musl's sinf and cosf evaluate a double
+polynomial, which is soft-float here; this reduces the angle to a quadrant and
+evaluates a float one.  Results differ from libm in the last ulp.
+=================
+*/
+static inline __attribute__((always_inline)) void SinCosDeg (float deg, float *s, float *c)
+{
+	union { float f; unsigned i; }	u;
+	int		n;
+
+	u.f = deg;
+	if ((u.i & 0x7fffffff) >= 0x48000000)		// 2^17 degrees, inf or NaN
+		deg = DegMod360 (u.i);
+	n = lrintf (deg * (1.0f/90.0f));			// quadrant; deg - n*90 is exact
+	SinCosPoly (deg - (float)n * 90.0f, n, s, c);
+}
+
+/*
+=================
+PQ_SinRad
+
+sin of an angle in radians.  Cody-Waite reduction, then the same kind of float
+polynomial: 0.62 ulp from the polynomial itself, 1.42 ulp up to 2 pi and 2.47
+ulp at the top of the range once the reduction's own error is in.  Angles past
+2^15 rad, where that reduction would lose the low bits, stay on libm.
+=================
+*/
+#define SR3		-1.666665077e-01f
+#define SR5		 8.332016878e-03f
+#define SR7		-1.950151054e-04f
+#define CR2		-5.000000000e-01f
+#define CR4		 4.166664928e-02f
+#define CR6		-1.388758537e-03f
+#define CR8		 2.446249164e-05f
+
+float PQ_SinRad (float x)
+{
+	union { float f; unsigned i; }	a, b;
+	float	fn, r, v, ps, pc;
+	int		n;
+
+	a.f = x;
+	if ((a.i & 0x7fffffff) >= 0x47000000)		// 2^15 radians, inf or NaN
+		return sinf (x);
+	n = lrintf (x * 6.36619747e-01f);			// 2/pi
+	fn = -(float)n;
+	r = fmaf (fn, 1.57031250e+00f, x);			// pi/2 in three parts
+	r = fmaf (fn, 4.83826792e-04f, r);
+	r = fmaf (fn, 2.56334407e-12f, r);
+
+	v = r * r;
+	ps = fmaf (v, SR7, SR5);
+	pc = fmaf (v, CR8, CR6);
+	ps = fmaf (v, ps, SR3);
+	pc = fmaf (v, pc, CR4);
+	pc = fmaf (v, pc, CR2);
+	a.f = fmaf (r * v, ps, r);
+	b.f = fmaf (v, pc, 1.0f);
+
+	a.i ^= (a.i ^ b.i) & (unsigned)-(n & 1);	// odd quadrant: cos
+	a.i ^= (unsigned)(n & 2) << 30;
+	return a.f;
+}
+
 PQ_HOT void AngleVectors (vec3_t angles, vec3_t forward, vec3_t right, vec3_t up)
 {
-	float		angle;
 	float		sr, sp, sy, cr, cp, cy;
-	
-	angle = angles[YAW] * (float)(M_PI / 180.0);
-	sy = sinf(angle);
-	cy = cosf(angle);
-	angle = angles[PITCH] * (float)(M_PI / 180.0);
-	sp = sinf(angle);
-	cp = cosf(angle);
-	angle = angles[ROLL] * (float)(M_PI / 180.0);
-	sr = sinf(angle);
-	cr = cosf(angle);
+
+	SinCosDeg (angles[YAW], &sy, &cy);
+	SinCosDeg (angles[PITCH], &sp, &cp);
+	SinCosDeg (angles[ROLL], &sr, &cr);
 
 	forward[0] = cp*cy;
 	forward[1] = cp*sy;

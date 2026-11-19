@@ -67,30 +67,39 @@ float	fv;
 
 /*
 ==============
-Array-based Active Edge Table (AET) — Structure-of-Arrays layout
+Array-based Active Edge Table (AET)
 
-SoA splits hot fields into separate arrays for optimal cache utilization
-on VexiiRiscv's single-issue in-order pipeline.  R_StepRemoveEdges_Array
-only touches aet_v_end[], aet_u[] and aet_u_step[] (small sequential
-loads instead of 16-byte structs).  aet_surfs[] is only accessed in
-GenerateSpans.
-
-sort_keys[] mirrors aet_u[aet_order[i]] so the insertion sort inner loop
-uses a direct array compare instead of a double-indirected struct load,
-eliminating a 3-4 cycle dependent-load stall per comparison.
+One 16-byte record per active edge, kept sorted by u.  Both per-scanline
+walks then run sequentially off a single pointer with no dependent load:
+R_StepRemoveEdges_Array reads u/u_step/v_end, R_GenerateSpans_Array reads
+u and the two surface indices.  The surface indices ride in the sorted
+record (packed into one word), so the scanline walk no longer gathers
+through an order[] -> pool[] indirection.
 ==============
 */
-static fixed16_t     aet_u[NUMSTACKEDGES];         // 12.20 fixed-point x position
-static fixed16_t     aet_u_step[NUMSTACKEDGES];    // per-scanline x step
-static unsigned short aet_surfs[NUMSTACKEDGES][2];  // surface indices [0]=trailing [1]=leading
-static unsigned short aet_v_end[NUMSTACKEDGES];     // last scanline this edge is active
-static int aet_order[NUMSTACKEDGES];                // sorted indices into pool arrays
-static int sort_keys[NUMSTACKEDGES];                // cached u values in sorted order
-static int aet_count;                                // number of active edges
-static int aet_alloc;                                // next free pool slot (monotonic within frame)
+typedef struct
+{
+	fixed16_t		u;			// 12.20 fixed-point x position
+	fixed16_t		u_step;		// per-scanline x step
+	unsigned int	surfs;		// surfs[0] | surfs[1]<<16 ([0]=trailing [1]=leading)
+	unsigned int	v_end;		// last scanline this edge is active
+} aetedge_t;
+
+static aetedge_t	aet[NUMSTACKEDGES];
+static int			aet_count;	// number of active edges
 
 // Store v_end in edge_t->prev (unused by array-based AET, same cache line as u/surfs)
 #define EDGE_V_END(e)  ((unsigned short)(unsigned long)((e)->prev))
+
+// edge_t.surfs is two shorts at a word-aligned offset; fetch the pair as
+// one word (the assume_aligned keeps it a single load)
+static inline unsigned int EdgeSurfs32 (const edge_t *e)
+{
+	unsigned int	w;
+
+	memcpy (&w, __builtin_assume_aligned (e->surfs, 4), sizeof(w));
+	return w;
+}
 
 // Array-based AET functions
 void R_InsertNewEdges_Array (edge_t *edgestoadd);
@@ -235,8 +244,9 @@ Merge sorted newedges linked list into sorted aet[] array.
 */
 PQ_FASTTEXT void R_InsertNewEdges_Array (edge_t *edgestoadd)
 {
-	edge_t *rev, *next;
-	int new_count, first_new, i, k, n;
+	edge_t		*rev, *next;
+	aetedge_t	*src, *dst;
+	int			new_count;
 
 	// Reverse linked list to get descending u order for right-to-left merge.
 	rev = NULL;
@@ -250,44 +260,26 @@ PQ_FASTTEXT void R_InsertNewEdges_Array (edge_t *edgestoadd)
 		edgestoadd = next;
 	}
 
-	// Append new entries to pool (SoA layout)
-	first_new = aet_alloc;
-	n = new_count - 1;
+	// Right-to-left merge straight into the sorted records: existing
+	// entries are sorted ascending by u, the reversed list is descending.
+	src = &aet[aet_count];
+	aet_count += new_count;
+	dst = &aet[aet_count];
+
 	while (rev)
 	{
-		int idx = aet_alloc++;
-		aet_u[idx]       = rev->u;
-		aet_u_step[idx]  = rev->u_step;
-		aet_surfs[idx][0] = rev->surfs[0];
-		aet_surfs[idx][1] = rev->surfs[1];
-		aet_v_end[idx]   = EDGE_V_END(rev);
+		int		nu = rev->u;
+
+		while (src > aet && src[-1].u > nu)
+			*--dst = *--src;
+
+		--dst;
+		dst->u = nu;
+		dst->u_step = rev->u_step;
+		dst->surfs = EdgeSurfs32 (rev);
+		dst->v_end = EDGE_V_END(rev);
 		rev = rev->next;
 	}
-
-	// Right-to-left merge into aet_order[] + sort_keys[]:
-	// Existing entries are sorted ascending by u.  New entries at
-	// pool indices first_new..first_new+new_count-1 are in descending
-	// u order (from reversed list).
-	i = aet_count - 1;
-	k = aet_count + new_count - 1;
-	n = 0;
-
-	while (n < new_count)
-	{
-		if (i >= 0 && sort_keys[i] > aet_u[first_new + n])
-		{
-			sort_keys[k] = sort_keys[i];
-			aet_order[k--] = aet_order[i--];
-		}
-		else
-		{
-			sort_keys[k] = aet_u[first_new + n];
-			aet_order[k--] = first_new + n;
-			n++;
-		}
-	}
-
-	aet_count += new_count;
 }
 
 
@@ -297,58 +289,79 @@ R_StepRemoveEdges_Array
 
 Single pass per scanline over the sorted AET: drop entries whose
 v_end == iv (edge ended on this scanline), step u for the survivors,
-and rewrite aet_order[]/sort_keys[] compacted.  Then restore order
-with a nearly-sorted insertion sort (~O(n)).
+compact the records and insert each one into the sorted prefix as it
+goes — remove, step and sort in one traversal.
 
-Replaces the separate R_RemoveEdges_Array + R_StepActiveU_Array
-passes — one traversal of the active table per scanline instead of
-two, on VexiiRiscv's single-issue in-order pipeline that's ~a third
-of the per-scanline AET maintenance cost.
-
-SoA layout: aet_u[] / aet_u_step[] / aet_v_end[] are separate
-arrays, so each load is small and sequential loads through
-aet_order[] prefetch well.
+Edges rarely end, so until the first one does the records keep their
+slots: the leading run only reloads u/u_step/v_end, stores u back, and
+sorts a crossing in place.  Past the first dropped edge the rest are
+compacted down one slot as they are sorted in.  Either way this is the
+same stable insertion sort the array had when the sort was a separate
+pass over the compacted table.
 ==============
 */
 PQ_FASTTEXT void R_StepRemoveEdges_Array (int iv)
 {
-	int i, j, n;
+	aetedge_t	*src, *dst, *stop, *p;
+	int			u, prevu;
 
-	n = aet_count;
-	for (i = 0, j = 0; i < n; i++)
+	stop = &aet[aet_count];
+	prevu = -0x7FFFFFFF - 1;
+
+	// nothing dropped yet: step u in place
+	for (src = aet ; src < stop ; src++)
 	{
-		int idx = aet_order[i];
-		int u;
+		if (src->v_end == (unsigned int)iv)
+			break;			// edge ends on this scanline — drop it
+		u = src->u + src->u_step;
+		if (u < prevu)
+		{	// stepped past the edge to its left: sort it back in
+			aetedge_t	e = *src;
 
-		if (aet_v_end[idx] == iv)
-			continue;		// edge ends on this scanline — drop it
-
-		u = aet_u[idx] + aet_u_step[idx];
-		aet_u[idx] = u;
-		aet_order[j] = idx;
-		sort_keys[j] = u;
-		j++;
-	}
-	aet_count = j;
-
-	// Insertion sort using sort_keys[] — direct array comparison,
-	// no double indirection (sort_keys[k] vs aet[aet_order[k]].u).
-	for (i = 1; i < j; i++)
-	{
-		int key = sort_keys[i];
-		if (key < sort_keys[i-1])
-		{
-			int idx = aet_order[i];
-			int k = i - 1;
+			e.u = u;
+			p = src;
 			do {
-				sort_keys[k+1] = sort_keys[k];
-				aet_order[k+1] = aet_order[k];
-				k--;
-			} while (k >= 0 && sort_keys[k] > key);
-			sort_keys[k+1] = key;
-			aet_order[k+1] = idx;
+				p[0] = p[-1];
+				p--;
+			} while (p > aet && p[-1].u > u);
+			*p = e;
+			continue;		// prevu is unchanged: src[0] holds it now
 		}
+		src->u = u;
+		prevu = u;
 	}
+
+	// past the first dropped edge, survivors move down as they sort in
+	dst = src;
+	if (src < stop)
+		src++;				// the edge that ended is gone
+
+	for ( ; src < stop ; src++)
+	{
+		aetedge_t	e = *src;
+
+		if (e.v_end == (unsigned int)iv)
+			continue;
+		e.u += e.u_step;
+
+		if (e.u < prevu)
+		{
+			p = dst;
+			do {
+				p[0] = p[-1];
+				p--;
+			} while (p > aet && p[-1].u > e.u);
+			*p = e;
+		}
+		else
+		{
+			prevu = e.u;
+			*dst = e;
+		}
+		dst++;
+	}
+
+	aet_count = dst - aet;
 }
 
 
@@ -362,12 +375,18 @@ Array variant: takes surface pointer and u value directly.
 PQ_FASTTEXT void R_TrailingEdge_A (surf_t *surf, int u)
 {
 	espan_t		*span;
+	surf_t		*snext, *sprev;
 	int			iu;
 
 	if (--surf->spanstate == 0)
 	{
 		if (surf->insubmodel)
 			r_bmodelactive--;
+
+		// both links read before the unlink stores, which cannot
+		// change either of them
+		snext = surf->next;
+		sprev = surf->prev;
 
 		if (surf == surfaces[1].next)
 		{
@@ -386,11 +405,11 @@ PQ_FASTTEXT void R_TrailingEdge_A (surf_t *surf, int u)
 				surf->spans = span;
 			}
 
-			surf->next->last_u = iu;
+			snext->last_u = iu;
 		}
 
-		surf->prev->next = surf->next;
-		surf->next->prev = surf->prev;
+		sprev->next = snext;
+		snext->prev = sprev;
 	}
 }
 
@@ -610,15 +629,15 @@ PQ_HOT void R_GenerateSpans_HW (void)
 
 	// Feed all AET edges to hardware (in sorted order)
 	for (i = 0; i < hw_count; i++) {
-		int idx = aet_order[i];
-		int iu = sort_keys[i] >> 20;
+		unsigned int sw = aet[i].surfs;
+		int iu = aet[i].u >> 20;
 		// Clamp to valid range — negative u from edge stepping would
 		// produce garbage in the unsigned 9-bit iu field
 		if (iu < 0) iu = 0;
 		else if (iu > 511) iu = 511;
 		SCAN_EDGE_DATA = ((unsigned int)iu << 23) |
-		                 ((unsigned int)aet_surfs[idx][1] << 10) |
-		                 (unsigned int)aet_surfs[idx][0];
+		                 ((sw >> 16) << 10) |
+		                 (sw & 0xFFFF);
 	}
 
 	// Start processing (bit 0 = start, bit 1 = backward mode)
@@ -663,19 +682,20 @@ Walk sorted aet[] array instead of linked list.
 */
 PQ_FASTTEXT void R_GenerateSpans_Array (void)
 {
-	int i;
+	const aetedge_t	*e, *estop;
 
 	r_bmodelactive = 0;
 
 	surfaces[1].next = surfaces[1].prev = &surfaces[1];
 	surfaces[1].last_u = edge_head_u_shift20;
 
-	for (i = 0; i < aet_count; i++)
+	estop = &aet[aet_count];
+	for (e = aet ; e < estop ; e++)
 	{
-		int idx = aet_order[i];
-		int u = sort_keys[i];
-		unsigned short s0 = aet_surfs[idx][0];
-		unsigned short s1 = aet_surfs[idx][1];
+		unsigned int	sw = e->surfs;
+		int				u = e->u;
+		unsigned int	s0 = sw & 0xFFFF;
+		unsigned int	s1 = sw >> 16;
 
 		if (s0)
 		{
@@ -700,19 +720,20 @@ Walk sorted aet[] array instead of linked list (backward variant).
 */
 PQ_HOT void R_GenerateSpansBackward_Array (void)
 {
-	int i;
+	const aetedge_t	*e, *estop;
 
 	r_bmodelactive = 0;
 
 	surfaces[1].next = surfaces[1].prev = &surfaces[1];
 	surfaces[1].last_u = edge_head_u_shift20;
 
-	for (i = 0; i < aet_count; i++)
+	estop = &aet[aet_count];
+	for (e = aet ; e < estop ; e++)
 	{
-		int idx = aet_order[i];
-		int u = sort_keys[i];
-		unsigned short s0 = aet_surfs[idx][0];
-		unsigned short s1 = aet_surfs[idx][1];
+		unsigned int	sw = e->surfs;
+		int				u = e->u;
+		unsigned int	s0 = sw & 0xFFFF;
+		unsigned int	s1 = sw >> 16;
 
 		if (s0)
 			R_TrailingEdge_A (&surfaces[s0], u);
@@ -764,7 +785,6 @@ PQ_FASTTEXT void R_ScanEdges (void)
 
 // clear array-based AET
 	aet_count = 0;
-	aet_alloc = 0;
 
 #if HW_SCANLINE_ACCEL
 // Frame setup: clear HW spanstate BRAM and load surface keys

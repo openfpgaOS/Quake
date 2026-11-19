@@ -32,17 +32,19 @@ typedef union eval_s
 } eval_t;	
 
 #define	MAX_ENT_LEAFS	16
+// area sits last in the fixed part so that it shares a 64 byte line with
+// v.absmin/v.absmax: the areanode walks read the link and the box together
 typedef struct edict_s
 {
 	qboolean	free;
-	link_t		area;				// linked to a division node or leaf
-	
+
 	int			num_leafs;
 	short		leafnums[MAX_ENT_LEAFS];
 
 	entity_state_t	baseline;
-	
+
 	float		freetime;			// sv.time when the object was freed
+	link_t		area;				// linked to a division node or leaf
 	entvars_t	v;					// C exported fields from progs
 // other fields from progs come immediately after
 } edict_t;

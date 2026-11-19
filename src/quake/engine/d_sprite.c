@@ -34,7 +34,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 static int		sprite_height;
 static int		minindex, maxindex;
 static sspan_t	*sprite_spans;
-static of_emit_param_span_record_t d_sprite_param_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS];
+static of_emit_param_span_record_t d_sprite_param_records[OF_EMIT_PARAM_SPAN_MAX_RECORDS]
+	__attribute__((aligned(4)));
 extern cvar_t pq_gpu_zwrite;
 extern int pq_gpu_zwrite_pending;
 
@@ -47,6 +48,139 @@ static inline int32_t D_SpriteMad2I32(int32_t origin,
 }
 
 #if D_USE_GPU_SPRITES
+static inline int32_t D_SpriteTruncSat (int neg, uint64_t m, int e)
+{
+	uint64_t v;
+
+	if (e >= 0)
+	{
+		if (e > 31 || m > (0x7fffffffu >> e))
+			return neg ? INT32_MIN : INT32_MAX;
+		v = m << e;
+	}
+	else
+	{
+		v = e > -64 ? m >> -e : 0;
+		if (v > 0x7fffffffu)
+			return neg ? INT32_MIN : INT32_MAX;
+	}
+	return neg ? -(int32_t)v : (int32_t)v;
+}
+
+/*
+=====================
+D_SpritePlaneFixed
+
+(int32_t)((double)f * 65536.0 + (double)adj * (double)zi) in integers:
+round-to-nearest-even double product and sum, saturating conversion,
+NaN converts to INT32_MAX.
+=====================
+*/
+static int32_t D_SpritePlaneFixed (float f, int adj, float zi)
+{
+	union { float f; uint32_t u; } bf, bz;
+	uint32_t ef, ez, mf;
+	uint64_t mp, m1, m2;
+	int sf, sp, e1, e2, n;
+
+	bf.f = f;
+	bz.f = zi;
+	sf = bf.u >> 31;
+	sp = (bz.u >> 31) ^ (adj < 0);
+	ef = (bf.u >> 23) & 0xff;
+	ez = (bz.u >> 23) & 0xff;
+	mf = bf.u & 0x7fffff;
+	mp = bz.u & 0x7fffff;
+
+	if ((ef == 0xff && mf) || (ez == 0xff && mp))
+		return INT32_MAX;
+	if (ez == 0xff)
+	{
+		if (!adj || (ef == 0xff && sf != sp))
+			return INT32_MAX;
+		return sp ? INT32_MIN : INT32_MAX;
+	}
+	if (ef == 0xff)
+		return sf ? INT32_MIN : INT32_MAX;
+
+	if (ef)
+		mf |= 0x800000;
+	else
+		ef = 1;
+	if (ez)
+		mp |= 0x800000;
+	else
+		ez = 1;
+	e1 = (int)ef - 150 + 16;
+	e2 = (int)ez - 150;
+
+// adj * zi, rounded to 53 bits
+	mp *= adj < 0 ? -(uint32_t)adj : (uint32_t)adj;
+	if (mp >> 53)
+	{
+		uint64_t rem, half;
+
+		n = (mp >> 54) ? 2 : 1;
+		rem = mp & ((1u << n) - 1);
+		half = 1u << (n - 1);
+		mp >>= n;
+		e2 += n;
+		if (rem > half || (rem == half && (mp & 1)))
+			mp++;
+	}
+
+	if (!mp)
+		return D_SpriteTruncSat (sf, mf, e1);
+	if (!mf)
+		return D_SpriteTruncSat (sp, mp, e2);
+
+// f * 65536 + product, rounded to 53 bits
+	m1 = mf;
+	n = __builtin_clzll (m1) - 2;
+	m1 <<= n;
+	e1 -= n;
+	m2 = mp;
+	n = __builtin_clzll (m2) - 2;
+	m2 <<= n;
+	e2 -= n;
+
+	if (e1 < e2 || (e1 == e2 && m1 < m2))
+	{
+		uint64_t tm = m1;
+		int te = e1, ts = sf;
+
+		m1 = m2; e1 = e2; sf = sp;
+		m2 = tm; e2 = te; sp = ts;
+	}
+
+	n = e1 - e2;
+	if (n > 62)
+		m2 = 1;
+	else if (n)
+		m2 = (m2 >> n) | ((m2 << (64 - n)) != 0);
+
+	if (sf == sp)
+		m1 += m2;
+	else
+		m1 -= m2;
+	if (!m1)
+		return 0;
+
+	n = 11 - __builtin_clzll (m1);
+	if (n > 0)
+	{
+		uint64_t rem = m1 & (((uint64_t)1 << n) - 1);
+		uint64_t half = (uint64_t)1 << (n - 1);
+
+		m1 >>= n;
+		e1 += n;
+		if (rem > half || (rem == half && (m1 & 1)))
+			m1++;
+	}
+
+	return D_SpriteTruncSat (sf, m1, e1);
+}
+
 static int D_SpriteDrawSpans_ParamZ(sspan_t *pspan, byte *pbase)
 {
 	sspan_t *span;
@@ -73,24 +207,15 @@ static int D_SpriteDrawSpans_ParamZ(sspan_t *pspan, byte *pbase)
 
 	of_emit_cache_clean_once(pbase, cachewidth * sprite_height);
 
-	const double sadjustd = (double)sadjust;
-	const double tadjustd = (double)tadjust;
-	const double fixscale = 65536.0;
-	const int32_t sdivz_org = (int32_t)((double)d_sdivzorigin * fixscale +
-	                                    sadjustd * (double)d_ziorigin);
-	const int32_t tdivz_org = (int32_t)((double)d_tdivzorigin * fixscale +
-	                                    tadjustd * (double)d_ziorigin);
-	const int32_t zi_org = (int32_t)((double)d_ziorigin * fixscale);
-	const int32_t sdivz_stepv = (int32_t)((double)d_sdivzstepv * fixscale +
-	                                      sadjustd * (double)d_zistepv);
-	const int32_t tdivz_stepv = (int32_t)((double)d_tdivzstepv * fixscale +
-	                                      tadjustd * (double)d_zistepv);
-	const int32_t zi_stepv = (int32_t)((double)d_zistepv * fixscale);
-	const int32_t sdivz_stepu = (int32_t)((double)d_sdivzstepu * fixscale +
-	                                      sadjustd * (double)d_zistepu);
-	const int32_t tdivz_stepu = (int32_t)((double)d_tdivzstepu * fixscale +
-	                                      tadjustd * (double)d_zistepu);
-	const int32_t zi_stepu = (int32_t)((double)d_zistepu * fixscale);
+	const int32_t sdivz_org = D_SpritePlaneFixed(d_sdivzorigin, sadjust, d_ziorigin);
+	const int32_t tdivz_org = D_SpritePlaneFixed(d_tdivzorigin, tadjust, d_ziorigin);
+	const int32_t zi_org = (int32_t)(d_ziorigin * 65536.0f);
+	const int32_t sdivz_stepv = D_SpritePlaneFixed(d_sdivzstepv, sadjust, d_zistepv);
+	const int32_t tdivz_stepv = D_SpritePlaneFixed(d_tdivzstepv, tadjust, d_zistepv);
+	const int32_t zi_stepv = (int32_t)(d_zistepv * 65536.0f);
+	const int32_t sdivz_stepu = D_SpritePlaneFixed(d_sdivzstepu, sadjust, d_zistepu);
+	const int32_t tdivz_stepu = D_SpritePlaneFixed(d_tdivzstepu, tadjust, d_zistepu);
+	const int32_t zi_stepu = (int32_t)(d_zistepu * 65536.0f);
 
 	of_emit_param_span_list_t params;
 	memset(&params, 0, sizeof(params));

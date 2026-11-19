@@ -46,6 +46,7 @@ client_state_t	cl;
 // FIXME: put these on hunk?
 efrag_t			cl_efrags[MAX_EFRAGS];
 entity_t		cl_entities[MAX_EDICTS];
+unsigned int	cl_entlive[CL_ENTLIVE_WORDS];
 entity_t		cl_static_entities[MAX_STATIC_ENTITIES];
 lightstyle_t	cl_lightstyle[MAX_LIGHTSTYLES];
 dlight_t		cl_dlights[MAX_DLIGHTS];
@@ -74,6 +75,7 @@ void CL_ClearState (void)
 // clear other arrays	
 	memset (cl_efrags, 0, sizeof(cl_efrags));
 	memset (cl_entities, 0, sizeof(cl_entities));
+	memset (cl_entlive, 0, sizeof(cl_entlive));
 	memset (cl_dlights, 0, sizeof(cl_dlights));
 	memset (cl_lightstyle, 0, sizeof(cl_lightstyle));
 	memset (cl_temp_entities, 0, sizeof(cl_temp_entities));
@@ -400,7 +402,7 @@ float	CL_LerpPoint (void)
 		return 1;
 	}
 		
-	if (f > 0.1)
+	if (f >= 0.1f)	// same as f > 0.1 for every float
 	{	// dropped packet, or start of demo
 		cl.mtime[1] = cl.mtime[0] - 0.1;
 		f = 0.1;
@@ -409,7 +411,7 @@ float	CL_LerpPoint (void)
 //Con_Printf ("frac: %f\n",frac);
 	if (frac < 0)
 	{
-		if (frac < -0.01)
+		if (frac < -0.01f)	// same as frac < -0.01 for every float
 		{
 SetPal(1);
 			cl.time = cl.mtime[1];
@@ -419,7 +421,7 @@ SetPal(1);
 	}
 	else if (frac > 1)
 	{
-		if (frac > 1.01)
+		if (frac > 1.01f)	// same as frac > 1.01 for every float
 		{
 SetPal(2);
 			cl.time = cl.mtime[0];
@@ -439,10 +441,21 @@ SetPal(2);
 CL_RelinkEntities
 ===============
 */
+// ctz(x) by de Bruijn multiply: rv32imafc has no count-trailing-zeros
+// instruction, and __builtin_ctz becomes a __ctzsi2 call
+static const byte cl_ctztab[32] = {
+	 0,  1, 28,  2, 29, 14, 24,  3, 30, 22, 20, 15, 25, 17,  4,  8,
+	31, 27, 13, 23, 21, 19, 16,  7, 26, 12, 18,  6, 11,  5, 10,  9
+};
+
+#define	CL_CTZ32(m)	cl_ctztab[(unsigned int)(((m) & -(m)) * 0x077CB531u) >> 27]
+
 void CL_RelinkEntities (void)
 {
 	entity_t	*ent;
 	int			i, j;
+	int			w, nw;
+	unsigned int live;
 	float		frac, f, d;
 	vec3_t		delta;
 	float		bobjrotate;
@@ -477,147 +490,162 @@ void CL_RelinkEntities (void)
 	
 	bobjrotate = anglemod(100*cl.time);
 	
-// start on the entity after the world
-	for (i=1,ent=cl_entities+1 ; i<cl.num_entities ; i++,ent++)
+// walk the live slots only; the world (bit 0) is never relinked
+	nw = (cl.num_entities + 31) >> 5;
+	for (w=0 ; w<nw ; w++)
 	{
-		if (!ent->model)
-		{	// empty slot
+		live = cl_entlive[w];
+		if (!w)
+			live &= ~1u;
+		while (live)
+		{
+			i = (w<<5) + CL_CTZ32(live);
+			live &= live - 1;
+			ent = cl_entities + i;
+
+			if (!ent->model)
+			{	// empty slot
+				if (ent->forcelink)
+					R_RemoveEfrags (ent);	// just became empty
+				else
+					CL_EntLiveClear (i);
+				continue;
+			}
+
+			// if the object wasn't included in the last packet, remove it
+			if (ent->msgtime != cl.mtime[0])
+			{
+				ent->model = NULL;
+				if (!ent->forcelink)
+					CL_EntLiveClear (i);
+				continue;
+			}
+
+			VectorCopy (ent->origin, oldorg);
+
 			if (ent->forcelink)
-				R_RemoveEfrags (ent);	// just became empty
-			continue;
-		}
+			{	// the entity was not updated in the last message
+				// so move to the final spot
+				VectorCopy (ent->msg_origins[0], ent->origin);
+				VectorCopy (ent->msg_angles[0], ent->angles);
+			}
+			else
+			{	// if the delta is large, assume a teleport and don't lerp
+				f = frac;
+				for (j=0 ; j<3 ; j++)
+				{
+					delta[j] = ent->msg_origins[0][j] - ent->msg_origins[1][j];
+					if (delta[j] > 100 || delta[j] < -100)
+						f = 1;		// assume a teleportation, not a motion
+				}
 
-// if the object wasn't included in the last packet, remove it
-		if (ent->msgtime != cl.mtime[0])
-		{
-			ent->model = NULL;
-			continue;
-		}
+			// interpolate the origin and angles
+				for (j=0 ; j<3 ; j++)
+				{
+					ent->origin[j] = ent->msg_origins[1][j] + f*delta[j];
 
-		VectorCopy (ent->origin, oldorg);
+					d = ent->msg_angles[0][j] - ent->msg_angles[1][j];
+					if (d > 180)
+						d -= 360;
+					else if (d < -180)
+						d += 360;
+					ent->angles[j] = ent->msg_angles[1][j] + f*d;
+				}
 
-		if (ent->forcelink)
-		{	// the entity was not updated in the last message
-			// so move to the final spot
-			VectorCopy (ent->msg_origins[0], ent->origin);
-			VectorCopy (ent->msg_angles[0], ent->angles);
-		}
-		else
-		{	// if the delta is large, assume a teleport and don't lerp
-			f = frac;
-			for (j=0 ; j<3 ; j++)
-			{
-				delta[j] = ent->msg_origins[0][j] - ent->msg_origins[1][j];
-				if (delta[j] > 100 || delta[j] < -100)
-					f = 1;		// assume a teleportation, not a motion
 			}
 
-		// interpolate the origin and angles
-			for (j=0 ; j<3 ; j++)
+			// rotate binary objects locally
+			if (ent->model->flags & EF_ROTATE)
+				ent->angles[1] = bobjrotate;
+
+			if (ent->effects & EF_BRIGHTFIELD)
+				R_EntityParticles (ent);
+#ifdef QUAKE2
+			if (ent->effects & EF_DARKFIELD)
+				R_DarkFieldParticles (ent);
+#endif
+			if (ent->effects & EF_MUZZLEFLASH)
 			{
-				ent->origin[j] = ent->msg_origins[1][j] + f*delta[j];
+				vec3_t		fv, rv, uv;
 
-				d = ent->msg_angles[0][j] - ent->msg_angles[1][j];
-				if (d > 180)
-					d -= 360;
-				else if (d < -180)
-					d += 360;
-				ent->angles[j] = ent->msg_angles[1][j] + f*d;
+				dl = CL_AllocDlight (i);
+				VectorCopy (ent->origin,  dl->origin);
+				dl->origin[2] += 16;
+				AngleVectors (ent->angles, fv, rv, uv);
+
+				VectorMA (dl->origin, 18, fv, dl->origin);
+				dl->radius = 200 + (rand()&31);
+				dl->minlight = 32;
+				dl->die = cl.time + 0.1;
 			}
-			
-		}
-
-// rotate binary objects locally
-		if (ent->model->flags & EF_ROTATE)
-			ent->angles[1] = bobjrotate;
-
-		if (ent->effects & EF_BRIGHTFIELD)
-			R_EntityParticles (ent);
+			if (ent->effects & EF_BRIGHTLIGHT)
+			{
+				dl = CL_AllocDlight (i);
+				VectorCopy (ent->origin,  dl->origin);
+				dl->origin[2] += 16;
+				dl->radius = 400 + (rand()&31);
+				dl->die = cl.time + 0.001;
+			}
+			if (ent->effects & EF_DIMLIGHT)
+			{
+				dl = CL_AllocDlight (i);
+				VectorCopy (ent->origin,  dl->origin);
+				dl->radius = 200 + (rand()&31);
+				dl->die = cl.time + 0.001;
+			}
 #ifdef QUAKE2
-		if (ent->effects & EF_DARKFIELD)
-			R_DarkFieldParticles (ent);
-#endif
-		if (ent->effects & EF_MUZZLEFLASH)
-		{
-			vec3_t		fv, rv, uv;
-
-			dl = CL_AllocDlight (i);
-			VectorCopy (ent->origin,  dl->origin);
-			dl->origin[2] += 16;
-			AngleVectors (ent->angles, fv, rv, uv);
-			 
-			VectorMA (dl->origin, 18, fv, dl->origin);
-			dl->radius = 200 + (rand()&31);
-			dl->minlight = 32;
-			dl->die = cl.time + 0.1;
-		}
-		if (ent->effects & EF_BRIGHTLIGHT)
-		{			
-			dl = CL_AllocDlight (i);
-			VectorCopy (ent->origin,  dl->origin);
-			dl->origin[2] += 16;
-			dl->radius = 400 + (rand()&31);
-			dl->die = cl.time + 0.001;
-		}
-		if (ent->effects & EF_DIMLIGHT)
-		{			
-			dl = CL_AllocDlight (i);
-			VectorCopy (ent->origin,  dl->origin);
-			dl->radius = 200 + (rand()&31);
-			dl->die = cl.time + 0.001;
-		}
-#ifdef QUAKE2
-		if (ent->effects & EF_DARKLIGHT)
-		{			
-			dl = CL_AllocDlight (i);
-			VectorCopy (ent->origin,  dl->origin);
-			dl->radius = 200.0 + (rand()&31);
-			dl->die = cl.time + 0.001;
-			dl->dark = true;
-		}
-		if (ent->effects & EF_LIGHT)
-		{			
-			dl = CL_AllocDlight (i);
-			VectorCopy (ent->origin,  dl->origin);
-			dl->radius = 200;
-			dl->die = cl.time + 0.001;
-		}
+			if (ent->effects & EF_DARKLIGHT)
+			{
+				dl = CL_AllocDlight (i);
+				VectorCopy (ent->origin,  dl->origin);
+				dl->radius = 200.0 + (rand()&31);
+				dl->die = cl.time + 0.001;
+				dl->dark = true;
+			}
+			if (ent->effects & EF_LIGHT)
+			{
+				dl = CL_AllocDlight (i);
+				VectorCopy (ent->origin,  dl->origin);
+				dl->radius = 200;
+				dl->die = cl.time + 0.001;
+			}
 #endif
 
-		if (ent->model->flags & EF_GIB)
-			R_RocketTrail (oldorg, ent->origin, 2);
-		else if (ent->model->flags & EF_ZOMGIB)
-			R_RocketTrail (oldorg, ent->origin, 4);
-		else if (ent->model->flags & EF_TRACER)
-			R_RocketTrail (oldorg, ent->origin, 3);
-		else if (ent->model->flags & EF_TRACER2)
-			R_RocketTrail (oldorg, ent->origin, 5);
-		else if (ent->model->flags & EF_ROCKET)
-		{
-			R_RocketTrail (oldorg, ent->origin, 0);
-			dl = CL_AllocDlight (i);
-			VectorCopy (ent->origin, dl->origin);
-			dl->radius = 200;
-			dl->die = cl.time + 0.01;
-		}
-		else if (ent->model->flags & EF_GRENADE)
-			R_RocketTrail (oldorg, ent->origin, 1);
-		else if (ent->model->flags & EF_TRACER3)
-			R_RocketTrail (oldorg, ent->origin, 6);
+			if (ent->model->flags & EF_GIB)
+				R_RocketTrail (oldorg, ent->origin, 2);
+			else if (ent->model->flags & EF_ZOMGIB)
+				R_RocketTrail (oldorg, ent->origin, 4);
+			else if (ent->model->flags & EF_TRACER)
+				R_RocketTrail (oldorg, ent->origin, 3);
+			else if (ent->model->flags & EF_TRACER2)
+				R_RocketTrail (oldorg, ent->origin, 5);
+			else if (ent->model->flags & EF_ROCKET)
+			{
+				R_RocketTrail (oldorg, ent->origin, 0);
+				dl = CL_AllocDlight (i);
+				VectorCopy (ent->origin, dl->origin);
+				dl->radius = 200;
+				dl->die = cl.time + 0.01;
+			}
+			else if (ent->model->flags & EF_GRENADE)
+				R_RocketTrail (oldorg, ent->origin, 1);
+			else if (ent->model->flags & EF_TRACER3)
+				R_RocketTrail (oldorg, ent->origin, 6);
 
-		ent->forcelink = false;
+			ent->forcelink = false;
 
-		if (i == cl.viewentity && !chase_active.value)
-			continue;
+			if (i == cl.viewentity && !chase_active.value)
+				continue;
 
 #ifdef QUAKE2
-		if ( ent->effects & EF_NODRAW )
-			continue;
+			if ( ent->effects & EF_NODRAW )
+				continue;
 #endif
-		if (cl_numvisedicts < MAX_VISEDICTS)
-		{
-			cl_visedicts[cl_numvisedicts] = ent;
-			cl_numvisedicts++;
+			if (cl_numvisedicts < MAX_VISEDICTS)
+			{
+				cl_visedicts[cl_numvisedicts] = ent;
+				cl_numvisedicts++;
+			}
 		}
 	}
 

@@ -334,9 +334,25 @@ void D_DrawNonSubdiv (void)
 
 
 	/* Alias skins are immutable after model load; model reloads invalidate
-	 * the clean-once registry in Mod_LoadAliasModel. */
-	of_emit_cache_clean_once(r_affinetridesc.pskin,
-	    r_affinetridesc.skinwidth * r_affinetridesc.skinheight);
+	 * the clean-once registry in Mod_LoadAliasModel. Clipped models come
+	 * through here once per triangle, so repeat calls within one
+	 * R_AliasDrawModel (same frame and model count) skip the lookup. */
+	{
+		static void	*cleanskin;
+		static int	cleansize, cleanframe, cleanmodel;
+		int			size;
+
+		size = r_affinetridesc.skinwidth * r_affinetridesc.skinheight;
+		if (r_affinetridesc.pskin != cleanskin || size != cleansize ||
+			r_framecount != cleanframe || r_amodels_drawn != cleanmodel)
+		{
+			of_emit_cache_clean_once(r_affinetridesc.pskin, size);
+			cleanskin = r_affinetridesc.pskin;
+			cleansize = size;
+			cleanframe = r_framecount;
+			cleanmodel = r_amodels_drawn;
+		}
+	}
 
 #if D_USE_GPU_ALIAS == 2
 	if (D_PolysetHWTriangles()) {
@@ -440,10 +456,14 @@ void D_DrawNonSubdiv (void)
 			continue;
 
 		/* Mode 1/0 — CPU edge walker feeds either GPU affine spans or
-		 * pure CPU scanlines (guarded below in D_PolysetDrawSpans8). */
-		__builtin_memcpy(r_p0, index0->v, 6 * sizeof(int));
-		__builtin_memcpy(r_p1, index1->v, 6 * sizeof(int));
-		__builtin_memcpy(r_p2, index2->v, 6 * sizeof(int));
+		 * pure CPU scanlines (guarded below in D_PolysetDrawSpans8).
+		 * Field-by-field copies: a memcpy here becomes a library call. */
+		r_p0[0] = index0->v[0]; r_p0[1] = index0->v[1]; r_p0[2] = index0->v[2];
+		r_p0[3] = index0->v[3]; r_p0[4] = index0->v[4]; r_p0[5] = index0->v[5];
+		r_p1[0] = index1->v[0]; r_p1[1] = index1->v[1]; r_p1[2] = index1->v[2];
+		r_p1[3] = index1->v[3]; r_p1[4] = index1->v[4]; r_p1[5] = index1->v[5];
+		r_p2[0] = index2->v[0]; r_p2[1] = index2->v[1]; r_p2[2] = index2->v[2];
+		r_p2[3] = index2->v[3]; r_p2[4] = index2->v[4]; r_p2[5] = index2->v[5];
 		if (!ptri->facesfront) {
 			if (index0->flags & ALIAS_ONSEAM) r_p0[2] += r_affinetridesc.seamfixupX16;
 			if (index1->flags & ALIAS_ONSEAM) r_p1[2] += r_affinetridesc.seamfixupX16;
@@ -783,11 +803,47 @@ void InitGel (byte *palette)
 /*
 ================
 D_PolysetDrawSpans8
+
+z points into an uncached alias, so each access is a bus transaction. Spans
+of DPS_PAIRSPAN or more pixels read and write the z words that lie wholly
+inside the span as one word each.
 ================
 */
+#define DPS_PAIRSPAN	4
+
+typedef unsigned int __attribute__((__may_alias__)) dpsword_t;
+
+#define DPS_STEP						\
+	lzi += r_zistepx;					\
+	llight += r_lstepx;					\
+	lptex += a_ststepxwhole;			\
+	lsfrac += a_sstepxfrac;				\
+	lptex += lsfrac >> 16;				\
+	lsfrac &= 0xFFFF;					\
+	ltfrac += a_tstepxfrac;				\
+	if (ltfrac & 0x10000)				\
+	{									\
+		lptex += lskinwidth;			\
+		ltfrac &= 0xFFFF;				\
+	}
+
+#define DPS_PIXEL									\
+	if ((lzi >> 16) >= *lpz)						\
+	{												\
+		*lpz = lzi >> 16;							\
+		*lpdest = lcolormap[*lptex + (llight & 0xFF00)];	\
+	}												\
+	lpdest++;										\
+	lpz++;											\
+	DPS_STEP
+
 PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 {
 	int		lcount;
+	byte	*lcolormap;
+	int		lskinwidth;
+	int		lerrorterm, laspancount;
+	int		lerrup, lerrdown, lextrastep, lbasestep;
 
 	if (pq_gpu_zwrite_pending)
 	{
@@ -795,20 +851,31 @@ PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 		pq_gpu_zwrite_pending = 0;
 	}
 
+	lcolormap = host_colormap;
+	lskinwidth = r_affinetridesc.skinwidth;
+
+// span stepping state lives in locals and is written back on exit; the four
+// step constants do not change while a span list is walked
+	lerrorterm = errorterm;
+	laspancount = d_aspancount;
+	lerrup = erroradjustup;
+	lerrdown = erroradjustdown;
+	lextrastep = d_countextrastep;
+	lbasestep = ubasestep;
+
 	do
 	{
-		lcount = d_aspancount - pspanpackage->count;
+		int		mask;
 
-		errorterm += erroradjustup;
-		if (errorterm >= 0)
-		{
-			d_aspancount += d_countextrastep;
-			errorterm -= erroradjustdown;
-		}
-		else
-		{
-			d_aspancount += ubasestep;
-		}
+		lcount = laspancount - pspanpackage->count;
+
+	// branchless step: mask is -1 when the error term came out non-negative.
+	// The test splits near 50/50 on the slopes alias models produce, so a
+	// branch here mispredicts most of the time.
+		lerrorterm += lerrup;
+		mask = ~(lerrorterm >> 31);
+		laspancount += (lextrastep & mask) | (lbasestep & ~mask);
+		lerrorterm -= lerrdown & mask;
 
 		if (lcount > 0)
 		{
@@ -822,33 +889,63 @@ PQ_HOT void D_PolysetDrawSpans8 (spanpackage_t *pspanpackage)
 			int llight   = pspanpackage->light;
 			int lzi      = pspanpackage->zi;
 
-			do
+			if (lcount < DPS_PAIRSPAN)
 			{
-				if ((lzi >> 16) >= *lpz)
+				do
 				{
-					*lpz = lzi >> 16;
-					*lpdest = host_colormap[*lptex + (llight & 0xFF00)];
-				}
-				lpdest++;
-				lzi += r_zistepx;
-				lpz++;
-				llight += r_lstepx;
-				lptex += a_ststepxwhole;
-				lsfrac += a_sstepxfrac;
-				lptex += lsfrac >> 16;
-				lsfrac &= 0xFFFF;
-				ltfrac += a_tstepxfrac;
-				if (ltfrac & 0x10000)
+					DPS_PIXEL
+				} while (--lcount);
+			}
+			else
+			{
+				do
 				{
-					lptex += r_affinetridesc.skinwidth;
-					ltfrac &= 0xFFFF;
-				}
-			} while (--lcount);
+					if (lcount >= 2 && !((uintptr_t)lpz & 2))
+					{
+					// both shorts of this z word are in the span; lpz[0] is
+					// the low half (little-endian)
+						unsigned	zold, znew;
+
+						zold = znew = *(dpsword_t *)lpz;
+
+						if ((lzi >> 16) >= (short)zold)
+						{
+							znew = (znew & 0xFFFF0000) | ((lzi >> 16) & 0xFFFF);
+							lpdest[0] = lcolormap[*lptex + (llight & 0xFF00)];
+						}
+						DPS_STEP
+
+						if ((lzi >> 16) >= (short)(zold >> 16))
+						{
+							znew = (znew & 0xFFFF) | ((unsigned)(lzi >> 16) << 16);
+							lpdest[1] = lcolormap[*lptex + (llight & 0xFF00)];
+						}
+						DPS_STEP
+
+						if (znew != zold)
+							*(dpsword_t *)lpz = znew;
+						lpdest += 2;
+						lpz += 2;
+						lcount -= 2;
+					}
+					else
+					{
+						DPS_PIXEL
+						lcount--;
+					}
+				} while (lcount > 0);
+			}
 		}
 
 		pspanpackage++;
 	} while (pspanpackage->count != -999999);
+
+	errorterm = lerrorterm;
+	d_aspancount = laspancount;
 }
+
+#undef DPS_PIXEL
+#undef DPS_STEP
 
 /*
 ================
@@ -861,38 +958,52 @@ The viewmodel renders last with ziscale*3, so it always passes the Z-test.
 PQ_HOT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
 {
 	int		lcount;
+	int		lerrorterm, laspancount;
+	int		lerrup, lerrdown, lextrastep, lbasestep;
+#if D_USE_GPU_ALIAS || D_USE_GPU_ALIAS_NOZ
+	static of_emit_span_t	sp;		// fields not assigned below stay zero
+#endif
+
+// span stepping state lives in locals and is written back on exit; the four
+// step constants do not change while a span list is walked
+	lerrorterm = errorterm;
+	laspancount = d_aspancount;
+	lerrup = erroradjustup;
+	lerrdown = erroradjustdown;
+	lextrastep = d_countextrastep;
+	lbasestep = ubasestep;
+
+#if D_USE_GPU_ALIAS || D_USE_GPU_ALIAS_NOZ
+	sp.sstep     = r_sstepx;
+	sp.tstep     = r_tstepx;
+	sp.flags     = OF_EMIT_COLORMAP;
+	sp.fb_stride = 1;
+	sp.tex_width = (uint16_t)r_affinetridesc.skinwidth;
+#endif
 
 	do
 	{
-		lcount = d_aspancount - pspanpackage->count;
+		int		mask;
 
-		errorterm += erroradjustup;
-		if (errorterm >= 0)
-		{
-			d_aspancount += d_countextrastep;
-			errorterm -= erroradjustdown;
-		}
-		else
-		{
-			d_aspancount += ubasestep;
-		}
+		lcount = laspancount - pspanpackage->count;
+
+	// branchless step: mask is -1 when the error term came out non-negative.
+	// The test splits near 50/50 on the slopes alias models produce, so a
+	// branch here mispredicts most of the time.
+		lerrorterm += lerrup;
+		mask = ~(lerrorterm >> 31);
+		laspancount += (lextrastep & mask) | (lbasestep & ~mask);
+		lerrorterm -= lerrdown & mask;
 
 		if (lcount > 0)
 		{
 #if D_USE_GPU_ALIAS || D_USE_GPU_ALIAS_NOZ
-			of_emit_span_t sp = {
-				.fb_addr   = (uint32_t)(uintptr_t)pspanpackage->pdest,
-				.tex_addr  = (uint32_t)(uintptr_t)pspanpackage->ptex,
-				.s         = pspanpackage->sfrac & 0xFFFF,
-				.t         = pspanpackage->tfrac & 0xFFFF,
-				.sstep     = r_sstepx,
-				.tstep     = r_tstepx,
-				.count     = (uint16_t)lcount,
-				.light     = (uint8_t)((pspanpackage->light >> 8) & 0x3F),
-				.flags     = OF_EMIT_COLORMAP,
-				.fb_stride = 1,
-				.tex_width = (uint16_t)r_affinetridesc.skinwidth,
-			};
+			sp.fb_addr  = (uint32_t)(uintptr_t)pspanpackage->pdest;
+			sp.tex_addr = (uint32_t)(uintptr_t)pspanpackage->ptex;
+			sp.s        = pspanpackage->sfrac & 0xFFFF;
+			sp.t        = pspanpackage->tfrac & 0xFFFF;
+			sp.count    = (uint16_t)lcount;
+			sp.light    = (uint8_t)((pspanpackage->light >> 8) & 0x3F);
 			of_emit_span(&sp);
 #else
 			byte *lpdest = (byte *)pspanpackage->pdest;
@@ -921,6 +1032,9 @@ PQ_HOT void D_PolysetDrawSpans8_NoZ (spanpackage_t *pspanpackage)
 
 		pspanpackage++;
 	} while (pspanpackage->count != -999999);
+
+	errorterm = lerrorterm;
+	d_aspancount = laspancount;
 }
 #endif	// !id386
 

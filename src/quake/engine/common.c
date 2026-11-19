@@ -722,12 +722,12 @@ char *MSG_ReadString (void)
 
 float MSG_ReadCoord (void)
 {
-	return MSG_ReadShort() * (1.0/8);
+	return MSG_ReadShort() * 0.125f;	// exact: same result as * (1.0/8)
 }
 
 float MSG_ReadAngle (void)
 {
-	return MSG_ReadChar() * (360.0/256);
+	return MSG_ReadChar() * 1.40625f;	// exact: same result as * (360.0/256)
 }
 
 

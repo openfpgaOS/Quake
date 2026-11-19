@@ -25,9 +25,9 @@
  *     *behind* the cursor.  The refill bytes come from the track file by
  *     async data-slot DMA (of_file_read_async): the CPU kicks off a read
  *     and returns, the bytes land in CRAM0 in the background, and a
- *     completion IRQ flags them; next frame the CPU only deinterleaves the
- *     finished chunk into the ring and flushes it.  The SD transfer itself
- *     costs the CPU nothing -- which matters, because a *blocking* fread
+ *     completion IRQ flags them; over the next frames the CPU only folds
+ *     the finished chunk into the ring and flushes it.  The SD transfer
+ *     itself costs the CPU nothing -- which matters, because a *blocking* fread
  *     of the 176 KB/s stream measured ~13% of total CPU.  (The synchronous
  *     fread path is kept as a fallback / [quake] CD_ASYNC=0.)  Because the
  *     hardware keeps playing the ring regardless of when we refill, a long
@@ -89,6 +89,10 @@
  * at runtime by of_file_async_max_read(). */
 #define CD_CHUNK_FRAMES   16384
 
+/* A finished chunk is folded into the ring over a few frames: at least
+ * this many frames per CDAudio_Update. */
+#define CD_FOLD_MIN       4096
+
 /* Music voices sit high enough that nothing reclaims them, but the
  * group machinery keeps them away from SFX regardless. */
 #define CD_MIXER_PRIORITY 200
@@ -138,6 +142,9 @@ static int       cd_chunk_frames;      /* frames per DMA read (<= CD_CHUNK_FRAME
 static int       cd_async_pending;     /* a DMA read is in flight */
 static int       cd_async_frames;      /* frames the in-flight read delivers */
 static int       cd_ring_valid;        /* produced frames ahead of play cursor */
+static int       cd_fold_off;          /* next staged frame to fold in */
+static int       cd_fold_left;         /* staged frames not yet folded */
+static int       cd_last_consumed;     /* cursor advance at last update */
 static volatile int cd_async_done;     /* set by the completion IRQ callback */
 static volatile int cd_async_result;   /* IRQ result: 0 ok, <0 error */
 
@@ -354,11 +361,12 @@ static void CDAudio_Produce(int nframes)
  * byte of audio = ~13% of all CPU just to stream 176 KB/s).  The async
  * path hands the transfer to the data-slot DMA engine: we issue a read
  * and return, the bytes land in CRAM0 in the background, and a completion
- * IRQ sets cd_async_done.  Per frame the CPU only deinterleaves an already
- * finished chunk and issues the next one — the SD transfer costs it
- * nothing.  Only one read may be in flight at a time (bridge limit), so we
- * keep the ring deep (CD_RING_SECONDS) and refill a chunk whenever the
- * play cursor has freed up that much space. */
+ * IRQ sets cd_async_done.  Per frame the CPU only folds part of an already
+ * finished chunk into the ring, and issues the next read once the chunk is
+ * fully folded — the SD transfer costs it nothing.  Only one read may be in
+ * flight at a time (bridge limit), so we keep the ring deep
+ * (CD_RING_SECONDS) and refill a chunk whenever the play cursor has freed
+ * up that much space. */
 
 static void cd_async_cb(int token, int result)
 {
@@ -392,11 +400,18 @@ static int CDAudio_ResolveSlot(byte track, long *size_out)
     return found;
 }
 
-/* Deinterleave `frames` of finished CRAM0 staging into the ring at the
- * write cursor (wrapping), flushing each written span for the mixer DMA. */
-static void cd_stage_to_ring(int frames)
+#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "cd_stage_to_ring reads CDDA frames as little-endian 32-bit words"
+#endif
+
+/* Deinterleave `frames` of finished CRAM0 staging, from staged frame
+ * `src_off`, into the ring at the write cursor (wrapping), flushing each
+ * written span for the mixer DMA.  One 32-bit load per stereo frame: each
+ * CRAM0 load is a full bridge round trip. */
+static void cd_stage_to_ring(int src_off, int frames)
 {
-    const int16_t *src = (const int16_t *)cd_stage_dma;
+    const volatile uint32_t *src =
+        (const volatile uint32_t *)cd_stage_dma + src_off;
     int done = 0;
 
     while (done < frames) {
@@ -407,8 +422,9 @@ static void cd_stage_to_ring(int frames)
             batch = contig;
 
         for (int i = 0; i < batch; i++) {
-            cd_ringL[w + i] = src[(done + i) * 2 + 0];
-            cd_ringR[w + i] = src[(done + i) * 2 + 1];
+            uint32_t v = src[done + i];
+            cd_ringL[w + i] = (int16_t)v;
+            cd_ringR[w + i] = (int16_t)(v >> 16);
         }
         of_cache_flush_range(&cd_ringL[w], (uint32_t)batch * sizeof(int16_t));
         of_cache_flush_range(&cd_ringR[w], (uint32_t)batch * sizeof(int16_t));
@@ -578,6 +594,7 @@ void CDAudio_Play(byte track, qboolean looping)
     CDAudio_Produce(CD_RING_FRAMES);   /* wraps write_pos back to 0 */
     cd_write_pos = 0;
     cd_last_pos  = 0;
+    cd_last_consumed = 0;
     cd_read_offset = ftell(cd_file);   /* async resumes here */
     cd_ring_valid  = CD_RING_FRAMES;   /* ring is full after prefill */
 
@@ -626,6 +643,7 @@ void CDAudio_Stop(void)
     if (cd_async_pending)
         cd_async_wait();
     cd_async_ok = 0;
+    cd_fold_left = 0;
 
     CDAudio_StopVoices();
     if (cd_file) {
@@ -708,6 +726,10 @@ void CDAudio_NotifySlotWrite(void)
     if (!cd_enabled)
         return;
 
+    /* Never read staging after a slot write: the sync path re-reads the
+     * unfolded rest of the staged chunk from the file. */
+    cd_read_offset -= (long)cd_fold_left * CD_BYTES_PER_FRAME;
+    cd_fold_left = 0;
     CDAudio_DrainAsync();           /* retire anything already in flight */
     cd_async_pending = 0;
 
@@ -732,6 +754,15 @@ void CDAudio_Update(void)
          * bridge stays idle and the stream resumes where it left off. */
         if (cd_playing && !cd_menu_quiet) {
             CDAudio_DrainAsync();           /* retire any in-flight read */
+            /* Save-slot file closes while quiet (menu scans, loads) hand
+             * CRAM0 to the bridge until a DMA read completes: drop the
+             * unfolded staged frames and re-read them after the freeze. */
+            if (cd_async_ok && cd_async_pending && cd_async_done) {
+                cd_read_offset -= (long)cd_async_frames * CD_BYTES_PER_FRAME;
+                cd_async_pending = 0;
+            }
+            cd_read_offset -= (long)cd_fold_left * CD_BYTES_PER_FRAME;
+            cd_fold_left = 0;
             of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, 0);
             of_mixer_set_rate_h(cd_vL, 0);  /* freeze play cursors */
             of_mixer_set_rate_h(cd_vR, 0);
@@ -771,13 +802,28 @@ void CDAudio_Update(void)
         }
     }
 
-    /* Async: fold in a finished DMA read before measuring the cursor. */
+    /* Async: take a finished DMA read before measuring the cursor. */
     if (cd_async_ok && cd_async_pending && cd_async_done) {
         if (cd_async_result >= 0) {
-            cd_stage_to_ring(cd_async_frames);
-            cd_ring_valid += cd_async_frames;
+            cd_fold_off  = 0;
+            cd_fold_left = cd_async_frames;
         }
         cd_async_pending = 0;
+    }
+
+    /* Fold it over a few frames at a multiple of the consume rate, or all
+     * at once when the ring runs low. */
+    if (cd_fold_left > 0) {
+        int n = 3 * cd_last_consumed;
+        if (n < CD_FOLD_MIN)
+            n = CD_FOLD_MIN;
+        if (n > cd_fold_left ||
+            cd_ring_valid - cd_last_consumed < CD_RING_FRAMES / 4)
+            n = cd_fold_left;
+        cd_stage_to_ring(cd_fold_off, n);
+        cd_fold_off   += n;
+        cd_fold_left  -= n;
+        cd_ring_valid += n;
     }
 
     pos = of_mixer_get_position_h(cd_vL);
@@ -788,15 +834,17 @@ void CDAudio_Update(void)
     if (consumed >= CD_RING_FRAMES)     /* clamp pathological jumps */
         consumed = CD_RING_FRAMES - 1;
     cd_last_pos = pos;
+    cd_last_consumed = consumed;
 
     if (cd_async_ok) {
         cd_ring_valid -= consumed;
         if (cd_ring_valid < 0)
             cd_ring_valid = 0;          /* underrun guard */
 
-        /* Issue the next DMA read once the cursor has freed a whole chunk
-         * and nothing is in flight (the bridge allows only one). */
-        if (!cd_async_pending && !cd_ended &&
+        /* Issue the next DMA read once the cursor has freed a whole chunk,
+         * nothing is in flight (the bridge allows only one) and the staged
+         * chunk is fully folded (the next read overwrites it). */
+        if (!cd_async_pending && !cd_fold_left && !cd_ended &&
             CD_RING_FRAMES - cd_ring_valid >= cd_chunk_frames)
             cd_async_issue();
 
@@ -853,6 +901,8 @@ int CDAudio_Init(void)
         if (cd_async_enable && cd_chunk_frames > 0)
             cd_stage_dma = (uint8_t *)of_file_dma_stage_alloc(
                 (uint32_t)cd_chunk_frames * CD_BYTES_PER_FRAME, 2048);
+        if ((uintptr_t)cd_stage_dma & 3)
+            cd_stage_dma = NULL;    /* staging is read as 32-bit words */
     }
 #endif
 

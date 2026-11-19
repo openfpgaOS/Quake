@@ -92,6 +92,7 @@ qboolean R_AliasCheckBBox (void)
 	int					i, flags, frame, numv;
 	aliashdr_t			*pahdr;
 	float				zi, basepts[8][3], v0, v1, frac;
+	float				zc, lo, hi, r2, d;
 	finalvert_t			*pv0, *pv1, viewpts[16];
 	auxvert_t			*pa0, *pa1, viewaux[16];
 	maliasframedesc_t	*pframedesc;
@@ -106,8 +107,6 @@ qboolean R_AliasCheckBBox (void)
 	pahdr = Mod_Extradata (pmodel);
 	pmdl = (mdl_t *)((byte *)pahdr + pahdr->model);
 
-	R_AliasSetUpTransform (0);
-
 // construct the base bounding box for this frame
 	frame = currententity->frame;
 // TODO: don't repeat this check when drawing?
@@ -119,6 +118,29 @@ qboolean R_AliasCheckBBox (void)
 	}
 
 	pframedesc = &pahdr->frames[frame];
+
+// reject without building the transform if a sphere around the model origin
+// holding the whole box is behind the near clip plane, with a one unit margin
+	zc = -DotProduct (modelorg, vpn);
+	if (zc < ALIAS_Z_CLIP_PLANE - 1)
+	{
+		r2 = 0;
+		for (i=0 ; i<3 ; i++)
+		{
+			lo = fabsf (pmdl->scale[i] * (float)pframedesc->bboxmin.v[i] +
+					pmdl->scale_origin[i]);
+			hi = fabsf (pmdl->scale[i] * (float)pframedesc->bboxmax.v[i] +
+					pmdl->scale_origin[i]);
+			if (hi > lo)
+				lo = hi;
+			r2 += lo * lo;
+		}
+		d = ALIAS_Z_CLIP_PLANE - 1 - zc;
+		if (d * d > r2)
+			return false;	// everything is near-z-clipped
+	}
+
+	R_AliasSetUpTransform (0);
 
 // x worldspace coordinates
 	basepts[0][0] = basepts[1][0] = basepts[2][0] = basepts[3][0] =
@@ -272,7 +294,7 @@ void R_AliasPreparePoints (void)
 	stvert_t	*pstverts;
 	finalvert_t	*fv;
 	auxvert_t	*av;
-	mtriangle_t	*ptri;
+	mtriangle_t	*ptri, *prun;
 	finalvert_t	*pfv[3];
 
 	pstverts = (stvert_t *)((byte *)paliashdr + paliashdr->stverts);
@@ -301,32 +323,101 @@ void R_AliasPreparePoints (void)
 	}
 
 //
-// clip and draw all triangles
+// clip and draw all triangles; consecutive totally unclipped triangles are
+// drawn with one D_PolysetDraw call
 //
-	r_affinetridesc.numtriangles = 1;
-
 	ptri = (mtriangle_t *)((byte *)paliashdr + paliashdr->triangles);
+	prun = ptri;
 	for (i=0 ; i<pmdl->numtris ; i++, ptri++)
 	{
 		pfv[0] = &pfinalverts[ptri->vertindex[0]];
 		pfv[1] = &pfinalverts[ptri->vertindex[1]];
 		pfv[2] = &pfinalverts[ptri->vertindex[2]];
 
-		if ( pfv[0]->flags & pfv[1]->flags & pfv[2]->flags & (ALIAS_XY_CLIP_MASK | ALIAS_Z_CLIP) )
-			continue;		// completely clipped
-		
 		if ( ! ( (pfv[0]->flags | pfv[1]->flags | pfv[2]->flags) &
 			(ALIAS_XY_CLIP_MASK | ALIAS_Z_CLIP) ) )
-		{	// totally unclipped
+			continue;		// totally unclipped
+
+		if (ptri != prun)
+		{
 			r_affinetridesc.pfinalverts = pfinalverts;
-			r_affinetridesc.ptriangles = ptri;
+			r_affinetridesc.ptriangles = prun;
+			r_affinetridesc.numtriangles = ptri - prun;
 			D_PolysetDraw ();
 		}
-		else		
-		{	// partially clipped
-			R_AliasClipTriangle (ptri);
-		}
+		prun = ptri + 1;
+
+		if ( pfv[0]->flags & pfv[1]->flags & pfv[2]->flags & (ALIAS_XY_CLIP_MASK | ALIAS_Z_CLIP) )
+			continue;		// completely clipped
+
+	// partially clipped
+		r_affinetridesc.numtriangles = 1;
+		R_AliasClipTriangle (ptri);
 	}
+
+	if (ptri != prun)
+	{
+		r_affinetridesc.pfinalverts = pfinalverts;
+		r_affinetridesc.ptriangles = prun;
+		r_affinetridesc.numtriangles = ptri - prun;
+		D_PolysetDraw ();
+	}
+}
+
+
+/*
+================
+R_AliasAngleVectors
+
+AngleVectors into alias_forward/right/up, memoized on the raw angle bits
+================
+*/
+#define AV_MEMO_BITS	6
+
+typedef struct
+{
+	unsigned	key[3];
+	vec3_t		forward, right, up;
+} avmemo_t;
+
+static avmemo_t	av_memo[1<<AV_MEMO_BITS];
+
+static void R_AliasAngleVectors (vec3_t angles)
+{
+	unsigned	k0, k1, k2, h;
+	avmemo_t	*m;
+
+	memcpy (&k0, &angles[0], sizeof(k0));
+	memcpy (&k1, &angles[1], sizeof(k1));
+	memcpy (&k2, &angles[2], sizeof(k2));
+
+// all angles +-0: cheap to compute, and never matches an empty slot
+	if (!((k0 | k1 | k2) << 1))
+	{
+		AngleVectors (angles, alias_forward, alias_right, alias_up);
+		return;
+	}
+
+	h = k0*0x9E3779B1u ^ k1*0x85EBCA77u ^ k2*0xC2B2AE3Du;
+	h ^= h >> 15;
+	m = &av_memo[h >> (32 - AV_MEMO_BITS)];
+
+	if (m->key[0] == k0 && m->key[1] == k1 && m->key[2] == k2)
+	{
+		VectorCopy (m->forward, alias_forward);
+		VectorCopy (m->right, alias_right);
+		VectorCopy (m->up, alias_up);
+		return;
+	}
+
+	AngleVectors (angles, alias_forward, alias_right, alias_up);
+
+	m->key[0] = k0;
+	m->key[1] = k1;
+	m->key[2] = k2;
+	VectorCopy (alias_forward, m->forward);
+	VectorCopy (alias_right, m->right);
+	VectorCopy (alias_up, m->up);
 }
 
 
@@ -345,12 +436,11 @@ PQ_HOT void R_AliasSetUpTransform (int trivial_accept)
 
 // TODO: should really be stored with the entity instead of being reconstructed
 // TODO: should use a look-up table
-// TODO: could cache lazily, stored in the entity
 
 	angles[ROLL] = currententity->angles[ROLL];
 	angles[PITCH] = -currententity->angles[PITCH];
 	angles[YAW] = currententity->angles[YAW];
-	AngleVectors (angles, alias_forward, alias_right, alias_up);
+	R_AliasAngleVectors (angles);
 
 	tmatrix[0][0] = pmdl->scale[0];
 	tmatrix[1][1] = pmdl->scale[1];

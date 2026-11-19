@@ -119,6 +119,7 @@ float		r_aliastransition, r_resfudge;
 int		d_lightstylevalue[256];	// 8.8 fraction of base light value
 
 void R_MarkLeaves (void);
+static void R_ClearTopNodeMemo (void);
 
 extern int pq_gpu_zwrite_pending;
 
@@ -367,6 +368,8 @@ void R_NewMap (void)
 {
 	int		i;
 
+	R_ClearTopNodeMemo ();
+
 // clear out efrags in case the level hasn't been reloaded
 // FIXME: is this one short?
 	for (i=0 ; i<cl.worldmodel->numleafs ; i++)
@@ -536,11 +539,11 @@ void R_ViewChanged (vrect_t *pvrect, int lineadj, float aspect)
 // the polygon rasterization will never render in the first row or column
 // but will definately render in the [range] row and column, so adjust the
 // buffer origin to get an exact edge to edge fill
-	xcenter = ((float)r_refdef.vrect.width * XCENTERING) +
-			r_refdef.vrect.x - 0.5;
+	xcenter = ((float)r_refdef.vrect.width * (float)XCENTERING) +
+			r_refdef.vrect.x - 0.5f;
 	aliasxcenter = xcenter * r_aliasuvscale;
-	ycenter = ((float)r_refdef.vrect.height * YCENTERING) +
-			r_refdef.vrect.y - 0.5;
+	ycenter = ((float)r_refdef.vrect.height * (float)YCENTERING) +
+			r_refdef.vrect.y - 0.5f;
 	aliasycenter = ycenter * r_aliasuvscale;
 
 	xscale = r_refdef.vrect.width / r_refdef.horizontalFieldOfView;
@@ -615,14 +618,36 @@ void R_ViewChanged (vrect_t *pvrect, int lineadj, float aspect)
 
 /*
 ===============
+R_MarkLeaf
+===============
+*/
+static void R_MarkLeaf (mleaf_t *leaf)
+{
+	mnode_t	*node;
+
+	node = (mnode_t *)leaf;
+	do
+	{
+		if (node->visframe == r_visframecount)
+			break;
+		node->visframe = r_visframecount;
+		node = node->parent;
+	} while (node);
+}
+
+/*
+===============
 R_MarkLeaves
+
+Reads the view leaf's compressed PVS row directly (as Mod_DecompressVis
+would expand it), skipping zero runs
 ===============
 */
 void R_MarkLeaves (void)
 {
-	byte	*vis;
-	mnode_t	*node;
-	int		i;
+	byte	*in;
+	mleaf_t	*leafs, *leaf;
+	int		i, b, row, numleafs;
 
 	if (r_oldviewleaf == r_viewleaf)
 		return;
@@ -630,21 +655,35 @@ void R_MarkLeaves (void)
 	r_visframecount++;
 	r_oldviewleaf = r_viewleaf;
 
-	vis = Mod_LeafPVS (r_viewleaf, cl.worldmodel);
-		
-	for (i=0 ; i<cl.worldmodel->numleafs ; i++)
+	numleafs = cl.worldmodel->numleafs;
+	leafs = cl.worldmodel->leafs + 1;
+
+	if (r_viewleaf == cl.worldmodel->leafs || !r_viewleaf->compressed_vis)
+	{	// no vis info, so everything is visible
+		for (i=0 ; i<numleafs ; i++)
+			R_MarkLeaf (leafs + i);
+		return;
+	}
+
+	row = (numleafs+7)>>3;
+	in = r_viewleaf->compressed_vis;
+	i = 0;
+	while (i < row)
 	{
-		if (vis[i>>3] & (1<<(i&7)))
+		b = *in++;
+		if (!b)
 		{
-			node = (mnode_t *)&cl.worldmodel->leafs[i+1];
-			do
-			{
-				if (node->visframe == r_visframecount)
-					break;
-				node->visframe = r_visframecount;
-				node = node->parent;
-			} while (node);
+			i += *in++;
+			continue;
 		}
+
+		leaf = leafs + (i<<3);
+		if (++i == row && (numleafs & 7))
+			b &= (1<<(numleafs & 7)) - 1;
+
+		for ( ; b ; b >>= 1, leaf++)
+			if (b & 1)
+				R_MarkLeaf (leaf);
 	}
 }
 
@@ -879,6 +918,73 @@ int R_BmodelCheckBBox (model_t *clmodel, float *minmaxs)
 
 /*
 =============
+R_TopNodeMemo
+
+R_SplitEntityOnNode2 walks the world tree from the root for every visible
+brush model, and its answer is a pure function of the entity's box and the
+PVS generation (r_visframecount, which only changes when the view leaf
+changes).  Most brush models stand still, so cache the last answer per
+entity; R_NewMap clears the table.
+=============
+*/
+typedef struct
+{
+	entity_t	*ent;
+	int			visframe;
+	float		box[6];
+	mnode_t		*topnode;
+	int			pad[7];		/* one 64-byte cache line per entry */
+} topnodememo_t;
+
+#define TOPNODE_MEMO_BITS	6
+static topnodememo_t	r_topnode_memo[1<<TOPNODE_MEMO_BITS]
+	__attribute__((aligned(64)));
+
+static void R_ClearTopNodeMemo (void)
+{
+	memset (r_topnode_memo, 0, sizeof(r_topnode_memo));
+}
+
+static __attribute__((noinline)) mnode_t *R_BmodelTopNode (float *minmaxs)
+{
+	topnodememo_t	*memo;
+	unsigned		slot;
+	int				j;
+
+	/* hash the entity's slot number, not its address, so the table's hit
+	 * rate does not depend on where the linker put cl_entities */
+	slot = (unsigned)(((uintptr_t)currententity - (uintptr_t)cl_entities)
+		/ sizeof(entity_t));
+	memo = &r_topnode_memo[(slot * 2654435761u) >> (32 - TOPNODE_MEMO_BITS)];
+
+	if (memo->ent == currententity &&
+		memo->visframe == r_visframecount &&
+		memo->box[0] == minmaxs[0] && memo->box[1] == minmaxs[1] &&
+		memo->box[2] == minmaxs[2] && memo->box[3] == minmaxs[3] &&
+		memo->box[4] == minmaxs[4] && memo->box[5] == minmaxs[5])
+		return memo->topnode;
+
+	r_pefragtopnode = NULL;
+
+	for (j=0 ; j<3 ; j++)
+	{
+		r_emins[j] = minmaxs[j];
+		r_emaxs[j] = minmaxs[3+j];
+		memo->box[j] = minmaxs[j];
+		memo->box[3+j] = minmaxs[3+j];
+	}
+
+	R_SplitEntityOnNode2 (cl.worldmodel->nodes);
+
+	memo->ent = currententity;
+	memo->visframe = r_visframecount;
+	memo->topnode = r_pefragtopnode;
+
+	return r_pefragtopnode;
+}
+
+/*
+=============
 R_DrawBEntitiesOnList
 =============
 */
@@ -956,15 +1062,7 @@ void R_DrawBEntitiesOnList (void)
 				}
 				else
 				{
-					r_pefragtopnode = NULL;
-
-					for (j=0 ; j<3 ; j++)
-					{
-						r_emins[j] = minmaxs[j];
-						r_emaxs[j] = minmaxs[3+j];
-					}
-
-					R_SplitEntityOnNode2 (cl.worldmodel->nodes);
+					r_pefragtopnode = R_BmodelTopNode (minmaxs);
 
 					if (r_pefragtopnode)
 					{

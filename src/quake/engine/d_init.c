@@ -43,6 +43,8 @@ static float	basemip[NUM_MIPS-1] = {1.0f, 0.5f*0.8f, 0.25f*0.8f};
 
 extern int			d_aflatcolor;
 
+extern void			D_Q29BeginFrame (void);
+
 void (*d_drawspans) (espan_t *pspan);
 
 
@@ -167,6 +169,8 @@ void D_SetupFrame (void)
 #endif
 
 	d_aflatcolor = 0;
+
+	D_Q29BeginFrame ();
 }
 
 

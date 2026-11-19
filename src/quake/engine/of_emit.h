@@ -155,9 +155,10 @@ int of_emit_fasttex_active(void);
 uint32_t of_emit_tex_create(const void *pixels, uint16_t w, uint16_t h, uint32_t nbytes);
 
 /* Register the animated sky as a DYNAMIC (in-place) texture; returns its GPU
- * base address.  Call of_emit_sky_update() after each rebuild. */
+ * base address.  Call of_emit_sky_update() after each rebuild with the rows
+ * the GPU can sample: the first row_bytes of each row_stride-byte row. */
 uint32_t of_emit_sky_create(void *pixels, uint16_t w, uint16_t h);
-void     of_emit_sky_update(uint32_t nbytes);
+void     of_emit_sky_update(uint32_t row_stride, uint32_t row_bytes, uint32_t rows);
 
 /* GPU base address of an SDRAM source the GPU samples in place (turbulent
  * scratch rows): memory-agnostic, matches the texture manager's addressing. */
@@ -195,8 +196,39 @@ void of_emit_bind_fb(uint32_t fb_addr, int fb_stride,
                      uint32_t zb_addr, int zb_stride_bytes);
 void of_emit_finish(void);
 void of_emit_kick(void);    /* publish queued commands without waiting */
+/* Publish every queued command now, regardless of batch size.  Does not
+ * wait for the GPU and leaves the CPU-sync state set: it does not replace
+ * of_emit_finish / of_emit_prepare_framebuffer_for_cpu before CPU
+ * framebuffer or z-buffer access.  The GPU reads texture sources when it
+ * runs a command, so publishing during the world pass changes pixels where
+ * D_SCAlloc later reuses a queued surface-cache block in the same frame. */
+void of_emit_publish(void);
 void of_emit_prepare_framebuffer_for_cpu(void);
 void of_emit_texture_cache_flush(void);
+/* Number of texture-cache flushes issued to the GPU so far. */
+extern uint32_t of_emit_tex_flush_epoch;
+
+/* GPU synchronization counters accumulated since the previous take.  The
+ * us_* phases are sampled only while host_speeds >= 2. */
+typedef struct of_emit_perf_s {
+    uint32_t frames;
+    uint32_t finishes;          /* of_emit_finish drains, all callers */
+    uint32_t finishes_bind;     /* ... from fetch-domain binds */
+    uint32_t finishes_prep;     /* ... from prepare_framebuffer_for_cpu */
+    uint32_t tex_flushes;
+    uint32_t us_encode;         /* of_emit_finish: span flush */
+    uint32_t us_publish;        /* of_emit_finish: fence + publish */
+    uint32_t us_wait;           /* of_emit_finish: GPU drain wait */
+    uint32_t us_fence;          /* VID_WaitSync: flip fence + acquire */
+    uint32_t us_vsync;          /* VID_Update: present wait */
+    uint32_t us_flip_submit;    /* VID_Update: span flush + flip publish */
+    uint32_t ring_waits;        /* SDK ring-full waits, spin iterations, */
+    uint32_t ring_spins;        /*  lowest free ring bytes seen */
+    uint32_t ring_min_free;
+    uint32_t dma_waits;
+    uint32_t dma_spins;
+} of_emit_perf_t;
+void of_emit_perf_take(of_emit_perf_t *out);
 void of_emit_cache_clean(const void *addr, uint32_t size);
 void of_emit_cache_clean_once(const void *addr, uint32_t size);
 void of_emit_cache_clean_forget(const void *addr, uint32_t size);
@@ -230,6 +262,11 @@ void of_emit_span(const of_emit_span_t *sp);
 int of_emit_param_span_list(const of_emit_param_span_list_t *params,
                             const of_emit_param_span_record_t *records,
                             uint32_t record_count);
+/* Same as of_emit_param_span_list for callers that guarantee every record
+ * count is in 1..4095 (skips the per-chunk count scan). */
+int of_emit_param_span_list_known(const of_emit_param_span_list_t *params,
+                                  const of_emit_param_span_record_t *records,
+                                  uint32_t record_count);
 
 /* Solid-color rectangle fill via the GPU's CMD_CLEAR_RECT primitive.
  * (dst_x, dst_y) are in bound-FB pixel coords; (w, h) are pixels;
@@ -245,7 +282,8 @@ void of_emit_clear_rect_addr(uint32_t fb_addr, int fb_stride,
  * no perspective, no colormap.  When `skip_key_ff` is non-zero,
  * source bytes equal to 0xFF are not written (Quake's TRANSPARENT_COLOR).
  * Caller is responsible for clipping; coords go straight to the GPU.
- * Internally emits one DRAW_SPAN per row. */
+ * Emits one affine param-span list, or an affine lane per row for short
+ * blits and cores without the span-list command. */
 void of_emit_blit(int dst_x, int dst_y,
                   int blit_w, int blit_h,
                   const unsigned char *src,

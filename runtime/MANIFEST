@@ -1,17 +1,22 @@
+# Scoped Pocket refresh 2026-11-18 (openfpgaOS v0.9.1, source 2f0e66d):
+# pocket/os25.rbf_r and pocket/ap_core.sof (single-cycle shifts; seed 28,
+# setup -0.601 ns, worst hold +0.092 ns at the configured 100 MHz; not
+# 100 MHz timing closure) and pocket/os.bin.  Other entries retain their
+# prior provenance; pocket/os30.rbf_r still has the /16 mixer.
 # openfpgaOS runtime publish manifest — written by 'make sdk'.
 # Consumers (platforms/<t>/image.sh) verify staged artifacts against
 # these md5s; a mismatch means a hand-mixed runtime set, which boots
-# into undefined behaviour.  source: 618a3eb
+# into undefined behaviour.  source: openfpgaos-mister-v0.9.5-dirty
 31bc2d0db1caf2b23681fdb4b1ab0f82  ./analogizer.cfg
 769c01d5b16c190a9d7745264e5072e4  ./bank.ofsf
 acf1c1890500c1510892943312b46f10  ./mister/openfpgaOS.rbf
 a31391dd00da16333bade23b6c337fdf  ./mister/os.bin
-42eafd790fffe06d9a5b180712b38a2e  ./pocket/ap_core.sof
+d3b3187a972621dd185f6922d0a1bd3e  ./pocket/ap_core.sof
 48c625e82daf68d14680893ac8cb27af  ./pocket/loader.bin
 faad7e5e84ea0f864587712dfd16a98f  ./pocket/os20.rbf_r
-637c8e0f2656f5ac7344e43f98262617  ./pocket/os25.rbf_r
+98b37966a5e0543d9a7c4a0762af16c8  ./pocket/os25.rbf_r
 3a960eeb817d8bd4e4f7d789e29e7f20  ./pocket/os25zf.rbf_r
 8558cba71c7bb0c1ac835b9c59046ec1  ./pocket/os30-macxf.rbf_r
 85bd093d1935d16eecd68343ef5eb3b0  ./pocket/os30.rbf_r
 a0811076cb58ea950f39cdecf67332be  ./pocket/os30-vtx.rbf_r
-cdc237dc18192844beff9375ebe4e7b1  ./pocket/os.bin
+1cfb6a10ab683f3a223736f5fadbac76  ./pocket/os.bin

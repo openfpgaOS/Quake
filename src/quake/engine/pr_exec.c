@@ -356,12 +356,65 @@ int PR_LeaveFunction (void)
 /*
 ====================
 PR_ExecuteProgram
+
+pr_xstatement and pr_xfunction->profile are only brought up to date
+before anything that can read them: calls, returns, and error paths.
+The statements executed since the last update are seg - runaway.
 ====================
 */
+#define	PR_SYNC()	(pr_xstatement = st - statements, pr_xfunction->profile += seg - runaway, seg = runaway)
+
+// threaded dispatch: every handler ends in its own indirect jump, so the
+// predictor keeps one target per opcode instead of one for the whole switch,
+// and only the operands a handler uses are ever formed
+#define	OPA		((eval_t *)&globals[st->a])
+#define	OPB		((eval_t *)&globals[st->b])
+#define	OPC		((eval_t *)&globals[st->c])
+
+#define	NEXT()								\
+	{										\
+		if (!--runaway)						\
+			goto runaway_error;				\
+		st++;								\
+		if (trace)							\
+			goto traced;					\
+		if (st->op > OP_BITOR)				\
+			goto bad_opcode;				\
+		goto *jt[st->op];					\
+	}
+
 void PR_ExecuteProgram (func_t fnum)
 {
+	static void	*const dispatch[OP_BITOR+1] =
+	{
+		&&L_DONE,		&&L_MUL_F,		&&L_MUL_V,		&&L_MUL_FV,
+		&&L_MUL_VF,		&&L_DIV_F,		&&L_ADD_F,		&&L_ADD_V,
+		&&L_SUB_F,		&&L_SUB_V,
+		&&L_EQ_F,		&&L_EQ_V,		&&L_EQ_S,		&&L_EQ_E,
+		&&L_EQ_FNC,
+		&&L_NE_F,		&&L_NE_V,		&&L_NE_S,		&&L_NE_E,
+		&&L_NE_FNC,
+		&&L_LE,			&&L_GE,			&&L_LT,			&&L_GT,
+		&&L_LOAD_F,		&&L_LOAD_V,		&&L_LOAD_S,		&&L_LOAD_ENT,
+		&&L_LOAD_FLD,	&&L_LOAD_FNC,
+		&&L_ADDRESS,
+		&&L_STORE_F,	&&L_STORE_V,	&&L_STORE_S,	&&L_STORE_ENT,
+		&&L_STORE_FLD,	&&L_STORE_FNC,
+		&&L_STOREP_F,	&&L_STOREP_V,	&&L_STOREP_S,	&&L_STOREP_ENT,
+		&&L_STOREP_FLD,	&&L_STOREP_FNC,
+		&&L_RETURN,
+		&&L_NOT_F,		&&L_NOT_V,		&&L_NOT_S,		&&L_NOT_ENT,
+		&&L_NOT_FNC,
+		&&L_IF,			&&L_IFNOT,
+		&&L_CALL0,		&&L_CALL1,		&&L_CALL2,		&&L_CALL3,
+		&&L_CALL4,		&&L_CALL5,		&&L_CALL6,		&&L_CALL7,
+		&&L_CALL8,
+		&&L_STATE,		&&L_GOTO,
+		&&L_AND,		&&L_OR,
+		&&L_BITAND,		&&L_BITOR
+	};
+	void	*const *jt;
 	eval_t	*a, *b, *c;
-	int			s;
 	dstatement_t	*st;
 	dfunction_t	*f, *newf;
 	int		runaway;
@@ -369,6 +422,10 @@ void PR_ExecuteProgram (func_t fnum)
 	edict_t	*ed;
 	int		exitdepth;
 	eval_t	*ptr;
+	int		seg;
+	qboolean	trace;
+	dstatement_t	*statements;
+	float	*globals;
 
 	if (!fnum || fnum >= progs->numfunctions)
 	{
@@ -376,293 +433,323 @@ void PR_ExecuteProgram (func_t fnum)
 			ED_Print (PROG_TO_EDICT(pr_global_struct->self));
 		Host_Error ("PR_ExecuteProgram: NULL function");
 	}
-	
+
 	f = &pr_functions[fnum];
 
 	runaway = 0x1000000; /* QuakeSpasm: was 100000 */
 	pr_trace = false;
+	trace = false;
 
 // make a stack frame
 	exitdepth = pr_depth;
 
-	s = PR_EnterFunction (f);
-	
-while (1)
-{
-	s++;	// next statement
+// progs can't be reloaded while they are running
+	statements = pr_statements;
+	globals = pr_globals;
+	jt = dispatch;
 
-	st = &pr_statements[s];
-	a = (eval_t *)&pr_globals[st->a];
-	b = (eval_t *)&pr_globals[st->b];
-	c = (eval_t *)&pr_globals[st->c];
-	
-	if (!--runaway)
-		PR_RunError ("runaway loop error");
-		
-	pr_xfunction->profile++;
-	pr_xstatement = s;
-	
-	if (pr_trace)
-		PR_PrintStatement (st);
-		
-	switch (st->op)
+	st = statements + PR_EnterFunction (f);	// PR_EnterFunction offsets the st++
+	seg = runaway;
+
+	NEXT ();
+
+runaway_error:
+	// st is the statement about to run; at a call its own PR_SYNC site is
+	// the better report, so leave pr_xstatement alone there
+	if ((unsigned)(st->op - OP_CALL0) > OP_CALL8 - OP_CALL0)
+		pr_xstatement = st - statements;
+	pr_xfunction->profile += seg - 1;
+	PR_RunError ("runaway loop error");
+
+traced:
+	PR_SYNC ();
+	PR_PrintStatement (st);
+	if (st->op > OP_BITOR)
+		goto bad_opcode;
+	goto *jt[st->op];
+
+bad_opcode:
+	PR_SYNC ();
+	PR_RunError ("Bad opcode %i", st->op);
+
+L_ADD_F:
+	OPC->_float = OPA->_float + OPB->_float;
+	NEXT ();
+L_ADD_V:
+	a = OPA;	b = OPB;	c = OPC;
+	c->vector[0] = a->vector[0] + b->vector[0];
+	c->vector[1] = a->vector[1] + b->vector[1];
+	c->vector[2] = a->vector[2] + b->vector[2];
+	NEXT ();
+
+L_SUB_F:
+	OPC->_float = OPA->_float - OPB->_float;
+	NEXT ();
+L_SUB_V:
+	a = OPA;	b = OPB;	c = OPC;
+	c->vector[0] = a->vector[0] - b->vector[0];
+	c->vector[1] = a->vector[1] - b->vector[1];
+	c->vector[2] = a->vector[2] - b->vector[2];
+	NEXT ();
+
+L_MUL_F:
+	OPC->_float = OPA->_float * OPB->_float;
+	NEXT ();
+L_MUL_V:
+	a = OPA;	b = OPB;
+	OPC->_float = a->vector[0]*b->vector[0]
+			+ a->vector[1]*b->vector[1]
+			+ a->vector[2]*b->vector[2];
+	NEXT ();
+L_MUL_FV:
+	a = OPA;	b = OPB;	c = OPC;
+	c->vector[0] = a->_float * b->vector[0];
+	c->vector[1] = a->_float * b->vector[1];
+	c->vector[2] = a->_float * b->vector[2];
+	NEXT ();
+L_MUL_VF:
+	a = OPA;	b = OPB;	c = OPC;
+	c->vector[0] = b->_float * a->vector[0];
+	c->vector[1] = b->_float * a->vector[1];
+	c->vector[2] = b->_float * a->vector[2];
+	NEXT ();
+
+L_DIV_F:
+	OPC->_float = OPA->_float / OPB->_float;
+	NEXT ();
+
+L_BITAND:
+	OPC->_float = (int)OPA->_float & (int)OPB->_float;
+	NEXT ();
+
+L_BITOR:
+	OPC->_float = (int)OPA->_float | (int)OPB->_float;
+	NEXT ();
+
+
+L_GE:
+	OPC->_float = OPA->_float >= OPB->_float;
+	NEXT ();
+L_LE:
+	OPC->_float = OPA->_float <= OPB->_float;
+	NEXT ();
+L_GT:
+	OPC->_float = OPA->_float > OPB->_float;
+	NEXT ();
+L_LT:
+	OPC->_float = OPA->_float < OPB->_float;
+	NEXT ();
+L_AND:
+	OPC->_float = OPA->_float && OPB->_float;
+	NEXT ();
+L_OR:
+	OPC->_float = OPA->_float || OPB->_float;
+	NEXT ();
+
+L_NOT_F:
+	OPC->_float = !OPA->_float;
+	NEXT ();
+L_NOT_V:
+	a = OPA;
+	OPC->_float = !a->vector[0] && !a->vector[1] && !a->vector[2];
+	NEXT ();
+L_NOT_S:
+	a = OPA;
+	PR_SYNC ();		// PR_GetString can Host_Error
+	OPC->_float = !a->string || !*PR_GetString(a->string);
+	NEXT ();
+L_NOT_FNC:
+	OPC->_float = !OPA->function;
+	NEXT ();
+L_NOT_ENT:
+	OPC->_float = (PROG_TO_EDICT(OPA->edict) == sv.edicts);
+	NEXT ();
+
+L_EQ_F:
+	OPC->_float = OPA->_float == OPB->_float;
+	NEXT ();
+L_EQ_V:
+	a = OPA;	b = OPB;
+	OPC->_float = (a->vector[0] == b->vector[0]) &&
+				(a->vector[1] == b->vector[1]) &&
+				(a->vector[2] == b->vector[2]);
+	NEXT ();
+L_EQ_S:
+	a = OPA;	b = OPB;
+	PR_SYNC ();
+	OPC->_float = !strcmp(PR_GetString(a->string),PR_GetString(b->string));
+	NEXT ();
+L_EQ_E:
+	OPC->_float = OPA->_int == OPB->_int;
+	NEXT ();
+L_EQ_FNC:
+	OPC->_float = OPA->function == OPB->function;
+	NEXT ();
+
+
+L_NE_F:
+	OPC->_float = OPA->_float != OPB->_float;
+	NEXT ();
+L_NE_V:
+	a = OPA;	b = OPB;
+	OPC->_float = (a->vector[0] != b->vector[0]) ||
+				(a->vector[1] != b->vector[1]) ||
+				(a->vector[2] != b->vector[2]);
+	NEXT ();
+L_NE_S:
+	a = OPA;	b = OPB;
+	PR_SYNC ();
+	OPC->_float = strcmp(PR_GetString(a->string),PR_GetString(b->string));
+	NEXT ();
+L_NE_E:
+	OPC->_float = OPA->_int != OPB->_int;
+	NEXT ();
+L_NE_FNC:
+	OPC->_float = OPA->function != OPB->function;
+	NEXT ();
+
+//==================
+L_STORE_F:
+L_STORE_ENT:
+L_STORE_FLD:		// integers
+L_STORE_S:
+L_STORE_FNC:		// pointers
+	OPB->_int = OPA->_int;
+	NEXT ();
+L_STORE_V:
+	a = OPA;	b = OPB;
+	b->vector[0] = a->vector[0];
+	b->vector[1] = a->vector[1];
+	b->vector[2] = a->vector[2];
+	NEXT ();
+
+L_STOREP_F:
+L_STOREP_ENT:
+L_STOREP_FLD:		// integers
+L_STOREP_S:
+L_STOREP_FNC:		// pointers
+	ptr = (eval_t *)((byte *)sv.edicts + OPB->_int);
+	ptr->_int = OPA->_int;
+	NEXT ();
+L_STOREP_V:
+	a = OPA;
+	ptr = (eval_t *)((byte *)sv.edicts + OPB->_int);
+	ptr->vector[0] = a->vector[0];
+	ptr->vector[1] = a->vector[1];
+	ptr->vector[2] = a->vector[2];
+	NEXT ();
+
+L_ADDRESS:
+	ed = PROG_TO_EDICT(OPA->edict);
+#ifdef PARANOID
+	NUM_FOR_EDICT(ed);		// make sure it's in range
+#endif
+	if (ed == (edict_t *)sv.edicts && sv.state == ss_active)
 	{
-	case OP_ADD_F:
-		c->_float = a->_float + b->_float;
-		break;
-	case OP_ADD_V:
-		c->vector[0] = a->vector[0] + b->vector[0];
-		c->vector[1] = a->vector[1] + b->vector[1];
-		c->vector[2] = a->vector[2] + b->vector[2];
-		break;
-		
-	case OP_SUB_F:
-		c->_float = a->_float - b->_float;
-		break;
-	case OP_SUB_V:
-		c->vector[0] = a->vector[0] - b->vector[0];
-		c->vector[1] = a->vector[1] - b->vector[1];
-		c->vector[2] = a->vector[2] - b->vector[2];
-		break;
+		PR_SYNC ();
+		PR_RunError ("assignment to world entity");
+	}
+	OPC->_int = (byte *)((int *)&ed->v + OPB->_int) - (byte *)sv.edicts;
+	NEXT ();
 
-	case OP_MUL_F:
-		c->_float = a->_float * b->_float;
-		break;
-	case OP_MUL_V:
-		c->_float = a->vector[0]*b->vector[0]
-				+ a->vector[1]*b->vector[1]
-				+ a->vector[2]*b->vector[2];
-		break;
-	case OP_MUL_FV:
-		c->vector[0] = a->_float * b->vector[0];
-		c->vector[1] = a->_float * b->vector[1];
-		c->vector[2] = a->_float * b->vector[2];
-		break;
-	case OP_MUL_VF:
-		c->vector[0] = b->_float * a->vector[0];
-		c->vector[1] = b->_float * a->vector[1];
-		c->vector[2] = b->_float * a->vector[2];
-		break;
+L_LOAD_F:
+L_LOAD_FLD:
+L_LOAD_ENT:
+L_LOAD_S:
+L_LOAD_FNC:
+	ed = PROG_TO_EDICT(OPA->edict);
+#ifdef PARANOID
+	NUM_FOR_EDICT(ed);		// make sure it's in range
+#endif
+	a = (eval_t *)((int *)&ed->v + OPB->_int);
+	OPC->_int = a->_int;
+	NEXT ();
 
-	case OP_DIV_F:
-		c->_float = a->_float / b->_float;
-		break;
-	
-	case OP_BITAND:
-		c->_float = (int)a->_float & (int)b->_float;
-		break;
-	
-	case OP_BITOR:
-		c->_float = (int)a->_float | (int)b->_float;
-		break;
-	
-		
-	case OP_GE:
-		c->_float = a->_float >= b->_float;
-		break;
-	case OP_LE:
-		c->_float = a->_float <= b->_float;
-		break;
-	case OP_GT:
-		c->_float = a->_float > b->_float;
-		break;
-	case OP_LT:
-		c->_float = a->_float < b->_float;
-		break;
-	case OP_AND:
-		c->_float = a->_float && b->_float;
-		break;
-	case OP_OR:
-		c->_float = a->_float || b->_float;
-		break;
-		
-	case OP_NOT_F:
-		c->_float = !a->_float;
-		break;
-	case OP_NOT_V:
-		c->_float = !a->vector[0] && !a->vector[1] && !a->vector[2];
-		break;
-	case OP_NOT_S:
-		c->_float = !a->string || !*PR_GetString(a->string);
-		break;
-	case OP_NOT_FNC:
-		c->_float = !a->function;
-		break;
-	case OP_NOT_ENT:
-		c->_float = (PROG_TO_EDICT(a->edict) == sv.edicts);
-		break;
-
-	case OP_EQ_F:
-		c->_float = a->_float == b->_float;
-		break;
-	case OP_EQ_V:
-		c->_float = (a->vector[0] == b->vector[0]) &&
-					(a->vector[1] == b->vector[1]) &&
-					(a->vector[2] == b->vector[2]);
-		break;
-	case OP_EQ_S:
-		c->_float = !strcmp(PR_GetString(a->string),PR_GetString(b->string));
-		break;
-	case OP_EQ_E:
-		c->_float = a->_int == b->_int;
-		break;
-	case OP_EQ_FNC:
-		c->_float = a->function == b->function;
-		break;
-
-
-	case OP_NE_F:
-		c->_float = a->_float != b->_float;
-		break;
-	case OP_NE_V:
-		c->_float = (a->vector[0] != b->vector[0]) ||
-					(a->vector[1] != b->vector[1]) ||
-					(a->vector[2] != b->vector[2]);
-		break;
-	case OP_NE_S:
-		c->_float = strcmp(PR_GetString(a->string),PR_GetString(b->string));
-		break;
-	case OP_NE_E:
-		c->_float = a->_int != b->_int;
-		break;
-	case OP_NE_FNC:
-		c->_float = a->function != b->function;
-		break;
+L_LOAD_V:
+	ed = PROG_TO_EDICT(OPA->edict);
+#ifdef PARANOID
+	NUM_FOR_EDICT(ed);		// make sure it's in range
+#endif
+	a = (eval_t *)((int *)&ed->v + OPB->_int);
+	c = OPC;
+	c->vector[0] = a->vector[0];
+	c->vector[1] = a->vector[1];
+	c->vector[2] = a->vector[2];
+	NEXT ();
 
 //==================
-	case OP_STORE_F:
-	case OP_STORE_ENT:
-	case OP_STORE_FLD:		// integers
-	case OP_STORE_S:
-	case OP_STORE_FNC:		// pointers
-		b->_int = a->_int;
-		break;
-	case OP_STORE_V:
-		b->vector[0] = a->vector[0];
-		b->vector[1] = a->vector[1];
-		b->vector[2] = a->vector[2];
-		break;
-		
-	case OP_STOREP_F:
-	case OP_STOREP_ENT:
-	case OP_STOREP_FLD:		// integers
-	case OP_STOREP_S:
-	case OP_STOREP_FNC:		// pointers
-		ptr = (eval_t *)((byte *)sv.edicts + b->_int);
-		ptr->_int = a->_int;
-		break;
-	case OP_STOREP_V:
-		ptr = (eval_t *)((byte *)sv.edicts + b->_int);
-		ptr->vector[0] = a->vector[0];
-		ptr->vector[1] = a->vector[1];
-		ptr->vector[2] = a->vector[2];
-		break;
-		
-	case OP_ADDRESS:
-		ed = PROG_TO_EDICT(a->edict);
-#ifdef PARANOID
-		NUM_FOR_EDICT(ed);		// make sure it's in range
-#endif
-		if (ed == (edict_t *)sv.edicts && sv.state == ss_active)
-			PR_RunError ("assignment to world entity");
-		c->_int = (byte *)((int *)&ed->v + b->_int) - (byte *)sv.edicts;
-		break;
-		
-	case OP_LOAD_F:
-	case OP_LOAD_FLD:
-	case OP_LOAD_ENT:
-	case OP_LOAD_S:
-	case OP_LOAD_FNC:
-		ed = PROG_TO_EDICT(a->edict);
-#ifdef PARANOID
-		NUM_FOR_EDICT(ed);		// make sure it's in range
-#endif
-		a = (eval_t *)((int *)&ed->v + b->_int);
-		c->_int = a->_int;
-		break;
 
-	case OP_LOAD_V:
-		ed = PROG_TO_EDICT(a->edict);
-#ifdef PARANOID
-		NUM_FOR_EDICT(ed);		// make sure it's in range
-#endif
-		a = (eval_t *)((int *)&ed->v + b->_int);
-		c->vector[0] = a->vector[0];
-		c->vector[1] = a->vector[1];
-		c->vector[2] = a->vector[2];
-		break;
-		
-//==================
+L_IFNOT:
+	if (!OPA->_int)
+		st += st->b - 1;	// offset the st++
+	NEXT ();
 
-	case OP_IFNOT:
-		if (!a->_int)
-			s += st->b - 1;	// offset the s++
-		break;
-		
-	case OP_IF:
-		if (a->_int)
-			s += st->b - 1;	// offset the s++
-		break;
-		
-	case OP_GOTO:
-		s += st->a - 1;	// offset the s++
-		break;
-		
-	case OP_CALL0:
-	case OP_CALL1:
-	case OP_CALL2:
-	case OP_CALL3:
-	case OP_CALL4:
-	case OP_CALL5:
-	case OP_CALL6:
-	case OP_CALL7:
-	case OP_CALL8:
-		pr_argc = st->op - OP_CALL0;
-		if (!a->function)
-			PR_RunError ("NULL function");
+L_IF:
+	if (OPA->_int)
+		st += st->b - 1;	// offset the st++
+	NEXT ();
 
-		newf = &pr_functions[a->function];
+L_GOTO:
+	st += st->a - 1;	// offset the st++
+	NEXT ();
 
-		if (newf->first_statement < 0)
-		{	// negative statements are built in functions
-			i = -newf->first_statement;
-			if (i >= pr_numbuiltins)
-				PR_RunError ("Bad builtin call number");
-			pr_builtins[i] ();
-			break;
-		}
+L_CALL0:
+L_CALL1:
+L_CALL2:
+L_CALL3:
+L_CALL4:
+L_CALL5:
+L_CALL6:
+L_CALL7:
+L_CALL8:
+	a = OPA;
+	PR_SYNC ();
+	pr_argc = st->op - OP_CALL0;
+	if (!a->function)
+		PR_RunError ("NULL function");
 
-		s = PR_EnterFunction (newf);
-		break;
+	newf = &pr_functions[a->function];
 
-	case OP_DONE:
-	case OP_RETURN:
-		pr_globals[OFS_RETURN] = pr_globals[(unsigned short)st->a];
-		pr_globals[OFS_RETURN+1] = pr_globals[(unsigned short)st->a+1];
-		pr_globals[OFS_RETURN+2] = pr_globals[(unsigned short)st->a+2];
-	
-		s = PR_LeaveFunction ();
-		if (pr_depth == exitdepth)
-			return;		// all done
-		break;
-		
-	case OP_STATE:
-		ed = PROG_TO_EDICT(pr_global_struct->self);
+	if (newf->first_statement < 0)
+	{	// negative statements are built in functions
+		i = -newf->first_statement;
+		if (i >= pr_numbuiltins)
+			PR_RunError ("Bad builtin call number");
+		pr_builtins[i] ();
+		trace = pr_trace;
+		NEXT ();
+	}
+
+	st = statements + PR_EnterFunction (newf);
+	NEXT ();
+
+L_DONE:
+L_RETURN:
+	globals[OFS_RETURN] = globals[(unsigned short)st->a];
+	globals[OFS_RETURN+1] = globals[(unsigned short)st->a+1];
+	globals[OFS_RETURN+2] = globals[(unsigned short)st->a+2];
+
+	PR_SYNC ();
+	st = statements + PR_LeaveFunction ();
+	if (pr_depth == exitdepth)
+		return;		// all done
+	NEXT ();
+
+L_STATE:
+	ed = PROG_TO_EDICT(pr_global_struct->self);
 #ifdef FPS_20
-		ed->v.nextthink = pr_global_struct->time + 0.05;
+	ed->v.nextthink = pr_global_struct->time + 0.05;
 #else
+	if (fabsf(pr_global_struct->time) >= 0.5f)
+		ed->v.nextthink = pr_global_struct->time + 0.1f;	// same float as the double sum
+	else
 		ed->v.nextthink = pr_global_struct->time + 0.1;
 #endif
-		if (a->_float != ed->v.frame)
-		{
-			ed->v.frame = a->_float;
-		}
-		ed->v.think = b->function;
-		break;
-		
-	default:
-		PR_RunError ("Bad opcode %i", st->op);
+	a = OPA;
+	if (a->_float != ed->v.frame)
+	{
+		ed->v.frame = a->_float;
 	}
-}
-
+	ed->v.think = OPB->function;
+	NEXT ();
 }

@@ -330,37 +330,58 @@ void SV_FindTouchedLeafs (edict_t *ent, mnode_t *node)
 	mplane_t	*splitplane;
 	mleaf_t		*leaf;
 	int			sides;
+	int			notfront, back;
 	int			leafnum;
+	float		dist;
 
-	if (node->contents == CONTENTS_SOLID)
-		return;
-	
-// add an efrag if the node is a leaf
-
-	if ( node->contents < 0)
+	while (1)
 	{
-		if (ent->num_leafs == MAX_ENT_LEAFS)
+		if (node->contents == CONTENTS_SOLID)
 			return;
 
-		leaf = (mleaf_t *)node;
-		leafnum = leaf - sv.worldmodel->leafs - 1;
+	// add an efrag if the node is a leaf
 
-		ent->leafnums[ent->num_leafs] = leafnum;
-		ent->num_leafs++;			
-		return;
+		if ( node->contents < 0)
+		{
+			if (ent->num_leafs == MAX_ENT_LEAFS)
+				return;
+
+			leaf = (mleaf_t *)node;
+			leafnum = leaf - sv.worldmodel->leafs - 1;
+
+			ent->leafnums[ent->num_leafs] = leafnum;
+			ent->num_leafs++;
+			return;
+		}
+
+	// NODE_MIXED
+
+		splitplane = node->plane;
+
+	// BOX_ON_PLANE_SIDE as two independent compares: which side the box is on
+	// is close to a coin flip, so it picks a child index instead of a branch
+		if (splitplane->type < 3)
+		{
+			dist = splitplane->dist;
+			notfront = (ent->v.absmin[splitplane->type] < dist);
+			back = (ent->v.absmax[splitplane->type] <= dist);
+		}
+		else
+		{
+		// sides is 1, 2 or 3: BoxOnPlaneSide rounds both corner distances
+		// through the same chain, so for absmin <= absmax it never returns 0
+			sides = BoxOnPlaneSide (ent->v.absmin, ent->v.absmax, splitplane);
+			notfront = (sides != 1);
+			back = (sides == 2);
+		}
+
+	// recurse down the contacted sides, side 0 first as the recursion did;
+	// notfront > back is the both-sides case
+		if (notfront > back)
+			SV_FindTouchedLeafs (ent, node->children[0]);
+
+		node = node->children[notfront];
 	}
-	
-// NODE_MIXED
-
-	splitplane = node->plane;
-	sides = BOX_ON_PLANE_SIDE(ent->v.absmin, ent->v.absmax, splitplane);
-	
-// recurse down the contacted sides
-	if (sides & 1)
-		SV_FindTouchedLeafs (ent, node->children[0]);
-		
-	if (sides & 2)
-		SV_FindTouchedLeafs (ent, node->children[1]);
 }
 
 /*
@@ -503,10 +524,9 @@ PQ_HOT int SV_HullPointContents (hull_t *hull, int num, vec3_t p)
 			d = p[plane->type] - plane->dist;
 		else
 			d = DotProduct (plane->normal, p) - plane->dist;
-		if (d < 0)
-			num = node->children[1];
-		else
-			num = node->children[0];
+	// branchless descent: the sign of d is unpredictable, so index the
+	// children instead of branching on it
+		num = node->children[d < 0];
 	}
 	
 	return num;
@@ -577,8 +597,9 @@ SV_RecursiveHullCheck
 */
 qboolean SV_RecursiveHullCheck (hull_t *hull, int num, float p1f, float p2f, vec3_t p1, vec3_t p2, trace_t *trace)
 {
-	mclipnode_t	*node;
-	mplane_t	*plane;
+	mclipnode_t	*clipnodes, *node;
+	mplane_t	*planes, *plane;
+	int			firstclipnode, lastclipnode;
 	float		t1, t2;
 	float		frac;
 	int			i;
@@ -586,56 +607,70 @@ qboolean SV_RecursiveHullCheck (hull_t *hull, int num, float p1f, float p2f, vec
 	int			side;
 	float		midf;
 
-// check for empty
-	if (num < 0)
+	clipnodes = hull->clipnodes;
+	planes = hull->planes;
+	firstclipnode = hull->firstclipnode;
+	lastclipnode = hull->lastclipnode;
+
+// descend as long as both endpoints stay on one side of the node plane; the
+// hull fields stay in registers instead of being reloaded per node
+	while (1)
 	{
-		if (num != CONTENTS_SOLID)
+	// check for empty
+		if (num < 0)
 		{
-			trace->allsolid = false;
-			if (num == CONTENTS_EMPTY)
-				trace->inopen = true;
+			if (num != CONTENTS_SOLID)
+			{
+				trace->allsolid = false;
+				if (num == CONTENTS_EMPTY)
+					trace->inopen = true;
+				else
+					trace->inwater = true;
+			}
 			else
-				trace->inwater = true;
+				trace->startsolid = true;
+			return true;		// empty
+		}
+
+		if (num < firstclipnode || num > lastclipnode)
+			Sys_Error ("SV_RecursiveHullCheck: bad node number");
+
+	//
+	// find the point distances
+	//
+		node = clipnodes + num;
+		plane = planes + node->planenum;
+
+		if (plane->type < 3)
+		{
+			t1 = p1[plane->type] - plane->dist;
+			t2 = p2[plane->type] - plane->dist;
 		}
 		else
-			trace->startsolid = true;
-		return true;		// empty
-	}
+		{
+			t1 = DotProduct (plane->normal, p1) - plane->dist;
+			t2 = DotProduct (plane->normal, p2) - plane->dist;
+		}
 
-	if (num < hull->firstclipnode || num > hull->lastclipnode)
-		Sys_Error ("SV_RecursiveHullCheck: bad node number");
-
-//
-// find the point distances
-//
-	node = hull->clipnodes + num;
-	plane = hull->planes + node->planenum;
-
-	if (plane->type < 3)
-	{
-		t1 = p1[plane->type] - plane->dist;
-		t2 = p2[plane->type] - plane->dist;
+	// the sign of t1 is close to random here, so index the children with it
+	// instead of branching on it
+		side = (t1 < 0);
+		if (side != (t2 < 0))
+			break;			// the segment straddles the plane
+		num = node->children[side];
 	}
-	else
-	{
-		t1 = DotProduct (plane->normal, p1) - plane->dist;
-		t2 = DotProduct (plane->normal, p2) - plane->dist;
-	}
-	
-#if 1
-	if (t1 >= 0 && t2 >= 0)
-		return SV_RecursiveHullCheck (hull, node->children[0], p1f, p2f, p1, p2, trace);
-	if (t1 < 0 && t2 < 0)
-		return SV_RecursiveHullCheck (hull, node->children[1], p1f, p2f, p1, p2, trace);
-#else
-	if ( (t1 >= DIST_EPSILON && t2 >= DIST_EPSILON) || (t2 > t1 && t1 >= 0) )
-		return SV_RecursiveHullCheck (hull, node->children[0], p1f, p2f, p1, p2, trace);
-	if ( (t1 <= -DIST_EPSILON && t2 <= -DIST_EPSILON) || (t2 < t1 && t1 <= 0) )
-		return SV_RecursiveHullCheck (hull, node->children[1], p1f, p2f, p1, p2, trace);
-#endif
 
 // put the crosspoint DIST_EPSILON pixels on the near side
-	if (t1 < 0)
+// exact: for 1/64 <= |t1| < 2^19 the float numerator is exact and the float
+// divide rounds the same as the double divide; other t1 keep the double path
+	if (fabsf(t1) >= 0.015625f && fabsf(t1) < 524288.0f)
+	{
+		if (t1 < 0)
+			frac = (t1 + 0.03125f)/(t1-t2);
+		else
+			frac = (t1 - 0.03125f)/(t1-t2);
+	}
+	else if (t1 < 0)
 		frac = (t1 + DIST_EPSILON)/(t1-t2);
 	else
 		frac = (t1 - DIST_EPSILON)/(t1-t2);
@@ -647,8 +682,6 @@ qboolean SV_RecursiveHullCheck (hull_t *hull, int num, float p1f, float p2f, vec
 	midf = p1f + (p2f - p1f)*frac;
 	for (i=0 ; i<3 ; i++)
 		mid[i] = p1[i] + frac*(p2[i] - p1[i]);
-
-	side = (t1 < 0);
 
 // move up to the node
 	if (!SV_RecursiveHullCheck (hull, node->children[side], p1f, midf, p1, mid, trace) )
@@ -813,6 +846,17 @@ void SV_ClipToLinks ( areanode_t *node, moveclip_t *clip )
 	link_t		*l, *next;
 	edict_t		*touch;
 	trace_t		trace;
+	edict_t		*passedict;
+	int			type;
+	float		bmin0, bmin1, bmin2, bmax0, bmax1, bmax2;
+
+// nothing in the move but clip->trace changes while the list is walked, and
+// the exact clip below is a call, so keep the filter in registers
+	passedict = clip->passedict;
+	type = clip->type;
+	bmin0 = clip->boxmins[0];	bmax0 = clip->boxmaxs[0];
+	bmin1 = clip->boxmins[1];	bmax1 = clip->boxmaxs[1];
+	bmin2 = clip->boxmins[2];	bmax2 = clip->boxmaxs[2];
 
 // touch linked edicts
 	for (l = node->solid_edicts.next ; l != &node->solid_edicts ; l = next)
@@ -821,33 +865,33 @@ void SV_ClipToLinks ( areanode_t *node, moveclip_t *clip )
 		touch = EDICT_FROM_AREA(l);
 		if (touch->v.solid == SOLID_NOT)
 			continue;
-		if (touch == clip->passedict)
+		if (touch == passedict)
 			continue;
 		if (touch->v.solid == SOLID_TRIGGER)
 			Sys_Error ("Trigger in clipping list");
 
-		if (clip->type == MOVE_NOMONSTERS && touch->v.solid != SOLID_BSP)
+		if (type == MOVE_NOMONSTERS && touch->v.solid != SOLID_BSP)
 			continue;
 
-		if (clip->boxmins[0] > touch->v.absmax[0]
-		|| clip->boxmins[1] > touch->v.absmax[1]
-		|| clip->boxmins[2] > touch->v.absmax[2]
-		|| clip->boxmaxs[0] < touch->v.absmin[0]
-		|| clip->boxmaxs[1] < touch->v.absmin[1]
-		|| clip->boxmaxs[2] < touch->v.absmin[2] )
+		if (bmin0 > touch->v.absmax[0]
+		|| bmin1 > touch->v.absmax[1]
+		|| bmin2 > touch->v.absmax[2]
+		|| bmax0 < touch->v.absmin[0]
+		|| bmax1 < touch->v.absmin[1]
+		|| bmax2 < touch->v.absmin[2] )
 			continue;
 
-		if (clip->passedict && clip->passedict->v.size[0] && !touch->v.size[0])
+		if (passedict && passedict->v.size[0] && !touch->v.size[0])
 			continue;	// points never interact
 
 	// might intersect, so do an exact clip
 		if (clip->trace.allsolid)
 			return;
-		if (clip->passedict)
+		if (passedict)
 		{
-		 	if (PROG_TO_EDICT(touch->v.owner) == clip->passedict)
+			if (PROG_TO_EDICT(touch->v.owner) == passedict)
 				continue;	// don't clip against own missiles
-			if (PROG_TO_EDICT(clip->passedict->v.owner) == touch)
+			if (PROG_TO_EDICT(passedict->v.owner) == touch)
 				continue;	// don't clip against owner
 		}
 

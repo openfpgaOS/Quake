@@ -48,6 +48,8 @@ extern cvar_t	pq_gpu_world_light;
 
 static int	miplevel;
 
+static const float	d_mipscale_tab[4] = {1.0f, 0.5f, 0.25f, 0.125f};
+
 float		scale_for_mip;
 int			screenwidth;
 int			ubasestep, errorterm, erroradjustup, erroradjustdown;
@@ -129,7 +131,7 @@ PQ_FASTTEXT void D_CalcGradients (msurface_t *pface)
 	vec3_t		p_saxis, p_taxis;
 	float		t;
 
-	mipscale = 1.0f / (float)(1 << miplevel);
+	mipscale = d_mipscale_tab[miplevel];
 
 	TransformVector (pface->texinfo->vecs[0], p_saxis);
 	TransformVector (pface->texinfo->vecs[1], p_taxis);

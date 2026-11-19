@@ -71,6 +71,15 @@ static void	(*surfmiptable[4])(void) = {
 
 unsigned		blocklights[18*18] __attribute__((aligned(64)));
 
+#if !HW_SURFBLOCK_ACCEL
+/* 256-byte-aligned copy of the colormap.  R_SurfaceBlock8 walks the light
+ * value pre-added to the table base and picks the colormap row by clearing the
+ * low byte, which is only the right row when the table itself starts on a
+ * 256-byte boundary; vid.colormap is a hunk pointer with no such promise. */
+static unsigned char		r_blockcolormap[VID_GRADES*256] __attribute__((aligned(256)));
+static const unsigned char	*r_blockcolormap_src;
+#endif
+
 /*
 ===============
 R_AddDynamicLights
@@ -290,6 +299,14 @@ void R_DrawSurface (void)
 // calculate the lightings
 	R_BuildLightMap ();
 	
+#if !HW_SURFBLOCK_ACCEL
+	if (r_blockcolormap_src != (const unsigned char *)vid.colormap)
+	{
+		r_blockcolormap_src = (const unsigned char *)vid.colormap;
+		memcpy (r_blockcolormap, r_blockcolormap_src, sizeof(r_blockcolormap));
+	}
+#endif
+
 	surfrowbytes = r_drawsurf.rowbytes;
 
 	mt = r_drawsurf.texture;
@@ -401,6 +418,85 @@ static void R_DrawSurfaceBlock8_unified (void)
 #endif /* HW_SURFBLOCK_ACCEL */
 
 #if !HW_SURFBLOCK_ACCEL
+
+/*
+================
+R_SurfaceBlock8
+
+Shared 8-bit surface-block builder.  bshift is the mip's block shift (4 for
+mip0 .. 1 for mip3), so the block is (1<<bshift) texels square.
+
+The drawsurf globals are read once up front: the per-texel byte store makes the
+compiler assume vid.colormap and the step globals are clobbered, which cost ten
+reloads per texel row.  The texel is fetched through (r_blockcolormap + light)
+with the low byte masked off rather than colormap[(light & 0xFF00) + pix], one
+instruction less per texel.  The vertical light steps take the signed
+difference where the original took the wrapping unsigned one: the two differ
+only by a multiple of 2^24, which never reaches the row bits 8..15, and the
+signed one keeps light inside [0,16320] so the masked add stays in the table.
+================
+*/
+static inline __attribute__((always_inline)) void R_SurfaceBlock8 (const int bshift)
+{
+	unsigned char		*psource, *prowdest;
+	const unsigned char	*sourcemax;
+	unsigned			*plight;
+	unsigned long		cmap, q;
+	int					tstep, rowbytes, lwidth, stepback, nvblocks;
+	int					ll, lr, lls, lrs, lightstep;
+	int					v, i, b;
+
+	nvblocks = r_numvblocks;
+	if (nvblocks <= 0)
+		return;
+
+	cmap = (unsigned long)r_blockcolormap;
+	psource = pbasesource;
+	prowdest = prowdestbase;
+	sourcemax = r_sourcemax;
+	plight = r_lightptr;
+	tstep = sourcetstep;
+	rowbytes = surfrowbytes;
+	lwidth = r_lightwidth;
+	stepback = r_stepback;
+
+	for (v=0 ; v<nvblocks ; v++)
+	{
+		ll = (int)plight[0];
+		lr = (int)plight[1];
+		plight += lwidth;
+		lls = ((int)plight[0] - ll) >> bshift;
+		lrs = ((int)plight[1] - lr) >> bshift;
+
+		for (i=0 ; i<(1<<bshift) ; i++)
+		{
+			lightstep = (ll - lr) >> bshift;
+			q = cmap + (unsigned)lr;
+
+			for (b=(1<<bshift)-1 ; b>=0 ; b--)
+			{
+				prowdest[b] = ((const unsigned char *)
+						(q & ~0xFFUL))[psource[b]];
+				q += (unsigned long)lightstep;
+			}
+
+			psource += tstep;
+			lr += lrs;
+			ll += lls;
+			prowdest += rowbytes;
+		}
+
+		if (psource >= sourcemax)
+			psource -= stepback;
+	}
+
+	r_lightptr = plight;
+	lightleft = ll;
+	lightright = lr;
+	lightleftstep = lls;
+	lightrightstep = lrs;
+}
+
 /*
 ================
 R_DrawSurfaceBlock8_mip0
@@ -408,13 +504,11 @@ R_DrawSurfaceBlock8_mip0
 */
 PQ_FASTTEXT void R_DrawSurfaceBlock8_mip0 (void)
 {
-	int				v, i, b, lightstep, lighttemp, light;
-	unsigned char	pix, *psource, *prowdest;
-
-	psource = pbasesource;
-	prowdest = prowdestbase;
-
 #if HW_SURFACE_ACCEL
+	int				v, i;
+	unsigned char	*psource = pbasesource;
+	unsigned char	*prowdest = prowdestbase;
+
 	span_setup_surface(16);
 
 	for (v=0 ; v<r_numvblocks ; v++)
@@ -455,42 +549,7 @@ PQ_FASTTEXT void R_DrawSurfaceBlock8_mip0 (void)
 			psource -= r_stepback;
 	}
 #else
-	for (v=0 ; v<r_numvblocks ; v++)
-	{
-		lightleft = r_lightptr[0];
-		lightright = r_lightptr[1];
-		r_lightptr += r_lightwidth;
-		lightleftstep = (r_lightptr[0] - lightleft) >> 4;
-		lightrightstep = (r_lightptr[1] - lightright) >> 4;
-
-		for (i=0 ; i<16 ; i++)
-		{
-			lighttemp = lightleft - lightright;
-			lightstep = lighttemp >> 4;
-
-			light = lightright;
-
-			for (b=15; b>=0; b--)
-			{
-				pix = psource[b];
-#if HW_CMAP_BRAM
-				prowdest[b] = host_colormap[(light & 0xFF00) + pix];
-#else
-				prowdest[b] = ((unsigned char *)vid.colormap)
-						[(light & 0xFF00) + pix];
-#endif
-				light += lightstep;
-			}
-
-			psource += sourcetstep;
-			lightright += lightrightstep;
-			lightleft += lightleftstep;
-			prowdest += surfrowbytes;
-		}
-
-		if (psource >= r_sourcemax)
-			psource -= r_stepback;
-	}
+	R_SurfaceBlock8 (4);
 #endif
 }
 
@@ -502,13 +561,11 @@ R_DrawSurfaceBlock8_mip1
 */
 PQ_FASTTEXT void R_DrawSurfaceBlock8_mip1 (void)
 {
-	int				v, i, b, lightstep, lighttemp, light;
-	unsigned char	pix, *psource, *prowdest;
-
-	psource = pbasesource;
-	prowdest = prowdestbase;
-
 #if HW_SURFACE_ACCEL
+	int				v, i;
+	unsigned char	*psource = pbasesource;
+	unsigned char	*prowdest = prowdestbase;
+
 	span_setup_surface(8);
 
 	for (v=0 ; v<r_numvblocks ; v++)
@@ -545,42 +602,7 @@ PQ_FASTTEXT void R_DrawSurfaceBlock8_mip1 (void)
 			psource -= r_stepback;
 	}
 #else
-	for (v=0 ; v<r_numvblocks ; v++)
-	{
-		lightleft = r_lightptr[0];
-		lightright = r_lightptr[1];
-		r_lightptr += r_lightwidth;
-		lightleftstep = (r_lightptr[0] - lightleft) >> 3;
-		lightrightstep = (r_lightptr[1] - lightright) >> 3;
-
-		for (i=0 ; i<8 ; i++)
-		{
-			lighttemp = lightleft - lightright;
-			lightstep = lighttemp >> 3;
-
-			light = lightright;
-
-			for (b=7; b>=0; b--)
-			{
-				pix = psource[b];
-#if HW_CMAP_BRAM
-				prowdest[b] = host_colormap[(light & 0xFF00) + pix];
-#else
-				prowdest[b] = ((unsigned char *)vid.colormap)
-						[(light & 0xFF00) + pix];
-#endif
-				light += lightstep;
-			}
-
-			psource += sourcetstep;
-			lightright += lightrightstep;
-			lightleft += lightleftstep;
-			prowdest += surfrowbytes;
-		}
-
-		if (psource >= r_sourcemax)
-			psource -= r_stepback;
-	}
+	R_SurfaceBlock8 (3);
 #endif
 }
 
@@ -592,13 +614,11 @@ R_DrawSurfaceBlock8_mip2
 */
 PQ_HOT void R_DrawSurfaceBlock8_mip2 (void)
 {
-	int				v, i, b, lightstep, lighttemp, light;
-	unsigned char	pix, *psource, *prowdest;
-
-	psource = pbasesource;
-	prowdest = prowdestbase;
-
 #if HW_SURFACE_ACCEL
+	int				v, i;
+	unsigned char	*psource = pbasesource;
+	unsigned char	*prowdest = prowdestbase;
+
 	span_setup_surface(4);
 
 	for (v=0 ; v<r_numvblocks ; v++)
@@ -634,42 +654,7 @@ PQ_HOT void R_DrawSurfaceBlock8_mip2 (void)
 			psource -= r_stepback;
 	}
 #else
-	for (v=0 ; v<r_numvblocks ; v++)
-	{
-		lightleft = r_lightptr[0];
-		lightright = r_lightptr[1];
-		r_lightptr += r_lightwidth;
-		lightleftstep = (r_lightptr[0] - lightleft) >> 2;
-		lightrightstep = (r_lightptr[1] - lightright) >> 2;
-
-		for (i=0 ; i<4 ; i++)
-		{
-			lighttemp = lightleft - lightright;
-			lightstep = lighttemp >> 2;
-
-			light = lightright;
-
-			for (b=3; b>=0; b--)
-			{
-				pix = psource[b];
-#if HW_CMAP_BRAM
-				prowdest[b] = host_colormap[(light & 0xFF00) + pix];
-#else
-				prowdest[b] = ((unsigned char *)vid.colormap)
-						[(light & 0xFF00) + pix];
-#endif
-				light += lightstep;
-			}
-
-			psource += sourcetstep;
-			lightright += lightrightstep;
-			lightleft += lightleftstep;
-			prowdest += surfrowbytes;
-		}
-
-		if (psource >= r_sourcemax)
-			psource -= r_stepback;
-	}
+	R_SurfaceBlock8 (2);
 #endif
 }
 
@@ -681,13 +666,11 @@ R_DrawSurfaceBlock8_mip3
 */
 PQ_HOT void R_DrawSurfaceBlock8_mip3 (void)
 {
-	int				v, i, b, lightstep, lighttemp, light;
-	unsigned char	pix, *psource, *prowdest;
-
-	psource = pbasesource;
-	prowdest = prowdestbase;
-
 #if HW_SURFACE_ACCEL
+	int				v, i;
+	unsigned char	*psource = pbasesource;
+	unsigned char	*prowdest = prowdestbase;
+
 	span_setup_surface(2);
 
 	for (v=0 ; v<r_numvblocks ; v++)
@@ -726,42 +709,7 @@ PQ_HOT void R_DrawSurfaceBlock8_mip3 (void)
 	}
 	span_wait();
 #else
-	for (v=0 ; v<r_numvblocks ; v++)
-	{
-		lightleft = r_lightptr[0];
-		lightright = r_lightptr[1];
-		r_lightptr += r_lightwidth;
-		lightleftstep = (r_lightptr[0] - lightleft) >> 1;
-		lightrightstep = (r_lightptr[1] - lightright) >> 1;
-
-		for (i=0 ; i<2 ; i++)
-		{
-			lighttemp = lightleft - lightright;
-			lightstep = lighttemp >> 1;
-
-			light = lightright;
-
-			for (b=1; b>=0; b--)
-			{
-				pix = psource[b];
-#if HW_CMAP_BRAM
-				prowdest[b] = host_colormap[(light & 0xFF00) + pix];
-#else
-				prowdest[b] = ((unsigned char *)vid.colormap)
-						[(light & 0xFF00) + pix];
-#endif
-				light += lightstep;
-			}
-
-			psource += sourcetstep;
-			lightright += lightrightstep;
-			lightleft += lightleftstep;
-			prowdest += surfrowbytes;
-		}
-
-		if (psource >= r_sourcemax)
-			psource -= r_stepback;
-	}
+	R_SurfaceBlock8 (1);
 #endif
 }
 

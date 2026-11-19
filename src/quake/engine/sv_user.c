@@ -50,6 +50,7 @@ SV_SetIdealPitch
 ===============
 */
 #define	MAX_FORWARD	6
+void SV_SinCos (float angle, float *sinval, float *cosval);
 void SV_SetIdealPitch (void)
 {
 	float	angleval, sinval, cosval;
@@ -63,8 +64,7 @@ void SV_SetIdealPitch (void)
 		return;
 		
 	angleval = sv_player->v.angles[YAW] * M_PI*2 / 360;
-	sinval = sinf(angleval);
-	cosval = cosf(angleval);
+	SV_SinCos (angleval, &sinval, &cosval);
 
 	for (i=0 ; i<MAX_FORWARD ; i++)
 	{

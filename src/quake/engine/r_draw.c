@@ -54,9 +54,14 @@ clipplane_t	world_clipplanes[16];
 medge_t			*r_pedge;
 static medge_t	r_dummyedge;
 
-qboolean		r_leftclipped, r_rightclipped;
+qboolean		r_leftclipped;
 static qboolean	makeleftedge, makerightedge;
 qboolean		r_nearzionly;
+
+// memoized view_clipplanes[] chain, see R_ClipPlaneList.  clipflags is always
+// 0..15, so -1 forces the first build.
+static int			clipflags_built = -1;
+static clipplane_t	*clipplane_list;
 
 PQ_FASTDATA int		sintable[SIN_BUFFER_SIZE];
 PQ_FASTDATA int		intsintable[SIN_BUFFER_SIZE];
@@ -82,6 +87,51 @@ qboolean	r_lastvertvalid;
 
 /*
 ================
+R_ProjectVert
+
+Transform a world vertex to screen u/v and 1/z, clamped to the view rect.
+================
+*/
+static inline __attribute__((always_inline))
+void R_ProjectVert (mvertex_t *pvert, float *pu, float *pv, float *plzi)
+{
+	vec3_t	local;
+	float	scale, lzi, u, v, t0, t1, t2;
+
+// transform and project (TransformVector, spelled out so it stays inline)
+	VectorSubtract (pvert->position, modelorg, local);
+	t0 = DotProduct(local, vright);
+	t1 = DotProduct(local, vup);
+	t2 = DotProduct(local, vpn);
+
+	if (t2 < NEAR_CLIP)
+		t2 = NEAR_CLIP;
+
+	lzi = 1.0f / t2;
+
+// FIXME: build x/yscale into transform?
+	scale = xscale * lzi;
+	u = (xcenter + scale*t0);
+	if (u < r_refdef.fvrectx_adj)
+		u = r_refdef.fvrectx_adj;
+	if (u > r_refdef.fvrectright_adj)
+		u = r_refdef.fvrectright_adj;
+
+	scale = yscale * lzi;
+	v = (ycenter - scale*t1);
+	if (v < r_refdef.fvrecty_adj)
+		v = r_refdef.fvrecty_adj;
+	if (v > r_refdef.fvrectbottom_adj)
+		v = r_refdef.fvrectbottom_adj;
+
+	*pu = u;
+	*pv = v;
+	*plzi = lzi;
+}
+
+
+/*
+================
 R_EmitEdge
 ================
 */
@@ -90,10 +140,9 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 	edge_t	*edge, *pcheck;
 	int		u_check;
 	float	u, u_step;
-	vec3_t	local, transformed;
-	float	*world;
-	int		v, v2, ceilv0;
-	float	scale, lzi0, u0, v0;
+	int		v, v2, ceilv0, ceilv1;
+	float	lzi0, u0, v0;
+	float	lzi1, u1, v1;
 	int		side;
 
 	if (r_lastvertvalid)
@@ -102,65 +151,25 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 		v0 = r_v1;
 		lzi0 = r_lzi1;
 		ceilv0 = r_ceilv1;
+
+		R_ProjectVert (pv1, &u1, &v1, &lzi1);
 	}
 	else
 	{
-		world = &pv0->position[0];
-	
-	// transform and project
-		VectorSubtract (world, modelorg, local);
-		TransformVector (local, transformed);
-	
-		if (transformed[2] < NEAR_CLIP)
-			transformed[2] = NEAR_CLIP;
-	
-		lzi0 = 1.0f / transformed[2];
-	
-	// FIXME: build x/yscale into transform?
-		scale = xscale * lzi0;
-		u0 = (xcenter + scale*transformed[0]);
-		if (u0 < r_refdef.fvrectx_adj)
-			u0 = r_refdef.fvrectx_adj;
-		if (u0 > r_refdef.fvrectright_adj)
-			u0 = r_refdef.fvrectright_adj;
-	
-		scale = yscale * lzi0;
-		v0 = (ycenter - scale*transformed[1]);
-		if (v0 < r_refdef.fvrecty_adj)
-			v0 = r_refdef.fvrecty_adj;
-		if (v0 > r_refdef.fvrectbottom_adj)
-			v0 = r_refdef.fvrectbottom_adj;
-	
+	// both endpoints in one block, so the two projection chains cover
+	// each other's FPU latency instead of stalling in sequence
+		R_ProjectVert (pv0, &u0, &v0, &lzi0);
+		R_ProjectVert (pv1, &u1, &v1, &lzi1);
+
 		ceilv0 = pq_ceilf_int(v0);
 	}
 
-	world = &pv1->position[0];
+	r_lzi1 = lzi1;
+	r_u1 = u1;
+	r_v1 = v1;
 
-// transform and project
-	VectorSubtract (world, modelorg, local);
-	TransformVector (local, transformed);
-
-	if (transformed[2] < NEAR_CLIP)
-		transformed[2] = NEAR_CLIP;
-
-	r_lzi1 = 1.0f / transformed[2];
-
-	scale = xscale * r_lzi1;
-	r_u1 = (xcenter + scale*transformed[0]);
-	if (r_u1 < r_refdef.fvrectx_adj)
-		r_u1 = r_refdef.fvrectx_adj;
-	if (r_u1 > r_refdef.fvrectright_adj)
-		r_u1 = r_refdef.fvrectright_adj;
-
-	scale = yscale * r_lzi1;
-	r_v1 = (ycenter - scale*transformed[1]);
-	if (r_v1 < r_refdef.fvrecty_adj)
-		r_v1 = r_refdef.fvrecty_adj;
-	if (r_v1 > r_refdef.fvrectbottom_adj)
-		r_v1 = r_refdef.fvrectbottom_adj;
-
-	if (r_lzi1 > lzi0)
-		lzi0 = r_lzi1;
+	if (lzi1 > lzi0)
+		lzi0 = lzi1;
 
 	if (lzi0 > r_nearzi)	// for mipmap finding
 		r_nearzi = lzi0;
@@ -171,11 +180,12 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 
 	r_emitted = 1;
 
-	r_ceilv1 = pq_ceilf_int(r_v1);
+	ceilv1 = pq_ceilf_int(v1);
+	r_ceilv1 = ceilv1;
 
 
 // create the edge
-	if (ceilv0 == r_ceilv1)
+	if (ceilv0 == ceilv1)
 	{
 	// we cache unclipped horizontal edges as fully clipped
 		if (cacheoffset != 0x7FFFFFFF)
@@ -187,7 +197,7 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 		return;		// horizontal edge
 	}
 
-	side = ceilv0 > r_ceilv1;
+	side = ceilv0 > ceilv1;
 
 	edge = edge_p++;
 
@@ -199,25 +209,25 @@ PQ_FASTTEXT void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 	{
 	// trailing edge (go from p1 to p2)
 		v = ceilv0;
-		v2 = r_ceilv1 - 1;
+		v2 = ceilv1 - 1;
 
 		edge->surfs[0] = surface_p - surfaces;
 		edge->surfs[1] = 0;
 
-		u_step = ((r_u1 - u0) / (r_v1 - v0));
+		u_step = ((u1 - u0) / (v1 - v0));
 		u = u0 + ((float)v - v0) * u_step;
 	}
 	else
 	{
 	// leading edge (go from p2 to p1)
 		v2 = ceilv0 - 1;
-		v = r_ceilv1;
+		v = ceilv1;
 
 		edge->surfs[0] = 0;
 		edge->surfs[1] = surface_p - surfaces;
 
-		u_step = ((u0 - r_u1) / (v0 - r_v1));
-		u = r_u1 + ((float)v - r_v1) * u_step;
+		u_step = ((u0 - u1) / (v0 - v1));
+		u = u1 + ((float)v - v1) * u_step;
 	}
 
 	edge->u_step = u_step*0x100000;
@@ -302,12 +312,12 @@ PQ_FASTTEXT void R_ClipEdge (mvertex_t *pv0, mvertex_t *pv1, clipplane_t *clip)
 
 				if (clip->leftedge)
 				{
-					r_leftclipped = true;
+					r_leftclipped = makeleftedge = true;
 					r_leftexit = clipvert;
 				}
 				else if (clip->rightedge)
 				{
-					r_rightclipped = true;
+					makerightedge = true;
 					r_rightexit = clipvert;
 				}
 
@@ -343,12 +353,12 @@ PQ_FASTTEXT void R_ClipEdge (mvertex_t *pv0, mvertex_t *pv1, clipplane_t *clip)
 
 				if (clip->leftedge)
 				{
-					r_leftclipped = true;
+					r_leftclipped = makeleftedge = true;
 					r_leftenter = clipvert;
 				}
 				else if (clip->rightedge)
 				{
-					r_rightclipped = true;
+					makerightedge = true;
 					r_rightenter = clipvert;
 				}
 
@@ -363,6 +373,43 @@ PQ_FASTTEXT void R_ClipEdge (mvertex_t *pv0, mvertex_t *pv1, clipplane_t *clip)
 }
 
 #endif	// !id386
+
+
+/*
+================
+R_ClipPlaneList
+
+Chain the active view clip planes for a clipflags mask, so consecutive faces
+with the same mask reuse the chain.  The chain lives in view_clipplanes[].next,
+which nothing else writes; any new writer of those fields must reset
+clipflags_built.
+================
+*/
+static clipplane_t *R_ClipPlaneList (int clipflags)
+{
+	int			i;
+	unsigned	mask;
+	clipplane_t	*pclip;
+
+	if (clipflags == clipflags_built)
+		return clipplane_list;
+
+	pclip = NULL;
+
+	for (i=3, mask = 0x08 ; i>=0 ; i--, mask >>= 1)
+	{
+		if (clipflags & mask)
+		{
+			view_clipplanes[i].next = pclip;
+			pclip = &view_clipplanes[i];
+		}
+	}
+
+	clipflags_built = clipflags;
+	clipplane_list = pclip;
+
+	return pclip;
+}
 
 
 /*
@@ -395,8 +442,8 @@ R_RenderFace
 */
 PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 {
-	int			i, lindex;
-	unsigned	mask;
+	int			i, lindex, numedges;
+	qboolean	mkleft, mkright;
 	mplane_t	*pplane;
 	float		distinv;
 	vec3_t		p_normal;
@@ -420,16 +467,7 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 	c_faceclip++;
 
 // set up clip planes
-	pclip = NULL;
-
-	for (i=3, mask = 0x08 ; i>=0 ; i--, mask >>= 1)
-	{
-		if (clipflags & mask)
-		{
-			view_clipplanes[i].next = pclip;
-			pclip = &view_clipplanes[i];
-		}
-	}
+	pclip = R_ClipPlaneList (clipflags);
 
 // push the edges through
 	r_emitted = 0;
@@ -440,7 +478,9 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 	int *psurfedges = currententity->model->surfedges + fa->firstedge;
 	r_lastvertvalid = false;
 
-	for (i=0 ; i<fa->numedges ; i++)
+	numedges = fa->numedges;
+
+	for (i=0 ; i<numedges ; i++)
 	{
 		int v0idx, v1idx;
 
@@ -487,23 +527,24 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 
 	// assume it's cacheable
 		cacheoffset = (byte *)edge_p - (byte *)r_edges;
-		r_leftclipped = r_rightclipped = false;
+		r_leftclipped = false;
 		R_ClipEdge (&r_pcurrentvertbase[v0idx],
 					&r_pcurrentvertbase[v1idx],
 					pclip);
 		r_pedge->cachededgeoffset = cacheoffset;
 
-		if (r_leftclipped)
-			makeleftedge = true;
-		if (r_rightclipped)
-			makerightedge = true;
 		r_lastvertvalid = true;
 	}
+
+// R_ClipEdge accumulates makeleftedge/makerightedge; snapshot them so the
+// reconstructed left edge cannot add a right edge of its own
+	mkleft = makeleftedge;
+	mkright = makerightedge;
 
 // if there was a clip off the left edge, add that edge too
 // FIXME: faster to do in screen space?
 // FIXME: share clipped edges?
-	if (makeleftedge)
+	if (mkleft)
 	{
 		r_pedge = &r_dummyedge;
 		r_lastvertvalid = false;
@@ -511,7 +552,7 @@ PQ_FASTTEXT void R_RenderFace (msurface_t *fa, int clipflags, float planedot)
 	}
 
 // if there was a clip off the right edge, get the right r_nearzi
-	if (makerightedge)
+	if (mkright)
 	{
 		r_pedge = &r_dummyedge;
 		r_lastvertvalid = false;
@@ -556,8 +597,7 @@ R_RenderBmodelFace
 */
 void R_RenderBmodelFace (bedge_t *pedges, msurface_t *psurf)
 {
-	int			i;
-	unsigned	mask;
+	qboolean	mkleft, mkright;
 	mplane_t	*pplane;
 	float		distinv;
 	vec3_t		p_normal;
@@ -583,16 +623,7 @@ void R_RenderBmodelFace (bedge_t *pedges, msurface_t *psurf)
 	r_pedge = &r_dummyedge;
 
 // set up clip planes
-	pclip = NULL;
-
-	for (i=3, mask = 0x08 ; i>=0 ; i--, mask >>= 1)
-	{
-		if (r_clipflags & mask)
-		{
-			view_clipplanes[i].next = pclip;
-			pclip = &view_clipplanes[i];
-		}
-	}
+	pclip = R_ClipPlaneList (r_clipflags);
 
 // push the edges through
 	r_emitted = 0;
@@ -605,26 +636,24 @@ void R_RenderBmodelFace (bedge_t *pedges, msurface_t *psurf)
 
 	for ( ; pedges ; pedges = pedges->pnext)
 	{
-		r_leftclipped = r_rightclipped = false;
+		r_leftclipped = false;
 		R_ClipEdge (pedges->v[0], pedges->v[1], pclip);
-
-		if (r_leftclipped)
-			makeleftedge = true;
-		if (r_rightclipped)
-			makerightedge = true;
 	}
+
+	mkleft = makeleftedge;
+	mkright = makerightedge;
 
 // if there was a clip off the left edge, add that edge too
 // FIXME: faster to do in screen space?
 // FIXME: share clipped edges?
-	if (makeleftedge)
+	if (mkleft)
 	{
 		r_pedge = &r_dummyedge;
 		R_ClipEdge (&r_leftexit, &r_leftenter, pclip->next);
 	}
 
 // if there was a clip off the right edge, get the right r_nearzi
-	if (makerightedge)
+	if (mkright)
 	{
 		r_pedge = &r_dummyedge;
 		r_nearzionly = true;
@@ -680,7 +709,6 @@ void R_RenderPoly (msurface_t *fa, int clipflags)
 {
 	int			i, lindex, lnumverts, s_axis, t_axis;
 	float		dist, lastdist, lzi, scale, u, v, frac;
-	unsigned	mask;
 	vec3_t		local, transformed;
 	clipplane_t	*pclip;
 	medge_t		*pedges;
@@ -696,16 +724,7 @@ void R_RenderPoly (msurface_t *fa, int clipflags)
 	s_axis = t_axis = 0;	// keep compiler happy
 
 // set up clip planes
-	pclip = NULL;
-
-	for (i=3, mask = 0x08 ; i>=0 ; i--, mask >>= 1)
-	{
-		if (clipflags & mask)
-		{
-			view_clipplanes[i].next = pclip;
-			pclip = &view_clipplanes[i];
-		}
-	}
+	pclip = R_ClipPlaneList (clipflags);
 
 // reconstruct the polygon
 // FIXME: these should be precalculated and loaded off disk

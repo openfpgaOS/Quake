@@ -74,8 +74,8 @@ extern	entity_t		*currententity;
  * pointers, so nothing per-frame scales with these.  The array-based AET
  * in r_edge.c is sized off NUMSTACKEDGES too, which is why r_maxedges
  * must NOT be pushed past it at runtime; raising the constant keeps
- * the pool and the AET in step.  aet_surfs is uint16, so
- * NUMSTACKSURFACES must stay under 65535. */
+ * the pool and the AET in step.  The AET packs the two surface indices
+ * of an edge into one word, so NUMSTACKSURFACES must stay under 65535. */
 #define NUMSTACKEDGES		12288
 #define	MINEDGES			NUMSTACKEDGES
 #define NUMSTACKSURFACES	4096

@@ -41,7 +41,9 @@ int r_skydirect;		// not used?
 
 byte	bottomsky[128*131];
 byte	bottommask[128*131];
-byte	newsky[128*256];	// newsky and topsky both pack in here, 128 bytes
+// cache-line aligned: each 128-byte newsky half-row is two whole lines
+byte	newsky[128*256] __attribute__((aligned(64)));
+							// newsky and topsky both pack in here, 128 bytes
 							//  of newsky on the left of each scan, 128 bytes
 							//  of topsky on the right, because the low-level
 							//  drawers need 256-byte scan widths
@@ -162,10 +164,13 @@ void R_MakeSky (void)
 	r_skymade = 1;
 
 	/* Publish the freshly-composited sky bytes to the GPU (the manager does the
-	 * cache clean).  Once per skytime tick — cheap, no re-upload. */
+	 * cache clean).  Once per skytime tick — cheap, no re-upload.  The GPU
+	 * samples only newsky: D_DrawSkyScans8 masks s and t to SKYSIZE-1 over a
+	 * SKYSIZE*2 row width. */
 	{
-		extern void of_emit_sky_update(unsigned nbytes);
-		of_emit_sky_update(SKYSIZE * SKYSIZE * 2);
+		extern void of_emit_sky_update(unsigned row_stride, unsigned row_bytes,
+									   unsigned rows);
+		of_emit_sky_update(SKYSIZE * 2, SKYSIZE, SKYSIZE);
 	}
 }
 

@@ -19,6 +19,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 // r_aclip.c: clip routines for drawing Alias models directly to the screen
 
+#include <limits.h>
+
 #include "quakedef.h"
 #include "r_local.h"
 #include "d_local.h"
@@ -94,6 +96,34 @@ void R_Alias_clip_z (finalvert_t *pfv0, finalvert_t *pfv1, finalvert_t *out)
 
 #if	!id386
 
+/*
+================
+R_AliasClipRound
+
+(int)((double)f + 0.5) in float arithmetic, including the saturation of the
+double-to-int conversion.  Only the positive end needs a test: the conversion
+saturates to INT_MIN below -2147483648 and leaves a fraction of -256 or less,
+which adds nothing.  The sign test is on the truncated integer, which folds in
+the "i != 0" case f in (-1,0) - the fraction is then negative and adds nothing
+either.
+================
+*/
+static __attribute__((noinline)) int R_AliasClipRound (float f)
+{
+	int		i;
+	float	frac;
+
+	if (f >= 2147483648.0f)
+		return INT_MAX;
+
+	i = (int)f;
+	frac = f - (float)i;
+	if (i < 0)
+		return i + (frac > -0.5f);
+	return i + (frac >= 0.5f);
+}
+
+
 void R_Alias_clip_left (finalvert_t *pfv0, finalvert_t *pfv1, finalvert_t *out)
 {
 	float		scale;
@@ -104,14 +134,14 @@ void R_Alias_clip_left (finalvert_t *pfv0, finalvert_t *pfv1, finalvert_t *out)
 		scale = (float)(r_refdef.aliasvrect.x - pfv0->v[0]) /
 				(pfv1->v[0] - pfv0->v[0]);
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale);
 	}
 	else
 	{
 		scale = (float)(r_refdef.aliasvrect.x - pfv1->v[0]) /
 				(pfv0->v[0] - pfv1->v[0]);
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale);
 	}
 }
 
@@ -127,14 +157,14 @@ void R_Alias_clip_right (finalvert_t *pfv0, finalvert_t *pfv1,
 		scale = (float)(r_refdef.aliasvrectright - pfv0->v[0]) /
 				(pfv1->v[0] - pfv0->v[0]);
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale);
 	}
 	else
 	{
 		scale = (float)(r_refdef.aliasvrectright - pfv1->v[0]) /
 				(pfv0->v[0] - pfv1->v[0]);
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale);
 	}
 }
 
@@ -149,14 +179,14 @@ void R_Alias_clip_top (finalvert_t *pfv0, finalvert_t *pfv1, finalvert_t *out)
 		scale = (float)(r_refdef.aliasvrect.y - pfv0->v[1]) /
 				(pfv1->v[1] - pfv0->v[1]);
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale);
 	}
 	else
 	{
 		scale = (float)(r_refdef.aliasvrect.y - pfv1->v[1]) /
 				(pfv0->v[1] - pfv1->v[1]);
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale);
 	}
 }
 
@@ -173,7 +203,7 @@ void R_Alias_clip_bottom (finalvert_t *pfv0, finalvert_t *pfv1,
 				(pfv1->v[1] - pfv0->v[1]);
 
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv0->v[i] + (pfv1->v[i] - pfv0->v[i])*scale);
 	}
 	else
 	{
@@ -181,7 +211,7 @@ void R_Alias_clip_bottom (finalvert_t *pfv0, finalvert_t *pfv1,
 				(pfv0->v[1] - pfv1->v[1]);
 
 		for (i=0 ; i<6 ; i++)
-			out->v[i] = pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale + 0.5;
+			out->v[i] = R_AliasClipRound (pfv1->v[i] + (pfv0->v[i] - pfv1->v[i])*scale);
 	}
 }
 

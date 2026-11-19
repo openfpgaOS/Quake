@@ -429,6 +429,17 @@ float Sys_FloatTime(void)
     return (float)(now - t0_us) * 1.0e-6f;
 }
 
+/* Microsecond clock for the host_speeds trace: a direct service-table
+ * call, no trap.  Wraps every ~71.6 minutes; use unsigned differences. */
+unsigned Sys_Micros(void)
+{
+#ifndef OF_PC
+    return OF_SVC->timer_get_us();
+#else
+    return of_time_us();
+#endif
+}
+
 /* ---------------- Printf / Error / Quit ----------------------------- */
 
 void Sys_Error(char *error, ...)

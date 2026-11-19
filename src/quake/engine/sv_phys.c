@@ -185,7 +185,7 @@ Slide off of the impacting object
 returns the blocked flags (1 = floor, 2 = step / wall)
 ==================
 */
-#define	STOP_EPSILON	0.1
+#define	STOP_EPSILON	0.1f	// exact: > -0.1f && < 0.1f match the double compares
 
 int ClipVelocity (vec3_t in, vec3_t normal, vec3_t out, float overbounce)
 {
@@ -278,7 +278,7 @@ int SV_FlyMove (edict_t *ent, float time, trace_t *steptrace)
 		if (!trace.ent)
 			Sys_Error ("SV_FlyMove: !trace.ent");
 
-		if (trace.plane.normal[2] > 0.7)
+		if (trace.plane.normal[2] > 0.7f)	// exact: same as > 0.7 for every float
 		{
 			blocked |= 1;		// floor
 			if (trace.ent->v.solid == SOLID_BSP)
@@ -827,7 +827,8 @@ qboolean SV_CheckWater (edict_t *ent)
 #endif
 		ent->v.watertype = cont;
 		ent->v.waterlevel = 1;
-		point[2] = ent->v.origin[2] + (ent->v.mins[2] + ent->v.maxs[2])*0.5;
+		// exact: fmaf rounds once, the same as origin+0.5*(mins+maxs) in double
+		point[2] = fmaf(ent->v.mins[2] + ent->v.maxs[2], 0.5f, ent->v.origin[2]);
 		cont = SV_PointContents (point);
 		if (cont <= CONTENTS_WATER)
 		{
@@ -1030,7 +1031,7 @@ void SV_WalkMove (edict_t *ent)
 // move down
 	downtrace = SV_PushEntity (ent, downmove);	// FIXME: don't link?
 
-	if (downtrace.plane.normal[2] > 0.7)
+	if (downtrace.plane.normal[2] > 0.7f)	// exact: same as > 0.7 for every float
 	{
 		if (ent->v.solid == SOLID_BSP)
 		{
@@ -1321,7 +1322,7 @@ void SV_Physics_Toss (edict_t *ent)
 	ClipVelocity (ent->v.velocity, trace.plane.normal, ent->v.velocity, backoff);
 
 // stop if on ground
-	if (trace.plane.normal[2] > 0.7)
+	if (trace.plane.normal[2] > 0.7f)	// exact: same as > 0.7 for every float
 	{		
 #ifdef QUAKE2
 		if (ent->v.velocity[2] < 60 || (ent->v.movetype != MOVETYPE_BOUNCE && ent->v.movetype != MOVETYPE_BOUNCEMISSILE))
